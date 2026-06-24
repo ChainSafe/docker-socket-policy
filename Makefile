@@ -1,7 +1,7 @@
 BINARY_NAME ?= docker-socket-policy
 OUTPUT_DIR ?= .
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-QUINT ?= node /Users/abienkow/.hermes/node/lib/node_modules/@informalsystems/quint/dist/src/cli.js
+QUINT ?= $(shell command -v quint 2>/dev/null || echo node $$HOME/.hermes/node/lib/node_modules/@informalsystems/quint/dist/src/cli.js)
 SPEC ?= spec/docker_socket_policy.qnt
 
 .PHONY: build clean test lint verify typecheck validate

@@ -1,52 +1,42 @@
-name: Release
+name: CI
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+
       - name: Install Quint
         run: npm install -g @informalsystems/quint
+
       - name: Quint typecheck
         run: make typecheck
+
       - name: Quint simulation verification
         run: make verify
+
       - name: Go vet
         run: go vet ./...
+
       - name: Go test
         run: go test ./...
+
       - name: Go build
         run: go build -o /dev/null .
-
-  goreleaser:
-    needs: [validate]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-      - uses: goreleaser/goreleaser-action@v5
-        with:
-          distribution: goreleaser
-          version: latest
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

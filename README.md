@@ -1,6 +1,19 @@
 # docker-socket-policy
 
+[![CI](https://github.com/ChainSafe/docker-socket-policy/actions/workflows/ci.yml/badge.svg)](https://github.com/ChainSafe/docker-socket-policy/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8)](https://go.dev)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 A validating Docker API proxy that enforces **per-service policies** through a middleware pipeline. Designed for granting safe, audited Docker access to external contributors, CI/CD pipelines, and automated tooling — without giving them direct Docker daemon access.
+
+Key features:
+
+- **Policy-driven**: Per-service YAML policies control images, volumes, flags, and env vars
+- **Middleware pipeline**: 6 validation gates + 1 config mutator chain
+- **Default-deny router**: Only explicitly allowed endpoints pass through
+- **Formally verified**: [Quint](https://quint-lang.org/) specification with 8 security invariants
+- **Audit logging**: JSON-structured logs for all requests and decisions
+- **Zero dependencies**: Single Go binary, no runtime requirements
 
 ## Architecture
 
@@ -18,6 +31,9 @@ Docker CLI → docker-socket-policy (middleware chain) → Docker daemon
 
 ```bash
 go build -o docker-socket-policy .
+
+# Validate everything (typecheck, verify, vet, test)
+make validate
 ```
 
 ### Run
@@ -145,15 +161,17 @@ NoNewPrivileges=true
 
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine.
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 traces across 100+ steps each, checking all 8 invariants on every state transition.
+
+The CI pipeline runs verification on every push and PR. A violation blocks the build.
 
 ```bash
 make typecheck   # Quint type-check (proves type safety)
-make verify      # Random-simulation verification (no Java required)
+make verify      # Random-simulation verification (Rust backend, 2,400+ traces/sec)
 make validate    # All checks: typecheck + verify + go vet + go test
 ```
 
-See `spec/README.md` for details on the invariants and simulation coverage.
+See `spec/README.md` for details on the invariants, the middleware gate each maps to, and the attack scenarios each prevents.
 
 ## License
 
