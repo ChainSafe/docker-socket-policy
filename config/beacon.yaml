@@ -1,0 +1,62 @@
+# Per-service policy for the Lodestar beacon node.
+# Test with: docker-socket-policy --config-dir=./config
+service_name: beacon
+user_id: '2001'
+group_id: '2001'
+
+allowed_image_prefixes:
+  - chainsafe/lodestar
+  - ethpandaops/lodestar
+
+image_tag_pattern: '[A-Za-z0-9._\-]{1,128}'
+image_digest_allowed: true
+
+container_config:
+  network_mode: host
+  restart_policy: unless-stopped
+  security_options:
+    - no-new-privileges:true
+  user: '2001:2001'
+  log_driver: json-file
+  log_options:
+    max-file: '5'
+    max-size: 100m
+    mode: non-blocking
+    max-buffer-size: 4m
+
+volumes:
+  - host_path: /home/beacon
+    container_path: /data
+    read_write: true
+  - host_path: /etc/jwt_dir
+    container_path: /jwtdir
+    read_write: false
+
+env_file: /home/beacon/beacon.env
+
+allowed_cli_flags:
+  - --rcConfig
+  - --logLevel
+  - --dataDir
+  - --network
+
+flag_rules:
+  - flag: --rcConfig
+    value_pattern: '^/data/.*\.yml$'
+  - flag: --logLevel
+    value_pattern: '^(debug|info|warn|error)$'
+  - flag: --network
+    value_pattern: '^(mainnet|hoodi|sepolia|gnosis|chiado)$'
+
+denied_flags:
+  - --volume
+  - --mount
+  - --privileged
+  - --cap-add
+  - --cap-drop
+  - --device
+  - --security-opt
+  - --user
+  - --network
+  - --pid
+  - --ipc
