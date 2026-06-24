@@ -143,6 +143,18 @@ Restart=on-failure
 NoNewPrivileges=true
 ```
 
+## Formal Verification
+
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine.
+
+```bash
+make typecheck   # Quint type-check (proves type safety)
+make verify      # Random-simulation verification (no Java required)
+make validate    # All checks: typecheck + verify + go vet + go test
+```
+
+See `spec/README.md` for details on the invariants and simulation coverage.
+
 ## License
 
 Apache 2.0

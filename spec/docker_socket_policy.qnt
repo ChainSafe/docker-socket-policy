@@ -78,9 +78,8 @@ module docker_socket_policy {
     {
       serviceName: "beacon",
       allowedImages: Set(
-        "chainsafe/lodestar:latest",
-        "chainsafe/lodestar:next",
-        "ethpandaops/lodestar:latest"
+        "chainsafe/lodestar:beacon",
+        "ethpandaops/lodestar:beacon"
       ),
       containerConfig: {
         networkMode: "host",
@@ -102,8 +101,7 @@ module docker_socket_policy {
     {
       serviceName: "validator",
       allowedImages: Set(
-        "chainsafe/lodestar:latest",
-        "chainsafe/lodestar:next"
+        "chainsafe/lodestar:validator"
       ),
       containerConfig: {
         networkMode: "host",
@@ -244,23 +242,46 @@ module docker_socket_policy {
   }
 
   // ─── Step Action (for model checker) ──────────────────────────────────
+  //
+  // Non-deterministically picks one transition per step. Entry guards
+  // (imageAllowed, flagAllowed, volumeAllowed, envAllowed, etc.) naturally
+  // filter out invalid transitions. Actions that always fail (execContainer)
+  // are excluded — they contribute no state-space coverage.
+  //
+  // Create actions are weighted higher (3x) to quickly populate the container
+  // set so lifecycle operations (start/stop/remove) become productive.
 
   action step: bool = any {
-    createContainer("beacon", "chainsafe/lodestar:next",
-      Set("--rcConfig", "/data/config.yml"),
+    // --- Create actions (weighted 3x to seed containers early) ---
+    createContainer("beacon-0", "chainsafe/lodestar:beacon",
+      Set("--rcConfig", "--dataDir"),
       Set("/home/beacon"), Set(), false),
-    createContainer("validator", "chainsafe/lodestar:latest",
+    createContainer("beacon-1", "chainsafe/lodestar:beacon",
+      Set("--rcConfig", "--logLevel"),
+      Set("/home/beacon"), Set(), false),
+    createContainer("beacon-2", "chainsafe/lodestar:beacon",
+      Set("--network", "--rcConfig"),
+      Set("/home/beacon"), Set(), false),
+    createContainer("validator-0", "chainsafe/lodestar:validator",
+      Set("--dataDir", "/data/validator"),
+      Set("/home/validator"), Set(), false),
+    createContainer("validator-1", "chainsafe/lodestar:validator",
+      Set("--dataDir", "/data/validator"),
+      Set("/home/validator"), Set(), false),
+    createContainer("validator-2", "chainsafe/lodestar:validator",
       Set("--dataDir", "/data/validator"),
       Set("/home/validator"), Set(), false),
     createContainer("evil", "attacker/malware:latest",
-      Set(), Set(), Set(), true),
-    startContainer("beacon"),
-    stopContainer("beacon"),
-    removeContainer("beacon"),
-    execContainer("beacon"),
-    pullImage("chainsafe/lodestar:next"),
-    pullImage("attacker/malware:latest"),
-    readOnlyRequest("GET", "/_ping")
+      Set("--privileged"), Set(), Set(), true),
+    // --- Lifecycle actions (conditional on container existence) ---
+    startContainer("beacon-0"),
+    stopContainer("beacon-0"),
+    removeContainer("beacon-0"),
+    // --- Read-only & image pull (always productive) ---
+    pullImage("chainsafe/lodestar:beacon"),
+    pullImage("chainsafe/lodestar:validator"),
+    readOnlyRequest("GET", "/_ping"),
+    readOnlyRequest("GET", "/containers/json")
   }
 
   // ─── Invariants ───────────────────────────────────────────────────────

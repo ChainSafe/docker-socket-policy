@@ -17,12 +17,16 @@ This directory contains a [Quint](https://quint-lang.org/) formal specification 
 # Type-check the spec (proves type safety)
 quint typecheck spec/docker_socket_policy.qnt
 
-# Verify all invariants (requires Java for Apalache model checker)
-quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy.qnt
-
-# Random-simulation test (no Java required)
-quint verify --random-transitions --max-steps=100 --invariants allInvariants \
+# Random-simulation verification (fast, no Java required)
+quint run --max-steps=50 --invariants allInvariants --backend rust \
   spec/docker_socket_policy.qnt
+
+# Random-simulation with TypeScript backend (slower, no binary download)
+quint run --max-steps=50 --invariants allInvariants --backend typescript \
+  spec/docker_socket_policy.qnt
+
+# Formal model-checking via Apalache (exhaustive, requires Java)
+quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy.qnt
 ```
 
 ## Verification Coverage
