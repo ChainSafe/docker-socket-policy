@@ -12,17 +12,20 @@ module policy {
 
   type Policy = {
     serviceName: str,
-    allowedImages: Set[str],
+    allowedImagePrefixes: Set[str],
+    imageTagPattern: str,
+    imageDigestAllowed: bool,
     containerConfig: ContainerConfig,
     volumes: Set[str],
-    envFile: bool,
+    envFile: str,
+    privileged: bool,
     allowedCliFlags: Set[str],
     flagRules: List[FlagRule],
     deniedFlags: Set[str]
   }
 
-  pure def imageAllowed(image: str, policy: Policy): bool = {
-    policy.allowedImages.contains(image)
+  pure def imageNameAllowed(name: str, policy: Policy): bool = {
+    policy.allowedImagePrefixes.contains(name)
   }
 
   pure def flagAllowed(flag: str, policy: Policy): bool = {
@@ -35,7 +38,7 @@ module policy {
   }
 
   pure def envAllowed(envVars: Set[str], policy: Policy): bool = {
-    not(policy.envFile) or envVars.size() == 0
+    policy.envFile == "" or envVars.size() == 0
   }
 }
 
@@ -77,10 +80,12 @@ module docker_socket_policy {
   val policies: Set[Policy] = Set(
     {
       serviceName: "beacon",
-      allowedImages: Set(
-        "chainsafe/lodestar:beacon",
-        "ethpandaops/lodestar:beacon"
+      allowedImagePrefixes: Set(
+        "chainsafe/lodestar",
+        "ethpandaops/lodestar"
       ),
+      imageTagPattern: "",
+      imageDigestAllowed: false,
       containerConfig: {
         networkMode: "host",
         restartPolicy: "unless-stopped",
@@ -88,7 +93,8 @@ module docker_socket_policy {
         user: "2001:2001"
       },
       volumes: Set("/home/beacon", "/etc/jwt_dir"),
-      envFile: true,
+      envFile: "/etc/docker/env/beacon.env",
+      privileged: false,
       allowedCliFlags: Set("--rcConfig", "--logLevel", "--dataDir", "--network"),
       flagRules: List(
         { flag: "--rcConfig", valuePattern: "^/data/.*\\.yml$" },
@@ -100,9 +106,11 @@ module docker_socket_policy {
     },
     {
       serviceName: "validator",
-      allowedImages: Set(
-        "chainsafe/lodestar:validator"
+      allowedImagePrefixes: Set(
+        "chainsafe/lodestar"
       ),
+      imageTagPattern: "",
+      imageDigestAllowed: false,
       containerConfig: {
         networkMode: "host",
         restartPolicy: "unless-stopped",
@@ -110,7 +118,8 @@ module docker_socket_policy {
         user: "2002:2002"
       },
       volumes: Set("/home/validator"),
-      envFile: true,
+      envFile: "/etc/docker/env/validator.env",
+      privileged: false,
       allowedCliFlags: Set("--rcConfig", "--logLevel", "--dataDir", "--network"),
       flagRules: List(
         { flag: "--rcConfig", valuePattern: "^/data/.*\\.yml$" }
@@ -176,7 +185,7 @@ module docker_socket_policy {
     volumes: Set[str], envVars: Set[str],
     privileged: bool
   ): bool = {
-    nondet matched = oneOf(policies.filter(p => imageAllowed(image, p)))
+    nondet matched = oneOf(policies.filter(p => imageNameAllowed(image, p)))
     all {
       flags.forall(f => flagAllowed(f, matched)),
       volumes.forall(v => volumeAllowed(v, matched)),
@@ -190,7 +199,7 @@ module docker_socket_policy {
           image: image,
           privileged: false,
           volumes: volumes.intersect(matched.volumes),
-          envVars: if (matched.envFile) Set() else envVars,
+          envVars: if (matched.envFile != "") Set() else envVars,
           flags: flags.intersect(matched.allowedCliFlags),
           networkMode: matched.containerConfig.networkMode,
           running: true
@@ -229,7 +238,7 @@ module docker_socket_policy {
   }
 
   action pullImage(image: str): bool = {
-    nondet matched = oneOf(policies.filter(p => imageAllowed(image, p)))
+    nondet matched = oneOf(policies.filter(p => imageNameAllowed(image, p)))
     all {
       containers' = containers,
       proxyRunning' = proxyRunning
@@ -291,13 +300,13 @@ module docker_socket_policy {
   val networkModeEnforced = containers.forall(c => c.networkMode == "host")
 
   val allImagesAllowlisted = containers.forall(c =>
-    policies.exists(p => imageAllowed(c.image, p))
+    policies.exists(p => imageNameAllowed(c.image, p))
   )
 
   val envFromFileOnly = containers.forall(c =>
     policies.exists(p =>
       p.serviceName == c.serviceName
-        and (not(p.envFile) or c.envVars.size() == 0)
+        and (p.envFile == "" or c.envVars.size() == 0)
     )
   )
 
