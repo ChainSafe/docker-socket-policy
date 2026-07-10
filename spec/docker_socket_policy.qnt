@@ -47,31 +47,47 @@ module policy {
 module docker_socket_policy {
   import policy.*
 
+  // ─── Image Reference Types ──────────────────────────────────────────
+  //
+  // Models the split-then-validate pipeline for Docker image references.
+  // At runtime the proxy splits "image:tag" into name + tag/digest, then
+  // validates each part against the policy. Quint can't do string splitting
+  // or regex, so we model the EFFECT: only ValidImage reaches the container.
+
+  type ImageRef =
+    | ValidImage(name: str, tag: str)
+    | InvalidTag(name: str, tag: str)
+    | InvalidDigest(digest: str)
+
+  // ─── Container State ────────────────────────────────────────────────
+
+  type ContainerState = Running | Paused | Exited
+
   // ─── Container Type ──────────────────────────────────────────────────
 
   type Container = {
     name: str,
     serviceName: str,
-    image: str,
+    imageRef: ImageRef,
+    state: ContainerState,
     privileged: bool,
     volumes: Set[str],
     envVars: Set[str],
     flags: Set[str],
-    networkMode: str,
-    running: bool
+    networkMode: str
   }
 
-  pure def setRunning(c: Container, r: bool): Container = {
+  pure def setState(c: Container, s: ContainerState): Container = {
     {
       name: c.name,
       serviceName: c.serviceName,
-      image: c.image,
+      imageRef: c.imageRef,
+      state: s,
       privileged: c.privileged,
       volumes: c.volumes,
       envVars: c.envVars,
       flags: c.flags,
-      networkMode: c.networkMode,
-      running: r
+      networkMode: c.networkMode
     }
   }
 
