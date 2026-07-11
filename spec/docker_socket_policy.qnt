@@ -375,42 +375,49 @@ module docker_socket_policy {
   }
 
   // ─── Invariants ───────────────────────────────────────────────────────
+  //
+  // P0 — must never fail under any action sequence.
+  // P1 — should never fail under normal operation.
 
-  val noPrivileged = containers.forall(c => not(c.privileged))
+  val noPrivilegedAccess = containers.forall(c => not(c.privileged))
 
-  val networkModeEnforced = containers.forall(c => c.networkMode == "host")
+  val alwaysHostNetwork = containers.forall(c => c.networkMode == "host")
 
-  val allImagesAllowlisted = containers.forall(c =>
+  val imagesAlwaysAllowed = containers.forall(c =>
     if (c.imageRef.kind == "valid")
       policies.exists(p => imageNameAllowed(c.imageRef.imageName, p))
     else
       false
   )
 
-  val envFromFileOnly = containers.forall(c =>
+  val validImagesOnly = containers.forall(c =>
+    c.imageRef.kind == "valid"
+  )
+
+  val envOnlyFromFile = containers.forall(c =>
     policies.exists(p =>
       p.serviceName == c.serviceName
         and (p.envFile == "" or c.envVars.size() == 0)
     )
   )
 
-  val proxyAlwaysRunning = proxyRunning
+  val proxyLives = proxyRunning
 
-  val volumesWhitelisted = containers.forall(c =>
+  val volumesInWhitelist = containers.forall(c =>
     policies.exists(p =>
       p.serviceName == c.serviceName
         and c.volumes.subseteq(p.volumes)
     )
   )
 
-  val flagsAllowlisted = containers.forall(c =>
+  val flagsInAllowlist = containers.forall(c =>
     policies.exists(p =>
       p.serviceName == c.serviceName
         and c.flags.forall(f => flagAllowed(f, p))
     )
   )
 
-  val allEndpointsMatched = all {
+  val routingTableComplete = all {
     endpointsTable.contains({ method: "GET",  path: "/_ping",                 kind: "allowRead" }),
     endpointsTable.contains({ method: "GET",  path: "/version",               kind: "allowRead" }),
     endpointsTable.contains({ method: "GET",  path: "/info",                  kind: "allowRead" }),
@@ -422,6 +429,10 @@ module docker_socket_policy {
     endpointsTable.contains({ method: "POST", path: "/containers/create",     kind: "create" }),
     endpointsTable.contains({ method: "POST", path: "/containers/:name/start",kind: "allowAction" }),
     endpointsTable.contains({ method: "POST", path: "/containers/:name/stop", kind: "allowAction" }),
+    endpointsTable.contains({ method: "POST", path: "/containers/:name/restart",kind: "allowAction" }),
+    endpointsTable.contains({ method: "POST", path: "/containers/:name/kill", kind: "allowAction" }),
+    endpointsTable.contains({ method: "POST", path: "/containers/:name/wait", kind: "allowAction" }),
+    endpointsTable.contains({ method: "POST", path: "/containers/:name/unpause",kind: "allowAction" }),
     endpointsTable.contains({ method: "DELETE", path: "/containers/:name",    kind: "allowAction" }),
 
     endpointsTable.contains({ method: "POST", path: "/images/create",         kind: "pullImage" }),
@@ -432,7 +443,7 @@ module docker_socket_policy {
     endpointsTable.contains({ method: "POST", path: "/containers/:name/exec", kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/containers/:name/rename",kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/containers/:name/update",kind: "deny" }),
-    endpointsTable.contains({ method: "POST", path: "/containers/:name/kill", kind: "deny" }),
+    endpointsTable.contains({ method: "POST", path: "/containers/:name/pause",kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/containers/:name/attach",kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/containers/:name/prune", kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/networks/create",       kind: "deny" }),
@@ -440,17 +451,18 @@ module docker_socket_policy {
   }
 
   val allP0Invariants = all {
-    noPrivileged,
-    networkModeEnforced,
-    allImagesAllowlisted,
-    envFromFileOnly,
-    proxyAlwaysRunning
+    noPrivilegedAccess,
+    alwaysHostNetwork,
+    imagesAlwaysAllowed,
+    validImagesOnly,
+    envOnlyFromFile,
+    proxyLives
   }
 
   val allInvariants = allP0Invariants.and(all {
-    volumesWhitelisted,
-    flagsAllowlisted,
-    allEndpointsMatched
+    volumesInWhitelist,
+    flagsInAllowlist,
+    routingTableComplete
   })
 
   // Attack scenarios are documented in spec/README.md.
