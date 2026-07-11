@@ -38,6 +38,7 @@ quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy
 | `noPrivilegedAccess` | No created container has `privileged=true` | ContainerConfigMutator sets `privileged=false` |
 | `alwaysHostNetwork` | All containers use `network_mode: host` | ContainerConfigMutator enforces `networkMode=host` |
 | `imagesAlwaysAllowed` | All images match an `allowed_image_prefix` | RegistryGate via `nondet` policy match |
+| `validImagesOnly` | No container has invalid image ref (`InvalidTag`, `InvalidDigest`) | `createContainer` guard rejects invalid variants |
 | `envOnlyFromFile` | No inline env vars when policy sets `env_file` | EnvFileGate → `envAllowed()` |
 | `proxyLives` | Proxy process stays running | Error-handling recovery |
 
@@ -55,7 +56,8 @@ quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy
 |----------|----------------|--------------|
 | Privileged Escalation | Request `createContainer(privileged=true)` | `noPrivileged` — guard rejects privileged containers |
 | Exec Escape | Request `execContainer("beacon")` | `execContainer` unconditionally returns false |
-| Unlisted Image | Request `createContainer("attacker/malware:latest")` | `allImagesAllowlisted` — no matching policy |
+| Unlisted Image | Request `createContainer("attacker/malware:latest")` | `imagesAlwaysAllowed` — no matching policy |
+| Invalid Image Ref | Request `createContainer(InvalidTag/InvalidDigest)` | `validImagesOnly` — `createContainer` guard rejects non-valid |
 | Inline Env | Request `createContainer` with `VALIDATOR_KEY=secret` | `envFromFileOnly` — `envFile=true` policy rejects inline env |
 | Docker Socket Mount | Request `createContainer` with `/var/run/docker.sock` | `volumesWhitelisted` — `/var/run/docker.sock` not in policy |
 | Privileged Flag | Request `createContainer` with `--privileged` flag | `flagsAllowlisted` — `--privileged` is in `deniedFlags` |
@@ -70,33 +72,46 @@ quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy
           readOnlyRequest(_)
                          │
                          ▼
-  ┌──────────────────────────────────────────────────────┐
-  │                                                      │
-  │   createContainer(name, image, ...)                  │
-  │     │ guards: nondet, flagAllowed,                   │
-  │     │         volumeAllowed, envAllowed, not(priv)    │
-  │     │ mutators: enforcedPrivileged, networkMode,     │
-  │     │          effectiveFlags, effectiveVolumes,     │
-  │     │          effectiveEnvVars                       │
-  │     ▼                                                │
-  │   ┌──────────────────────────────────────────┐       │
-  │   │  startContainer(name)                    │       │
-  │   │      ┌─ guard: containerExists            │       │
-  │   │      └─ effect: c.running = true          │       │
-  │   │                                          │       │
-  │   │  stopContainer(name)                     │       │
-  │   │      ┌─ guard: containerExists            │       │
-  │   │      └─ effect: c.running = false         │       │
-  │   │                                          │       │
-  │   │  removeContainer(name)                   │       │
-  │   │      ┌─ guard: containerExists            │       │
-  │   │      └─ effect: remove from set           │       │
-  │   └──────────────────────────────────────────┘       │
-  │                                                      │
-  │   execContainer(name)  ──►  false  ──► DENIED       │
-  │   pullImage(image)      ──►  nondet policy match    │
-  │                                                      │
-  └──────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────┐
+ │                                                      │
+ │   createContainer(name, imageRef, ...)               │
+ │     │ guards: nondet, imageNameAllowed, flagAllowed, │
+ │     │         volumeAllowed, envAllowed, not(priv)   │
+ │     │         ValidImage only (invalid rejected)     │
+ │     │ mutators: enforcedPrivileged, networkMode,     │
+ │     │          effectiveFlags, effectiveVolumes,     │
+ │     │          effectiveEnvVars                      │
+ │     ▼                                                │
+ │   ┌──────────────────────────────────────────────────┐
+ │   │  start(name) / unpause(name)                     │
+ │   │      ┌─ guard: containerExists                    │
+ │   │      │  (paused → Running for unpause)            │
+ │   │      └─ effect: state = Running                   │
+ │   │                                                   │
+ │   │  stop(name) / kill(name)                          │
+ │   │      ┌─ guard: containerExists                    │
+ │   │      └─ effect: state = Exited                    │
+ │   │                                                   │
+ │   │  pause(name)                                      │
+ │   │      ┌─ guard: containerExists                    │
+ │   │      └─ effect: state = Paused                    │
+ │   │                                                   │
+ │   │  restart(name)                                    │
+ │   │      ┌─ guard: containerExists                    │
+ │   │      └─ effect: state = Running                   │
+ │   │                                                   │
+ │   │  wait(name)                                       │
+ │   │      ┌─ guard: containerExists                    │
+ │   │      └─ effect: no state change (read-only)       │
+ │   │                                                   │
+ │   │  removeContainer(name)                            │
+ │   │      └─ guard: containerExists                    │
+ │   │      └─ effect: remove from set                   │
+ │   └──────────────────────────────────────────────────┘ │
+ │                                                      │
+ │   pullImage(image)  ──►  nondet policy match        │
+ │                                                      │
+ └──────────────────────────────────────────────────────┘
 ```
 
 ## When to Update the Spec
