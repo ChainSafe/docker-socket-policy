@@ -54,10 +54,12 @@ module docker_socket_policy {
   // validates each part against the policy. Quint can't do string splitting
   // or regex, so we model the EFFECT: only ValidImage reaches the container.
 
-  type ImageRef =
-    | ValidImage(name: str, tag: str)
-    | InvalidTag(name: str, tag: str)
-    | InvalidDigest(digest: str)
+  type ImageRef = {
+    kind: str,
+    imageName: str,
+    tag: str,
+    digest: str
+  }
 
   // ─── Container State ────────────────────────────────────────────────
 
@@ -201,30 +203,36 @@ module docker_socket_policy {
   // ─── Container Lifecycle Actions ─────────────────────────────────────
 
   action createContainer(
-    name: str, image: str, flags: Set[str],
+    name: str, imageRef: ImageRef, flags: Set[str],
     volumes: Set[str], envVars: Set[str],
     privileged: bool
   ): bool = {
-    nondet matched = oneOf(policies.filter(p => imageNameAllowed(image, p)))
-    all {
-      flags.forall(f => flagAllowed(f, matched)),
-      volumes.forall(v => volumeAllowed(v, matched)),
-      envAllowed(envVars, matched),
-      not(privileged),
+    if (imageRef.kind == "valid") {
+      nondet matched = oneOf(policies.filter(p => imageNameAllowed(imageRef.imageName, p)))
+      all {
+        flags.forall(f => flagAllowed(f, matched)),
+        volumes.forall(v => volumeAllowed(v, matched)),
+        envAllowed(envVars, matched),
+        not(privileged) and not(matched.privileged),
 
-      containers' = containers.union(
-        Set({
-          name: name,
-          serviceName: matched.serviceName,
-          image: image,
-          privileged: false,
-          volumes: volumes.intersect(matched.volumes),
-          envVars: if (matched.envFile != "") Set() else envVars,
-          flags: flags.intersect(matched.allowedCliFlags),
-          networkMode: matched.containerConfig.networkMode,
-          running: true
-        })
-      ),
+        containers' = containers.union(
+          Set({
+            name: name,
+            serviceName: matched.serviceName,
+            imageRef: imageRef,
+            state: Running,
+            privileged: false,
+            volumes: volumes.intersect(matched.volumes),
+            envVars: if (matched.envFile != "") Set() else envVars,
+            flags: flags.intersect(matched.allowedCliFlags),
+            networkMode: matched.containerConfig.networkMode
+          })
+        ),
+        proxyRunning' = proxyRunning
+      }
+    } else all {
+      false,
+      containers' = containers,
       proxyRunning' = proxyRunning
     }
   }
@@ -232,7 +240,7 @@ module docker_socket_policy {
   action startContainer(name: str): bool = all {
     containerExists(name),
     containers' = containers.map(c =>
-      if (c.name == name) setRunning(c, true) else c
+      if (c.name == name) setState(c, Running) else c
     ),
     proxyRunning' = proxyRunning
   }
@@ -240,7 +248,45 @@ module docker_socket_policy {
   action stopContainer(name: str): bool = all {
     containerExists(name),
     containers' = containers.map(c =>
-      if (c.name == name) setRunning(c, false) else c
+      if (c.name == name) setState(c, Exited) else c
+    ),
+    proxyRunning' = proxyRunning
+  }
+
+  action restartContainer(name: str): bool = all {
+    containerExists(name),
+    containers' = containers.map(c =>
+      if (c.name == name) setState(c, Running) else c
+    ),
+    proxyRunning' = proxyRunning
+  }
+
+  action killContainer(name: str): bool = all {
+    containerExists(name),
+    containers' = containers.map(c =>
+      if (c.name == name) setState(c, Exited) else c
+    ),
+    proxyRunning' = proxyRunning
+  }
+
+  action waitContainer(name: str): bool = all {
+    containerExists(name),
+    containers' = containers,
+    proxyRunning' = proxyRunning
+  }
+
+  action pauseContainer(name: str): bool = all {
+    containerExists(name),
+    containers' = containers.map(c =>
+      if (c.name == name) setState(c, Paused) else c
+    ),
+    proxyRunning' = proxyRunning
+  }
+
+  action unpauseContainer(name: str): bool = all {
+    containerExists(name),
+    containers' = containers.map(c =>
+      if (c.name == name) setState(c, Running) else c
     ),
     proxyRunning' = proxyRunning
   }
@@ -248,12 +294,6 @@ module docker_socket_policy {
   action removeContainer(name: str): bool = all {
     containerExists(name),
     containers' = containers.exclude(containers.filter(c => c.name == name)),
-    proxyRunning' = proxyRunning
-  }
-
-  action execContainer(name: str): bool = all {
-    false,
-    containers' = containers,
     proxyRunning' = proxyRunning
   }
 
@@ -272,43 +312,64 @@ module docker_socket_policy {
 
   // ─── Step Action (for model checker) ──────────────────────────────────
   //
+  // Ordering note: At runtime, mutators (ContainerConfigMutator) run BEFORE
+  // gates (MountSourceGate, RegistryGate). The mutated body is what gates
+  // validate. In the spec, guards and state updates are combined in all {}
+  // blocks — this models the end-to-end invariant, not the pipeline ordering.
+  //
   // Non-deterministically picks one transition per step. Entry guards
-  // (imageAllowed, flagAllowed, volumeAllowed, envAllowed, etc.) naturally
-  // filter out invalid transitions. Actions that always fail (execContainer)
-  // are excluded — they contribute no state-space coverage.
+  // (imageNameAllowed, flagAllowed, volumeAllowed, envAllowed, etc.)
+  // naturally filter out invalid transitions. execContainer is modeled as
+  // an endpointsTable deny entry, not a separate action.
   //
   // Create actions are weighted higher (3x) to quickly populate the container
-  // set so lifecycle operations (start/stop/remove) become productive.
+  // set so lifecycle operations become productive.
 
   action step: bool = any {
     // --- Create actions (weighted 3x to seed containers early) ---
-    createContainer("beacon-0", "chainsafe/lodestar:beacon",
+    createContainer("beacon-0",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
       Set("--rcConfig", "--dataDir"),
       Set("/home/beacon"), Set(), false),
-    createContainer("beacon-1", "chainsafe/lodestar:beacon",
+    createContainer("beacon-1",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
       Set("--rcConfig", "--logLevel"),
       Set("/home/beacon"), Set(), false),
-    createContainer("beacon-2", "chainsafe/lodestar:beacon",
+    createContainer("beacon-2",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
       Set("--network", "--rcConfig"),
       Set("/home/beacon"), Set(), false),
-    createContainer("validator-0", "chainsafe/lodestar:validator",
+    createContainer("validator-0",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "validator", digest: "" },
       Set("--dataDir", "/data/validator"),
       Set("/home/validator"), Set(), false),
-    createContainer("validator-1", "chainsafe/lodestar:validator",
+    createContainer("validator-1",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "validator", digest: "" },
       Set("--dataDir", "/data/validator"),
       Set("/home/validator"), Set(), false),
-    createContainer("validator-2", "chainsafe/lodestar:validator",
+    createContainer("validator-2",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "validator", digest: "" },
       Set("--dataDir", "/data/validator"),
       Set("/home/validator"), Set(), false),
-    createContainer("evil", "attacker/malware:latest",
+    // --- Rejected create attempts (always fail, test coverage) ---
+    createContainer("evil",
+      { kind: "invalidTag", imageName: "attacker/malware", tag: "latest", digest: "" },
       Set("--privileged"), Set(), Set(), true),
+    createContainer("bad-digest",
+      { kind: "invalidDigest", imageName: "", tag: "", digest: "sha256:badbadbad" },
+      Set(), Set(), Set(), false),
     // --- Lifecycle actions (conditional on container existence) ---
     startContainer("beacon-0"),
     stopContainer("beacon-0"),
+    restartContainer("beacon-0"),
+    killContainer("beacon-0"),
+    waitContainer("beacon-0"),
+    pauseContainer("beacon-0"),
+    unpauseContainer("beacon-0"),
     removeContainer("beacon-0"),
     // --- Read-only & image pull (always productive) ---
-    pullImage("chainsafe/lodestar:beacon"),
-    pullImage("chainsafe/lodestar:validator"),
+    pullImage("chainsafe/lodestar"),
+    pullImage("chainsafe/lodestar"),
     readOnlyRequest("GET", "/_ping"),
     readOnlyRequest("GET", "/containers/json")
   }
@@ -320,7 +381,10 @@ module docker_socket_policy {
   val networkModeEnforced = containers.forall(c => c.networkMode == "host")
 
   val allImagesAllowlisted = containers.forall(c =>
-    policies.exists(p => imageNameAllowed(c.image, p))
+    if (c.imageRef.kind == "valid")
+      policies.exists(p => imageNameAllowed(c.imageRef.imageName, p))
+    else
+      false
   )
 
   val envFromFileOnly = containers.forall(c =>
