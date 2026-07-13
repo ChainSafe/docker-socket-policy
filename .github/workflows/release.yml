@@ -8,23 +8,41 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - name: Go vet
-        run: cd go && go vet ./...
-      - name: Go test
-        run: cd go && go test ./... -count=1
-      - name: Go build
-        run: cd go && go build -o /dev/null .
+      - name: Validate Go
+        run: |
+          cd go && go vet ./...
+          go test ./... -count=1
+          go build -o /dev/null .
 
-  goreleaser:
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate Rust
+        run: |
+          cd rs && cargo test
+          cargo build --release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - name: Validate TypeScript
+        run: |
+          cd ts && npm ci
+          npm run build
+          node --test dist/*.test.js
+
+  release-go:
     needs: [validate]
     runs-on: ubuntu-latest
     steps:
@@ -41,3 +59,165 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate SPDX SBOM for Go binary
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: docker-socket-policy-go.spdx.json
+
+      - name: Generate CycloneDX SBOM for Go binary
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: docker-socket-policy-go.cyclonedx.json
+
+      - name: Upload Go SBOMs to release
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            docker-socket-policy-go.spdx.json \
+            docker-socket-policy-go.cyclonedx.json \
+            --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign Go Docker image with Cosign
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          cosign sign --yes \
+            ghcr.io/chainsafe/docker-socket-policy-go:${{ github.ref_name }}
+
+  release-rust:
+    needs: [release-go]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Rust binary
+        run: cd rs && cargo build --release
+      - name: Upload Rust binary to release
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            rs/target/release/docker-socket-policy#docker-socket-policy-rs-linux-amd64 \
+            --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push Rust Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: rs
+          file: rs/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/chainsafe/docker-socket-policy-rs:${{ github.ref_name }}
+            ghcr.io/chainsafe/docker-socket-policy-rs:latest
+
+      - name: Generate SPDX SBOM for Rust binary
+        uses: anchore/sbom-action@v0
+        with:
+          path: rs/target/release/docker-socket-policy
+          format: spdx-json
+          output-file: docker-socket-policy-rs.spdx.json
+
+      - name: Generate CycloneDX SBOM for Rust binary
+        uses: anchore/sbom-action@v0
+        with:
+          path: rs/target/release/docker-socket-policy
+          format: cyclonedx-json
+          output-file: docker-socket-policy-rs.cyclonedx.json
+
+      - name: Upload Rust SBOMs to release
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            docker-socket-policy-rs.spdx.json \
+            docker-socket-policy-rs.cyclonedx.json \
+            --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign Rust Docker image with Cosign
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          cosign sign --yes \
+            ghcr.io/chainsafe/docker-socket-policy-rs:${{ github.ref_name }}
+
+  release-ts:
+    needs: [release-go]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - name: Build TypeScript
+        run: |
+          cd ts && npm ci
+          npm run build
+      - name: Create TypeScript archive
+        run: |
+          cd ts && tar czf ../docker-socket-policy-ts-${{ github.ref_name }}.tar.gz \
+            dist/ node_modules/ package.json package-lock.json
+      - name: Upload TypeScript archive to release
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            docker-socket-policy-ts-${{ github.ref_name }}.tar.gz \
+            --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push TypeScript Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ts
+          file: ts/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/chainsafe/docker-socket-policy-ts:${{ github.ref_name }}
+            ghcr.io/chainsafe/docker-socket-policy-ts:latest
+
+      - name: Generate SPDX SBOM for TypeScript archive
+        uses: anchore/sbom-action@v0
+        with:
+          path: docker-socket-policy-ts-${{ github.ref_name }}.tar.gz
+          format: spdx-json
+          output-file: docker-socket-policy-ts.spdx.json
+
+      - name: Generate CycloneDX SBOM for TypeScript archive
+        uses: anchore/sbom-action@v0
+        with:
+          path: docker-socket-policy-ts-${{ github.ref_name }}.tar.gz
+          format: cyclonedx-json
+          output-file: docker-socket-policy-ts.cyclonedx.json
+
+      - name: Upload TypeScript SBOMs to release
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            docker-socket-policy-ts.spdx.json \
+            docker-socket-policy-ts.cyclonedx.json \
+            --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign TypeScript Docker image with Cosign
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          cosign sign --yes \
+            ghcr.io/chainsafe/docker-socket-policy-ts:${{ github.ref_name }}

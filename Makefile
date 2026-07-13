@@ -95,3 +95,41 @@ test-integration-sock:
 	exit $$rc
 
 validate: typecheck verify lint-go test-go
+
+# ─── Reproducible build verification ─────────────────
+
+.PHONY: verify-reproducible-go verify-reproducible-rs verify-reproducible-ts verify-reproducible-all
+
+verify-reproducible-go:
+	docker build --no-cache --platform linux/amd64 \
+	  --build-arg VERSION=$(VERSION) \
+	  --output type=local,dest=/tmp/repro-go-a \
+	  -f go/Dockerfile go/
+	docker build --no-cache --platform linux/amd64 \
+	  --build-arg VERSION=$(VERSION) \
+	  --output type=local,dest=/tmp/repro-go-b \
+	  -f go/Dockerfile go/
+	cmp /tmp/repro-go-a/docker-socket-policy /tmp/repro-go-b/docker-socket-policy \
+	  && echo "Go: REPRODUCIBLE ✓" && rm -rf /tmp/repro-go-a /tmp/repro-go-b
+
+verify-reproducible-rs:
+	docker build --no-cache --platform linux/amd64 \
+	  --output type=local,dest=/tmp/repro-rs-a \
+	  -f rs/Dockerfile rs/
+	docker build --no-cache --platform linux/amd64 \
+	  --output type=local,dest=/tmp/repro-rs-b \
+	  -f rs/Dockerfile rs/
+	cmp /tmp/repro-rs-a/docker-socket-policy /tmp/repro-rs-b/docker-socket-policy \
+	  && echo "Rust: REPRODUCIBLE ✓" && rm -rf /tmp/repro-rs-a /tmp/repro-rs-b
+
+verify-reproducible-ts:
+	docker build --no-cache --platform linux/amd64 \
+	  --output type=local,dest=/tmp/repro-ts-a \
+	  -f ts/Dockerfile ts/
+	docker build --no-cache --platform linux/amd64 \
+	  --output type=local,dest=/tmp/repro-ts-b \
+	  -f ts/Dockerfile ts/
+	cmp /tmp/repro-ts-a/dist/index.js /tmp/repro-ts-b/dist/index.js \
+	  && echo "TypeScript: REPRODUCIBLE ✓" && rm -rf /tmp/repro-ts-a /tmp/repro-ts-b
+
+verify-reproducible-all: verify-reproducible-go verify-reproducible-rs verify-reproducible-ts

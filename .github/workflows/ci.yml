@@ -68,3 +68,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make test-integration
+
+  reproducible-build:
+    runs-on: ubuntu-latest
+    needs: [go, rust, typescript]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Go reproducibility
+        run: make verify-reproducible-go
+      - name: Verify Rust reproducibility
+        run: make verify-reproducible-rs
+      - name: Verify TypeScript reproducibility
+        run: make verify-reproducible-ts
