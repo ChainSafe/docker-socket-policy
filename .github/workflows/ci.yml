@@ -11,14 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: informalsystems/quint-action@v1
+      - uses: actions/setup-node@v4
         with:
-          entrypoint: spec/docker_socket_policy.qnt
-          args: typecheck
-      - uses: informalsystems/quint-action@v1
-        with:
-          entrypoint: spec/docker_socket_policy.qnt
-          args: run --max-steps=100 --invariants allInvariants
+          node-version: "22"
+      - run: npm install -g @informalsystems/quint
+      - run: quint typecheck spec/docker_socket_policy.qnt
+      - run: quint run --max-steps=100 --invariants allInvariants spec/docker_socket_policy.qnt
 
   go:
     runs-on: ubuntu-latest
