@@ -129,7 +129,7 @@ verify-reproducible-ts:
 	docker build --no-cache --platform linux/amd64 \
 	  --output type=local,dest=/tmp/repro-ts-b \
 	  -f ts/Dockerfile ts/
-	cmp /tmp/repro-ts-a/dist/index.js /tmp/repro-ts-b/dist/index.js \
+	cmp /tmp/repro-ts-a/app/dist/index.js /tmp/repro-ts-b/app/dist/index.js \
 	  && echo "TypeScript: REPRODUCIBLE ✓" && rm -rf /tmp/repro-ts-a /tmp/repro-ts-b
 
 verify-reproducible-all: verify-reproducible-go verify-reproducible-rs verify-reproducible-ts
