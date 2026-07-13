@@ -16,7 +16,7 @@ jobs:
           node-version: "22"
       - run: npm install -g @informalsystems/quint
       - run: quint typecheck spec/docker_socket_policy.qnt
-      - run: quint run --max-steps=100 --invariants allInvariants --backend typescript spec/docker_socket_policy.qnt
+      - run: quint run --max-steps=100 --invariants allInvariants spec/docker_socket_policy.qnt
 
   go:
     runs-on: ubuntu-latest
