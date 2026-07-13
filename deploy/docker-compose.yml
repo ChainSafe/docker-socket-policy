@@ -1,0 +1,29 @@
+name: docker-socket-policy-test
+
+services:
+  proxy:
+    build:
+      context: ../go
+      dockerfile: Dockerfile
+    user: root
+    ports:
+      - "12375:2375"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config:/etc/docker-socket-policy/services:ro
+    command:
+      - --docker-host=/var/run/docker.sock
+      - --listen-tcp=0.0.0.0:2375
+      - --listen-socket=/tmp/docker-socket-policy.sock
+      - --config-dir=/etc/docker-socket-policy/services
+      - --log-file=/tmp/docker-socket-policy.log
+
+  test:
+    image: docker:28-cli
+    depends_on:
+      - proxy
+    environment:
+      DOCKER_HOST: tcp://proxy:2375
+    volumes:
+      - ./test.sh:/test.sh:ro
+    entrypoint: ["/bin/sh", "/test.sh"]

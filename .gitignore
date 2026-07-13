@@ -1,2 +1,20 @@
-# Binary
+# Binaries
 /docker-socket-policy
+go/docker-socket-policy
+
+# Dependencies
+/quint-llm-kit/
+
+# TypeScript
+ts/dist/
+ts/node_modules/
+
+# Rust
+rs/target/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

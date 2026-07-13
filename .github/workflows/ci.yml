@@ -6,37 +6,67 @@ on:
   pull_request:
     branches: [main]
 
-permissions:
-  contents: read
-
 jobs:
-  validate:
+  quint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: informalsystems/quint-action@v1
+        with:
+          entrypoint: spec/docker_socket_policy.qnt
+          args: typecheck
+      - uses: informalsystems/quint-action@v1
+        with:
+          entrypoint: spec/docker_socket_policy.qnt
+          args: run --max-steps=100 --invariants allInvariants
 
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: "1.22"
+          cache-dependency-path: go/go.sum
+      - run: go build ./...
+      - run: go test ./... -count=1
+      - run: go vet ./...
 
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - run: cargo build --release
+      - run: cargo test
+
+  typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx tsc && node --test dist/*.test.js
 
-      - name: Install Quint
-        run: npm install -g @informalsystems/quint
-
-      - name: Quint typecheck
-        run: make typecheck
-
-      - name: Quint simulation verification
-        run: make verify
-
-      - name: Go vet
-        run: go vet ./...
-
-      - name: Go test
-        run: go test ./...
-
-      - name: Go build
-        run: go build -o /dev/null .
+  integration:
+    runs-on: ubuntu-latest
+    needs: [go]
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test-integration

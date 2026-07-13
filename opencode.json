@@ -1,0 +1,69 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "quint-kb": {
+      "type": "local",
+      "command": ["node", "quint-llm-kit/mcp-servers/kb/dist/server.js"],
+      "enabled": true
+    },
+    "quint-lsp": {
+      "type": "local",
+      "command": [
+        "/Users/abienkow/go/bin/mcp-language-server",
+        "--workspace", "{workspace}",
+        "--lsp", "/Users/abienkow/.hermes/node/bin/quint-language-server",
+        "--", "--stdio"
+      ],
+      "enabled": false
+    }
+  },
+  "agent": {
+    "quint-analyzer": {
+      "description": "Analyzes Quint specs against the Go implementation to find gaps, structural issues, and improvement opportunities",
+      "mode": "subagent",
+      "prompt": "{file:.opencode/agents/quint-analyzer.md}",
+      "model": "anthropic/claude-sonnet-4-20250514",
+      "temperature": 0.1,
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "webfetch": "allow",
+        "bash": {
+          "quint *": "allow",
+          "which *": "allow"
+        },
+        "edit": "deny",
+        "write": "deny"
+      }
+    },
+    "quint-verifier": {
+      "description": "Runs Quint typecheck and simulation verification against the spec, checks all invariants hold",
+      "mode": "subagent",
+      "prompt": "{file:.opencode/agents/quint-verifier.md}",
+      "model": "anthropic/claude-sonnet-4-20250514",
+      "temperature": 0.1,
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": {
+          "quint *": "allow",
+          "make typecheck": "allow",
+          "make verify": "allow"
+        },
+        "edit": "deny",
+        "write": "deny"
+      }
+    },
+    "quint-kb": {
+      "description": "Answers Quint language and workflow questions using the Quint knowledge base MCP server",
+      "mode": "subagent",
+      "prompt": "{file:.opencode/agents/quint-kb.md}",
+      "model": "anthropic/claude-sonnet-4-20250514",
+      "temperature": 0.2
+    }
+  }
+}

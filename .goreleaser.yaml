@@ -1,9 +1,10 @@
 version: 2
 before:
   hooks:
-    - go mod tidy
+    - cd go && go mod tidy
 builds:
-  - env:
+  - dir: go
+    env:
       - CGO_ENABLED=0
     goos:
       - linux
@@ -26,4 +27,4 @@ changelog:
       - '^test:'
 docker_images:
   - image_name: ghcr.io/chainsafe/docker-socket-policy
-    dockerfile: Dockerfile
+    dockerfile: go/Dockerfile
