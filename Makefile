@@ -66,7 +66,7 @@ typecheck:
 	$(QUINT) typecheck $(SPEC)
 
 verify:
-	$(QUINT) run --max-steps=100 --invariants allInvariants --backend rust $(SPEC)
+	$(QUINT) run --max-steps=100 --invariants allInvariants $(SPEC)
 
 verify-ts:
 	$(QUINT) run --max-steps=50 --invariants allInvariants --backend typescript $(SPEC)
