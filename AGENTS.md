@@ -45,3 +45,13 @@ deploy/ — Docker Compose + integration tests
 - Rust: `#[cfg(test)]` inline modules, `cargo test`
 - TypeScript: `node:test` framework, `npm run build && node --test dist/*.test.js`
 - Integration: `make test-integration` (26 test cases via Docker Compose)
+
+## Repo Standard Reference
+
+When implementing code or bootstrapping a new ChainSafe open source repo, follow the [ChainSafe Open Source Repository Standard](docs/repo-standard.md). This defines the required file structure, CI/CD, community files, and release pipeline for all ChainSafe public repos. This repo (`docker-socket-policy`) is the living reference implementation of that standard.
+
+## Reproducible Builds
+
+This repo uses [StageX](https://stagex.tools/) source-bootstrapped base images for fully reproducible Docker builds. See [docs/reproducible-builds.md](docs/reproducible-builds.md) for verification steps.
+
+For the authoritative Caution/StageX agent skill, see https://docs.caution.co/guides/build-with-an-ai-agent/
