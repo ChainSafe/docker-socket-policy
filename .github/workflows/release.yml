@@ -59,6 +59,8 @@ jobs:
           go test ./... -count=1
           go build -o /dev/null .
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.85"
       - name: Validate Rust
         run: |
           cd rs && cargo test
@@ -116,13 +118,13 @@ jobs:
       - name: Generate SPDX SBOM for Go binary
         uses: anchore/sbom-action@v0
         with:
-          path: docker-socket-policy-go
+          path: file:docker-socket-policy-go
           format: spdx-json
           output-file: docker-socket-policy-go.spdx.json
       - name: Generate CycloneDX SBOM for Go binary
         uses: anchore/sbom-action@v0
         with:
-          path: docker-socket-policy-go
+          path: file:docker-socket-policy-go
           format: cyclonedx-json
           output-file: docker-socket-policy-go.cyclonedx.json
       - name: Upload Go SBOMs to release
@@ -146,6 +148,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.85"
       - name: Build Rust binary
         run: cd rs && cargo build --release
       - name: Upload Rust binary to release
@@ -173,13 +177,13 @@ jobs:
       - name: Generate SPDX SBOM for Rust binary
         uses: anchore/sbom-action@v0
         with:
-          path: rs/target/release/docker-socket-policy
+          path: file:rs/target/release/docker-socket-policy
           format: spdx-json
           output-file: docker-socket-policy-rs.spdx.json
       - name: Generate CycloneDX SBOM for Rust binary
         uses: anchore/sbom-action@v0
         with:
-          path: rs/target/release/docker-socket-policy
+          path: file:rs/target/release/docker-socket-policy
           format: cyclonedx-json
           output-file: docker-socket-policy-rs.cyclonedx.json
       - name: Upload Rust SBOMs to release
@@ -240,13 +244,13 @@ jobs:
       - name: Generate SPDX SBOM for TypeScript archive
         uses: anchore/sbom-action@v0
         with:
-          path: docker-socket-policy-ts-${{ needs.version.outputs.tag }}.tar.gz
+          path: file:docker-socket-policy-ts-${{ needs.version.outputs.tag }}.tar.gz
           format: spdx-json
           output-file: docker-socket-policy-ts.spdx.json
       - name: Generate CycloneDX SBOM for TypeScript archive
         uses: anchore/sbom-action@v0
         with:
-          path: docker-socket-policy-ts-${{ needs.version.outputs.tag }}.tar.gz
+          path: file:docker-socket-policy-ts-${{ needs.version.outputs.tag }}.tar.gz
           format: cyclonedx-json
           output-file: docker-socket-policy-ts.cyclonedx.json
       - name: Upload TypeScript SBOMs to release
