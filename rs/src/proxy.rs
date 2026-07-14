@@ -311,9 +311,10 @@ mod tests {
     #[test]
     fn test_route_container_create() {
         let router = Router::new(make_manager(vec!["alpine"]));
-        let body = Some(&serde_json::from_value::<HashMap<String, serde_json::Value>>(
+        let binding = serde_json::from_value::<HashMap<String, serde_json::Value>>(
             serde_json::json!({"Image": "alpine:latest"}),
-        ).unwrap());
+        ).unwrap();
+        let body = Some(&binding);
         let result = router.route("POST", "/containers/create", body);
         assert_eq!(result.action, Action::CreateContainer);
         assert_eq!(result.service, Some("myservice".into()));
