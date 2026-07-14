@@ -115,18 +115,20 @@ jobs:
           tags: |
             ghcr.io/chainsafe/docker-socket-policy-go:${{ needs.version.outputs.tag }}
             ghcr.io/chainsafe/docker-socket-policy-go:latest
-      - name: Generate SPDX SBOM for Go binary
-        uses: anchore/sbom-action@v0
-        with:
-          path: file:docker-socket-policy-go
-          format: spdx-json
-          output-file: docker-socket-policy-go.spdx.json
-      - name: Generate CycloneDX SBOM for Go binary
-        uses: anchore/sbom-action@v0
-        with:
-          path: file:docker-socket-policy-go
-          format: cyclonedx-json
-          output-file: docker-socket-policy-go.cyclonedx.json
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
+            sh -s -- -b /usr/local/bin v1.42.3
+      - name: Generate SPDX SBOM for Go image
+        run: >
+          syft ghcr.io/chainsafe/docker-socket-policy-go:${{ needs.version.outputs.tag }}
+          -o spdx-json
+          --file docker-socket-policy-go.spdx.json
+      - name: Generate CycloneDX SBOM for Go image
+        run: >
+          syft ghcr.io/chainsafe/docker-socket-policy-go:${{ needs.version.outputs.tag }}
+          -o cyclonedx-json
+          --file docker-socket-policy-go.cyclonedx.json
       - name: Upload Go SBOMs to release
         run: |
           gh release upload "${{ needs.version.outputs.tag }}" \
@@ -174,18 +176,20 @@ jobs:
           tags: |
             ghcr.io/chainsafe/docker-socket-policy-rs:${{ needs.version.outputs.tag }}
             ghcr.io/chainsafe/docker-socket-policy-rs:latest
-      - name: Generate SPDX SBOM for Rust binary
-        uses: anchore/sbom-action@v0
-        with:
-          path: file:rs/target/release/docker-socket-policy
-          format: spdx-json
-          output-file: docker-socket-policy-rs.spdx.json
-      - name: Generate CycloneDX SBOM for Rust binary
-        uses: anchore/sbom-action@v0
-        with:
-          path: file:rs/target/release/docker-socket-policy
-          format: cyclonedx-json
-          output-file: docker-socket-policy-rs.cyclonedx.json
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
+            sh -s -- -b /usr/local/bin v1.42.3
+      - name: Generate SPDX SBOM for Rust image
+        run: >
+          syft ghcr.io/chainsafe/docker-socket-policy-rs:${{ needs.version.outputs.tag }}
+          -o spdx-json
+          --file docker-socket-policy-rs.spdx.json
+      - name: Generate CycloneDX SBOM for Rust image
+        run: >
+          syft ghcr.io/chainsafe/docker-socket-policy-rs:${{ needs.version.outputs.tag }}
+          -o cyclonedx-json
+          --file docker-socket-policy-rs.cyclonedx.json
       - name: Upload Rust SBOMs to release
         run: |
           gh release upload "${{ needs.version.outputs.tag }}" \
@@ -241,18 +245,20 @@ jobs:
           tags: |
             ghcr.io/chainsafe/docker-socket-policy-ts:${{ needs.version.outputs.tag }}
             ghcr.io/chainsafe/docker-socket-policy-ts:latest
-      - name: Generate SPDX SBOM for TypeScript archive
-        uses: anchore/sbom-action@v0
-        with:
-          path: file:docker-socket-policy-ts-${{ needs.version.outputs.tag }}.tar.gz
-          format: spdx-json
-          output-file: docker-socket-policy-ts.spdx.json
-      - name: Generate CycloneDX SBOM for TypeScript archive
-        uses: anchore/sbom-action@v0
-        with:
-          path: file:docker-socket-policy-ts-${{ needs.version.outputs.tag }}.tar.gz
-          format: cyclonedx-json
-          output-file: docker-socket-policy-ts.cyclonedx.json
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
+            sh -s -- -b /usr/local/bin v1.42.3
+      - name: Generate SPDX SBOM for TS image
+        run: >
+          syft ghcr.io/chainsafe/docker-socket-policy-ts:${{ needs.version.outputs.tag }}
+          -o spdx-json
+          --file docker-socket-policy-ts.spdx.json
+      - name: Generate CycloneDX SBOM for TS image
+        run: >
+          syft ghcr.io/chainsafe/docker-socket-policy-ts:${{ needs.version.outputs.tag }}
+          -o cyclonedx-json
+          --file docker-socket-policy-ts.cyclonedx.json
       - name: Upload TypeScript SBOMs to release
         run: |
           gh release upload "${{ needs.version.outputs.tag }}" \
