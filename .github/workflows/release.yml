@@ -137,6 +137,7 @@ jobs:
             --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@v3
       - name: Sign Go Docker image with Cosign
         env:
           COSIGN_EXPERIMENTAL: 1
@@ -198,6 +199,7 @@ jobs:
             --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@v3
       - name: Sign Rust Docker image with Cosign
         env:
           COSIGN_EXPERIMENTAL: 1
@@ -267,6 +269,7 @@ jobs:
             --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@v3
       - name: Sign TypeScript Docker image with Cosign
         env:
           COSIGN_EXPERIMENTAL: 1
