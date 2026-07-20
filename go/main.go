@@ -39,8 +39,8 @@ func main() {
 
 	auditLog, err := audit.NewLogger(*logFile)
 	if err != nil {
-		slog.Error("failed to initialize audit logger", "error", err)
-		os.Exit(1)
+		slog.Warn("audit logging disabled", "error", err)
+		auditLog = audit.NewNopLogger()
 	}
 	defer auditLog.Close()
 

@@ -49,7 +49,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let router = Arc::new(proxy::Router::new(policy_manager));
     let chain = middleware::Chain::new(cli.readonly);
-    let audit = audit::AuditLogger::new(&cli.log_file)?;
+    let audit = match audit::AuditLogger::new(&cli.log_file) {
+        Ok(logger) => logger,
+        Err(e) => {
+            eprintln!("warn: audit logging disabled: {}", e);
+            audit::AuditLogger::nop()
+        }
+    };
     let transport: Box<dyn transport::Transport> = Box::new(transport::UnixSocketTransport::new(&cli.docker_host));
     let handler = Arc::new(handler::Handler::new(router, chain, audit, transport));
 
