@@ -42,7 +42,17 @@ export class Manager {
   private policiesByName = new Map<string, Policy>();
 
   constructor(configDir: string) {
-    const entries = readdirSync(configDir);
+    let entries: string[];
+    try {
+      entries = readdirSync(configDir);
+    } catch (err: any) {
+      if (err.code === "ENOENT") {
+        console.warn(`warn: config dir ${configDir} not found, starting with empty policy set`);
+        entries = [];
+      } else {
+        throw err;
+      }
+    }
 
     for (const entry of entries) {
       if (!entry.endsWith(".yaml") && !entry.endsWith(".yml")) continue;
