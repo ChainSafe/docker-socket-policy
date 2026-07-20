@@ -55,7 +55,14 @@ impl Manager {
 
     pub fn new(config_dir: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let mut policies_by_name = HashMap::new();
-        let entries = std::fs::read_dir(config_dir)?;
+        let entries = match std::fs::read_dir(config_dir) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("warn: config dir {} not found, starting with empty policy set", config_dir);
+                return Ok(Manager { policies_by_name });
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         for entry in entries {
             let entry = entry?;

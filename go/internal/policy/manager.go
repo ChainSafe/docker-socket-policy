@@ -2,6 +2,7 @@ package policy
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,10 @@ func NewManager(configDir string) (*Manager, error) {
 
 	entries, err := os.ReadDir(configDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			slog.Warn("config dir not found, starting with empty policy set", "dir", configDir)
+			return m, nil
+		}
 		return nil, fmt.Errorf("failed to read config directory %s: %w", configDir, err)
 	}
 
