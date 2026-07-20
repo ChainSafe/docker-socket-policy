@@ -37,6 +37,14 @@ func NewLogger(path string) (*Logger, error) {
 	}, nil
 }
 
+func NewNopLogger() *Logger {
+	f, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0644)
+	return &Logger{
+		file: f,
+		enc:  json.NewEncoder(f),
+	}
+}
+
 func generateRequestID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
