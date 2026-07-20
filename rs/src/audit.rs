@@ -17,6 +17,17 @@ impl AuditLogger {
         })
     }
 
+    pub fn nop() -> Self {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/dev/null")
+            .expect("failed to open /dev/null");
+        AuditLogger {
+            file: Mutex::new(file),
+        }
+    }
+
     pub fn allow(&self, method: &str, uri: &str) {
         self.log("ALLOW", method, uri, "");
     }
