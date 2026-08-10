@@ -125,12 +125,11 @@ Update the Quint spec whenever:
 
 ## CI Integration
 
-CI is handled via `.github/workflows/release.yml` (GoReleaser). Quint formal verification should be added as a prerequisite step:
+Quint formal verification runs in CI via `.github/workflows/ci.yml` (quint job), which type-checks the spec and runs random simulation with all invariants:
 
 ```yaml
-- name: Verify formal invariants
-  uses: quint-lang/action@v1
-  with:
-    spec: spec/docker_socket_policy.qnt
-    max-steps: 100
+- run: quint typecheck spec/docker_socket_policy.qnt
+- run: quint run --max-steps=100 --invariants allInvariants --backend typescript spec/docker_socket_policy.qnt
 ```
+
+Releases are handled by `.github/workflows/release.yml`, which auto-bumps the patch version on push to `main`, creates a draft release, builds Docker images, generates SPDX + CycloneDX SBOMs with syft, and signs them with Cosign.
