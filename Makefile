@@ -3,8 +3,9 @@ OUTPUT_DIR ?= .
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 QUINT ?= $(shell command -v quint 2>/dev/null || echo node $$HOME/.hermes/node/lib/node_modules/@informalsystems/quint/dist/src/cli.js)
 SPEC ?= spec/docker_socket_policy.qnt
+BACKEND ?=
 
-.PHONY: build clean test lint verify typecheck validate
+.PHONY: build clean test lint verify typecheck validate ci-verify release-verify
 .PHONY: build-go test-go lint-go build-rs test-rs build-ts test-ts
 
 # ─── Go ──────────────────────────────────────────────
@@ -66,10 +67,28 @@ typecheck:
 	$(QUINT) typecheck $(SPEC)
 
 verify:
-	$(QUINT) run --max-steps=100 --invariants allInvariants $(SPEC)
+	if [ -n "$(BACKEND)" ]; then \
+		$(QUINT) run --max-steps=100 --invariants allInvariants --backend $(BACKEND) $(SPEC); \
+	else \
+		$(QUINT) run --max-steps=100 --invariants allInvariants $(SPEC); \
+	fi
 
 verify-ts:
 	$(QUINT) run --max-steps=50 --invariants allInvariants --backend typescript $(SPEC)
+
+ci-verify:
+	$(MAKE) typecheck
+	$(MAKE) verify BACKEND=typescript
+	$(MAKE) test-all
+	$(MAKE) test-integration
+	$(MAKE) verify-reproducible-all
+
+release-verify:
+	$(MAKE) typecheck
+	$(MAKE) verify BACKEND=rust
+	$(MAKE) test-all
+	$(MAKE) test-integration
+	$(MAKE) verify-reproducible-all
 
 # ─── Integration tests ───────────────────────────────
 

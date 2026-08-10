@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -19,40 +17,34 @@ jobs:
         with:
           node-version: "22"
       - run: npm install -g @informalsystems/quint
-      - run: quint typecheck spec/docker_socket_policy.qnt
-      - run: quint run --max-steps=100 --invariants allInvariants --backend typescript spec/docker_socket_policy.qnt
+      - run: make typecheck
+      - run: make verify BACKEND=typescript
 
   go:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: go
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
           cache-dependency-path: go/go.sum
-      - run: go build ./...
-      - run: go test ./... -count=1
-      - run: go vet ./...
+      - run: make lint-go
+      - run: make test-go
+      - run: make build-go
 
   rust:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: rs
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - run: cargo build --release
-      - run: cargo test
+        with:
+          toolchain: "1.85"
+      - run: make lint-rs
+      - run: make test-rs
+      - run: make build-rs
 
   typescript:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ts
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -61,8 +53,9 @@ jobs:
           cache: npm
           cache-dependency-path: ts/package-lock.json
       - run: npm ci
-      - run: npx tsc --noEmit
-      - run: npx tsc && node --test dist/*.test.js
+      - run: make lint-ts
+      - run: make test-ts
+      - run: make build-ts
 
   integration:
     runs-on: ubuntu-latest
@@ -76,9 +69,4 @@ jobs:
     needs: [go, rust, typescript]
     steps:
       - uses: actions/checkout@v4
-      - name: Verify Go reproducibility
-        run: make verify-reproducible-go
-      - name: Verify Rust reproducibility
-        run: make verify-reproducible-rs
-      - name: Verify TypeScript reproducibility
-        run: make verify-reproducible-ts
+      - run: make verify-reproducible-all
