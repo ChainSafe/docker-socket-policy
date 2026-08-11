@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { getFlag, hasFlag, parseHostPort } from "./flags.js";
+import { getFlag, hasFlag, parseHostPort, parseSocketPath } from "./flags.js";
 
 describe("flags", () => {
   describe("getFlag", () => {
@@ -70,6 +70,24 @@ describe("flags", () => {
 
     it("accepts a custom default host for bare port", () => {
       assert.deepEqual(parseHostPort("2375", "127.0.0.1"), { host: "127.0.0.1", port: 2375 });
+    });
+  });
+
+  describe("parseSocketPath", () => {
+    it("accepts a plain unix socket path", () => {
+      assert.equal(parseSocketPath("/var/run/docker.sock"), null);
+      assert.equal(parseSocketPath("/sock/docker.sock"), null);
+    });
+
+    it("rejects TCP and HTTP daemon addresses", () => {
+      assert.match(parseSocketPath("tcp://dind:2375") ?? "", /Unix socket paths/);
+      assert.match(parseSocketPath("http://dind:2375") ?? "", /Unix socket paths/);
+      assert.match(parseSocketPath("https://dind:2375") ?? "", /Unix socket paths/);
+      assert.match(parseSocketPath("unix:///var/run/docker.sock") ?? "", /Unix socket paths/);
+    });
+
+    it("rejects empty values", () => {
+      assert.match(parseSocketPath("") ?? "", /must not be empty/);
     });
   });
 });

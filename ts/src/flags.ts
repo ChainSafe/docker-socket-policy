@@ -32,3 +32,22 @@ export function parseHostPort(
   }
   return { host: input.slice(0, colon), port: parseInt(input.slice(colon + 1), 10) };
 }
+
+// Validates a Docker daemon address supplied via --docker-host. Only Unix
+// socket paths are accepted: connecting to the daemon over TCP would bypass
+// the Linux user/group ownership on the socket, which is the security model
+// of this proxy. Returns an error message when the value is unusable.
+export function parseSocketPath(input: string): string | null {
+  if (
+    input.startsWith("tcp://") ||
+    input.startsWith("http://") ||
+    input.startsWith("https://") ||
+    input.startsWith("unix://")
+  ) {
+    return `--docker-host only supports Unix socket paths, got: ${input}`;
+  }
+  if (input.length === 0) {
+    return "--docker-host must not be empty";
+  }
+  return null;
+}

@@ -107,19 +107,22 @@ test-integration-rs:
 test-integration-ts:
 	$(MAKE) test-integration IMPL=ts
 
-test-integration-tcp:
-	docker compose -f deploy/docker-compose.tcp.yml down --remove-orphans -v 2>/dev/null; \
-	docker compose -f deploy/docker-compose.tcp.yml run --rm test; \
+# Unix-socket provisioning tests. The proxy only connects to the Docker
+# daemon over a Unix socket — TCP would bypass user/group socket ownership,
+# which is the security model this target exercises. Not run in CI (uses
+# group-restricted socket setup); run locally per IMPL.
+test-integration-sock:
+	IMPL=$(IMPL) docker compose -f deploy/docker-compose.sock.yml down --remove-orphans -v 2>/dev/null; \
+	IMPL=$(IMPL) docker compose -f deploy/docker-compose.sock.yml run --build --rm test; \
 	rc=$$?; \
-	docker compose -f deploy/docker-compose.tcp.yml down --remove-orphans -v; \
+	IMPL=$(IMPL) docker compose -f deploy/docker-compose.sock.yml down --remove-orphans -v; \
 	exit $$rc
 
-test-integration-sock:
-	docker compose -f deploy/docker-compose.sock.yml down --remove-orphans -v 2>/dev/null; \
-	docker compose -f deploy/docker-compose.sock.yml run --rm test; \
-	rc=$$?; \
-	docker compose -f deploy/docker-compose.sock.yml down --remove-orphans -v; \
-	exit $$rc
+test-integration-sock-rs:
+	$(MAKE) test-integration-sock IMPL=rs
+
+test-integration-sock-ts:
+	$(MAKE) test-integration-sock IMPL=ts
 
 validate: typecheck verify lint-go test-go
 

@@ -56,3 +56,76 @@ impl AuditLogger {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn read_log(path: &str) -> Vec<serde_json::Value> {
+        let mut f = File::open(path).unwrap();
+        let mut contents = String::new();
+        f.read_to_string(&mut contents).unwrap();
+        contents
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_allow_writes_entry() {
+        let dir = std::env::temp_dir().join(format!("audit-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let logger = AuditLogger::new(dir.to_str().unwrap()).unwrap();
+        logger.allow("GET", "/_ping");
+
+        let entries = read_log(dir.to_str().unwrap());
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e["decision"], "ALLOW");
+        assert_eq!(e["method"], "GET");
+        assert_eq!(e["uri"], "/_ping");
+        assert_ne!(e["request_id"], "");
+        assert_ne!(e["timestamp"], "");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_deny_writes_entry() {
+        let dir = std::env::temp_dir().join(format!("audit-test-deny-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let logger = AuditLogger::new(dir.to_str().unwrap()).unwrap();
+        logger.deny("POST", "/containers/create", "exec denied by policy");
+
+        let entries = read_log(dir.to_str().unwrap());
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e["decision"], "DENY");
+        assert_eq!(e["method"], "POST");
+        assert_eq!(e["uri"], "/containers/create");
+        assert_eq!(e["reason"], "exec denied by policy");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_multiple_entries() {
+        let dir = std::env::temp_dir().join(format!("audit-test-multi-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let logger = AuditLogger::new(dir.to_str().unwrap()).unwrap();
+        for _ in 0..5 {
+            logger.allow("GET", "/version");
+        }
+
+        let entries = read_log(dir.to_str().unwrap());
+        assert_eq!(entries.len(), 5);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_nop_writes_nowhere() {
+        let logger = AuditLogger::nop();
+        logger.allow("GET", "/_ping");
+        logger.deny("POST", "/containers/create", "denied");
+    }
+}

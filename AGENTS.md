@@ -35,9 +35,9 @@ deploy/ — Docker Compose + integration tests
 - Zero external deps where possible (Go: yaml.v3, Rust: tokio/hyper/serde/clap, TS: yaml)
 
 ## Test Coverage
-- Go: 58 unit tests (policy: 9, middleware: 21, proxy: 28)
-- Rust: 104 unit tests (policy: 15, middleware: 48, proxy: 41)
-- TypeScript: 99 unit tests (policy: 10, middleware: 37, proxy: 26, transport: 3, handler: 6, flags: 13)
+- Go: 74 unit tests (policy: 10, middleware: 29, proxy: 31, audit: 4)
+- Rust: 112 unit tests (policy: 15, middleware: 50, proxy: 37, handler: 4, audit: 4, transport: 2)
+- TypeScript: 108 unit tests (policy: 10, middleware: 37, proxy: 26, transport: 5, handler: 6, flags: 16, audit: 4)
 - 26 integration tests via deploy/test.sh + docker-compose
 
 ## Test Conventions

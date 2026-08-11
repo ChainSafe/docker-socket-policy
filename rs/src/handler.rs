@@ -2,6 +2,7 @@ use crate::audit::AuditLogger;
 use crate::middleware::Chain;
 use crate::proxy::{Action, Router};
 use crate::transport::Transport;
+use crate::transport::TransportError;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::{Request, Response, StatusCode, header};
@@ -96,6 +97,13 @@ impl Handler {
 
         match self.transport.forward(forwarded).await {
             Ok(resp) => resp,
+            Err(TransportError::SocketPermission(e)) => {
+                warn!("denied: socket permission error: {}", e);
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Full::new(Bytes::from("permission denied on Docker socket")))
+                    .unwrap()
+            }
             Err(e) => {
                 warn!("forward error: {}", e);
                 Response::builder()
@@ -138,10 +146,12 @@ mod tests {
         async fn forward(
             &self,
             req: Request<Full<Bytes>>,
-        ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Response<Full<Bytes>>, TransportError> {
             *self.captured_headers.lock().unwrap() = Some(req.headers().clone());
             let body = req.into_body();
-            let collected = http_body_util::BodyExt::collect(body).await?;
+            let collected = http_body_util::BodyExt::collect(body)
+                .await
+                .expect("collecting in-memory body cannot fail");
             let bytes = collected.to_bytes();
             *self.captured_body.lock().unwrap() = Some(bytes.clone());
             Ok(Response::builder()
@@ -220,6 +230,89 @@ mod tests {
             captured.as_ref().unwrap().len(),
             "content-length must match the modified body length"
         );
+    }
+
+    #[derive(Copy, Clone)]
+    enum FailureKind {
+        SocketPermission,
+        Other,
+    }
+
+    struct FailingTransport {
+        kind: FailureKind,
+    }
+
+    #[async_trait]
+    impl Transport for FailingTransport {
+        async fn forward(
+            &self,
+            _req: Request<Full<Bytes>>,
+        ) -> Result<Response<Full<Bytes>>, TransportError> {
+            match self.kind {
+                FailureKind::SocketPermission => Err(TransportError::SocketPermission(
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                )),
+                FailureKind::Other => Err(TransportError::Other(
+                    Box::<dyn std::error::Error + Send + Sync>::from("connection refused"),
+                )),
+            }
+        }
+    }
+
+    fn make_forward_failing_handler(kind: FailureKind) -> Handler {
+        use crate::policy::ContainerConfig;
+        let mut policies = std::collections::HashMap::new();
+        policies.insert(
+            "svc".into(),
+            Policy {
+                service_name: "svc".into(),
+                user_id: None,
+                group_id: None,
+                allowed_image_prefixes: vec!["alpine".into()],
+                image_tag_pattern: None,
+                image_digest_allowed: false,
+                container_config: Some(ContainerConfig {
+                    network_mode: Some("bridge".into()),
+                    restart_policy: None,
+                    security_options: None,
+                    user: None,
+                    log_driver: None,
+                    log_options: None,
+                }),
+                volumes: None,
+                ports: None,
+                env_file: None,
+                allowed_cli_flags: None,
+                flag_rules: None,
+                denied_flags: None,
+            },
+        );
+        let manager = Manager::from_map(policies);
+        let router = Arc::new(Router::new(manager));
+        let chain = Chain::new(false);
+        let audit = AuditLogger::new("/dev/null").unwrap();
+        let transport = FailingTransport { kind };
+        Handler::new(router, chain, audit, Box::new(transport))
+    }
+
+    #[tokio::test]
+    async fn test_handler_socket_permission_returns_403() {
+        let handler = make_forward_failing_handler(FailureKind::SocketPermission);
+        let req = Request::get("http://localhost/_ping")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_handler_forward_error_returns_502() {
+        let handler = make_forward_failing_handler(FailureKind::Other);
+        let req = Request::get("http://localhost/_ping")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     fn make_deny_handler() -> (Handler, Arc<std::sync::Mutex<Option<Bytes>>>) {
