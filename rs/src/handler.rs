@@ -4,7 +4,7 @@ use crate::proxy::{Action, Router};
 use crate::transport::Transport;
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode, header};
 use http_body_util::Full;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -87,9 +87,12 @@ impl Handler {
             .method(method.as_str())
             .uri(&full_uri)
             .version(version)
-            .body(Full::new(body_bytes))
+            .body(Full::new(body_bytes.clone()))
             .unwrap();
         *forwarded.headers_mut() = headers;
+        forwarded
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, body_bytes.len().into());
 
         match self.transport.forward(forwarded).await {
             Ok(resp) => resp,
@@ -115,12 +118,18 @@ mod tests {
 
     struct MockTransport {
         captured_body: Arc<std::sync::Mutex<Option<Bytes>>>,
+        captured_headers: Arc<std::sync::Mutex<Option<hyper::HeaderMap>>>,
     }
 
     impl MockTransport {
-        fn new() -> (Self, Arc<std::sync::Mutex<Option<Bytes>>>) {
+        fn new() -> (Self, Arc<std::sync::Mutex<Option<Bytes>>>, Arc<std::sync::Mutex<Option<hyper::HeaderMap>>>) {
             let captured = Arc::new(std::sync::Mutex::new(None));
-            (MockTransport { captured_body: captured.clone() }, captured)
+            let captured_headers = Arc::new(std::sync::Mutex::new(None));
+            (
+                MockTransport { captured_body: captured.clone(), captured_headers: captured_headers.clone() },
+                captured,
+                captured_headers,
+            )
         }
     }
 
@@ -130,6 +139,7 @@ mod tests {
             &self,
             req: Request<Full<Bytes>>,
         ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
+            *self.captured_headers.lock().unwrap() = Some(req.headers().clone());
             let body = req.into_body();
             let collected = http_body_util::BodyExt::collect(body).await?;
             let bytes = collected.to_bytes();
@@ -141,7 +151,7 @@ mod tests {
         }
     }
 
-    fn make_test_handler() -> (Handler, Arc<std::sync::Mutex<Option<Bytes>>>) {
+    fn make_test_handler() -> (Handler, Arc<std::sync::Mutex<Option<Bytes>>>, Arc<std::sync::Mutex<Option<hyper::HeaderMap>>>) {
         use crate::policy::ContainerConfig;
         let mut policies = std::collections::HashMap::new();
         policies.insert(
@@ -173,14 +183,14 @@ mod tests {
         let router = Arc::new(Router::new(manager));
         let chain = Chain::new(false);
         let audit = AuditLogger::new("/dev/null").unwrap();
-        let (mock_transport, captured) = MockTransport::new();
+        let (mock_transport, captured, captured_headers) = MockTransport::new();
         let handler = Handler::new(router, chain, audit, Box::new(mock_transport));
-        (handler, captured)
+        (handler, captured, captured_headers)
     }
 
     #[tokio::test]
     async fn test_handler_forwards_modified_body() {
-        let (handler, captured) = make_test_handler();
+        let (handler, captured, captured_headers) = make_test_handler();
         let body = serde_json::json!({"Image": "alpine", "Cmd": ["sleep", "100"]});
         let body_bytes = serde_json::to_vec(&body).unwrap();
 
@@ -198,6 +208,18 @@ mod tests {
         assert!(captured_body.get("HostConfig").is_some());
         let hc = captured_body.get("HostConfig").unwrap();
         assert_eq!(hc.get("Privileged"), Some(&serde_json::Value::Bool(false)));
+
+        let headers = captured_headers.lock().unwrap();
+        let cl = headers
+            .as_ref()
+            .unwrap()
+            .get(hyper::header::CONTENT_LENGTH)
+            .expect("content-length header must be present");
+        assert_eq!(
+            cl.to_str().unwrap().parse::<usize>().unwrap(),
+            captured.as_ref().unwrap().len(),
+            "content-length must match the modified body length"
+        );
     }
 
     fn make_deny_handler() -> (Handler, Arc<std::sync::Mutex<Option<Bytes>>>) {
@@ -232,7 +254,7 @@ mod tests {
         let router = Arc::new(Router::new(manager));
         let chain = Chain::new(false);
         let audit = AuditLogger::new("/dev/null").unwrap();
-        let (mock_transport, captured) = MockTransport::new();
+        let (mock_transport, captured, _captured_headers) = MockTransport::new();
         let handler = Handler::new(router, chain, audit, Box::new(mock_transport));
         (handler, captured)
     }

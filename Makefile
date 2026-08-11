@@ -92,12 +92,20 @@ release-verify:
 
 # ─── Integration tests ───────────────────────────────
 
+IMPL ?= go
+
 test-integration:
-	docker compose -f deploy/docker-compose.yml down --remove-orphans -v 2>/dev/null; \
-	docker compose -f deploy/docker-compose.yml run --rm test; \
+	IMPL=$(IMPL) docker compose -f deploy/docker-compose.yml down --remove-orphans -v 2>/dev/null; \
+	IMPL=$(IMPL) docker compose -f deploy/docker-compose.yml run --build --rm test; \
 	rc=$$?; \
-	docker compose -f deploy/docker-compose.yml down --remove-orphans -v; \
+	IMPL=$(IMPL) docker compose -f deploy/docker-compose.yml down --remove-orphans -v; \
 	exit $$rc
+
+test-integration-rs:
+	$(MAKE) test-integration IMPL=rs
+
+test-integration-ts:
+	$(MAKE) test-integration IMPL=ts
 
 test-integration-tcp:
 	docker compose -f deploy/docker-compose.tcp.yml down --remove-orphans -v 2>/dev/null; \

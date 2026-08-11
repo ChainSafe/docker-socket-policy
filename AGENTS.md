@@ -37,7 +37,7 @@ deploy/ — Docker Compose + integration tests
 ## Test Coverage
 - Go: 58 unit tests (policy: 9, middleware: 21, proxy: 28)
 - Rust: 104 unit tests (policy: 15, middleware: 48, proxy: 41)
-- TypeScript: 80 unit tests (policy: 10, middleware: 37, proxy: 26, transport: 3, handler: 3)
+- TypeScript: 99 unit tests (policy: 10, middleware: 37, proxy: 26, transport: 3, handler: 6, flags: 13)
 - 26 integration tests via deploy/test.sh + docker-compose
 
 ## Test Conventions

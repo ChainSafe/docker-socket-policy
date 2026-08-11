@@ -1,11 +1,11 @@
-name: docker-socket-policy-test
+name: docker-socket-policy-test-${IMPL:-go}
 
 services:
   proxy:
     build:
-      context: ../go
+      context: ../${IMPL:-go}
       dockerfile: Dockerfile
-    user: root
+    user: "0:0"
     ports:
       - "12375:2375"
     volumes:

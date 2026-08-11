@@ -1,4 +1,4 @@
-name: docker-socket-policy-test-tcp
+name: docker-socket-policy-test-tcp-${IMPL:-go}
 
 services:
   dind:
@@ -19,9 +19,9 @@ services:
 
   proxy:
     build:
-      context: ../go
+      context: ../${IMPL:-go}
       dockerfile: Dockerfile
-    user: root
+    user: "0:0"
     depends_on:
       dind:
         condition: service_healthy

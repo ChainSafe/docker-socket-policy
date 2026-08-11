@@ -87,14 +87,23 @@ func (m *Manager) GetByImage(imageRef string) (*Policy, error) {
 	imageName := extractImageName(imageRef)
 
 	for _, p := range m.policiesByName {
-		for _, prefix := range p.AllowedImagePrefixes {
-			if strings.HasPrefix(imageName, prefix) {
-				return p, nil
-			}
+		if matchesImagePrefix(imageName, p.AllowedImagePrefixes) {
+			return p, nil
 		}
 	}
 
 	return nil, fmt.Errorf("no policy found for image: %s", imageRef)
+}
+
+// matchesImagePrefix matches a full image name against a prefix allowing only
+// namespace boundaries ("prefix" or "prefix/..."), never a bare substring.
+func matchesImagePrefix(imageName string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if imageName == prefix || strings.HasPrefix(imageName, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) List() []string {

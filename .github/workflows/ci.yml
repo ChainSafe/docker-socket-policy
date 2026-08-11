@@ -63,6 +63,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make test-integration
+      - run: make test-integration-rs
+      - run: make test-integration-ts
 
   reproducible-build:
     runs-on: ubuntu-latest
