@@ -52,7 +52,8 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: ts/package-lock.json
-      - run: npm ci
+      - working-directory: ts
+        run: npm ci
       - run: make lint-ts
       - run: make test-ts
       - run: make build-ts
