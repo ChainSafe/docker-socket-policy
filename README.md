@@ -32,9 +32,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 58 unit + 26 integration | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 104 unit | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 80 unit | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 74 unit + 26 integration | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 112 unit | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 108 unit | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -144,12 +144,19 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--listen-socket` | `/var/run/docker-socket-policy.sock` | Unix socket (or `fd://3` for systemd) |
+| `--listen-socket` | `/var/run/docker-socket-policy.sock` | Unix socket (or `fd://3` for systemd). **Go/Rust only** |
 | `--listen-tcp` | `127.0.0.1:2375` | TCP listen address |
-| `--docker-host` | `/var/run/docker.sock` | Docker daemon socket path |
+| `--docker-host` | `/var/run/docker.sock` | Docker daemon socket path (Unix socket only) |
 | `--config-dir` | `/etc/docker-socket-policy/services` | Policy config directory |
 | `--log-file` | `/var/log/docker-socket-policy.log` | Audit log path |
 | `--readonly` | `false` | Enable read-only mode |
+
+> The TypeScript implementation listens on TCP only (`--listen-tcp`); it does not
+> implement `--listen-socket`. All three implementations connect to the Docker
+> daemon over a Unix socket only: Go and Rust treat `--docker-host` as a Unix
+> socket path, and TypeScript additionally rejects `tcp://`/`http://` schemes
+> outright. Connecting to the daemon over TCP would bypass the socket's
+> user/group ownership, which is the security boundary.
 
 ### Systemd Socket Activation
 
@@ -177,14 +184,15 @@ NoNewPrivileges=true
 
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 traces across 100+ steps each, checking all 9 invariants on every state transition.
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition.
 
 The CI pipeline runs verification on every push and PR. A violation blocks the build.
 
 ```bash
-make typecheck   # Quint type-check (proves type safety)
-make verify      # Random-simulation verification (Rust backend, 2,400+ traces/sec)
-make validate    # All checks: typecheck + verify + go vet + go test
+make typecheck            # Quint type-check (proves type safety)
+make verify               # Random-simulation verification (default evaluator)
+make verify BACKEND=rust  # Same, using the faster Rust backend
+make validate             # All checks: typecheck + verify + go vet + go test
 ```
 
 See `spec/README.md` for details on the invariants, the middleware gate each maps to, and the attack scenarios each prevents.
