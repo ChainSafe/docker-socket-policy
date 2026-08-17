@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/ChainSafe/docker-socket-policy/go/internal/policy"
@@ -71,6 +72,35 @@ func TestExecGate_DeniesExec(t *testing.T) {
 	result := c.Execute(r, p, body)
 	if result.Allowed {
 		t.Fatal("expected exec to be denied")
+	}
+}
+
+func TestChain_ReadonlyDeniesWrites(t *testing.T) {
+	for _, method := range []string{"POST", "PUT", "DELETE", "PATCH"} {
+		c := NewChain(true)
+		r := testRequest(method, "/containers/create")
+		body := map[string]interface{}{"Image": "chainsafe/lodestar:next"}
+		p := testPolicy(nil)
+		result := c.Execute(r, p, body)
+		if result.Allowed {
+			t.Fatalf("expected %s to be denied in read-only mode", method)
+		}
+		if !strings.Contains(result.Reason, "read-only") {
+			t.Fatalf("expected read-only reason, got: %s", result.Reason)
+		}
+	}
+}
+
+func TestChain_ReadonlyAllowsReads(t *testing.T) {
+	c := NewChain(true)
+	for _, method := range []string{"GET", "HEAD"} {
+		r := testRequest(method, "/containers/json")
+		body := map[string]interface{}{}
+		p := testPolicy(nil)
+		result := c.Execute(r, p, body)
+		if !result.Allowed {
+			t.Fatalf("expected %s to be allowed in read-only mode, got: %s", method, result.Reason)
+		}
 	}
 }
 
@@ -335,5 +365,100 @@ func TestChain_MutatorRunsBeforeGates(t *testing.T) {
 	result := c.Execute(r, p, body)
 	if !result.Allowed {
 		t.Fatalf("expected mutator to strip Privileged before gate check, got: %s", result.Reason)
+	}
+}
+
+func TestRegistryGate_RejectsInvalidDigestFormat(t *testing.T) {
+	c := NewChain(false)
+	r := testRequest("POST", "/containers/create")
+	body := map[string]interface{}{"Image": "chainsafe/lodestar@sha256:xyz"}
+	p := testPolicy(nil)
+	result := c.Execute(r, p, body)
+	if result.Allowed {
+		t.Fatal("expected invalid digest format to be rejected")
+	}
+}
+
+func TestRegistryGate_RejectsOversizedTag(t *testing.T) {
+	c := NewChain(false)
+	r := testRequest("POST", "/containers/create")
+	longTag := strings.Repeat("a", 129)
+	body := map[string]interface{}{"Image": "chainsafe/lodestar:" + longTag}
+	p := testPolicy(nil)
+	result := c.Execute(r, p, body)
+	if result.Allowed {
+		t.Fatal("expected tag exceeding 128 chars to be rejected")
+	}
+}
+
+func TestRegistryGate_RejectsTagOutsidePattern(t *testing.T) {
+	c := NewChain(false)
+	r := testRequest("POST", "/containers/create")
+	body := map[string]interface{}{"Image": "chainsafe/lodestar:2.1"}
+	p := testPolicy(nil)
+	p.ImageTagPattern = `^v?[0-9]+\.[0-9]+\.[0-9]+$`
+	result := c.Execute(r, p, body)
+	if result.Allowed {
+		t.Fatal("expected tag outside pattern to be rejected")
+	}
+}
+
+func TestCmdGate_ValidatesInlineFlagValue(t *testing.T) {
+	c := NewChain(false)
+	r := testRequest("POST", "/containers/create")
+	body := map[string]interface{}{
+		"Image": "chainsafe/lodestar:next",
+		"Cmd":   []interface{}{"--network=mainnet"},
+	}
+	p := testPolicy(nil)
+	result := c.Execute(r, p, body)
+	if !result.Allowed {
+		t.Fatalf("expected --flag=value form to be allowed, got: %s", result.Reason)
+	}
+}
+
+func TestCmdGate_RejectsInvalidInlineFlagValue(t *testing.T) {
+	c := NewChain(false)
+	r := testRequest("POST", "/containers/create")
+	body := map[string]interface{}{
+		"Image": "chainsafe/lodestar:next",
+		"Cmd":   []interface{}{"--network=hacker-chan"},
+	}
+	p := testPolicy(nil)
+	result := c.Execute(r, p, body)
+	if result.Allowed {
+		t.Fatal("expected invalid --flag=value to be rejected")
+	}
+}
+
+func TestEnvFileGate_RejectsHostConfigEnv(t *testing.T) {
+	c := NewChain(false)
+	r := testRequest("POST", "/containers/create")
+	body := map[string]interface{}{
+		"Image": "chainsafe/lodestar:next",
+		"HostConfig": map[string]interface{}{
+			"Env": []interface{}{"SECRET=leaked"},
+		},
+	}
+	p := testPolicy(nil)
+	result := c.Execute(r, p, body)
+	if result.Allowed {
+		t.Fatal("expected HostConfig.Env to be denied when env_file is set")
+	}
+}
+
+func TestMountSourceGate_DeniesTopLevelVolumes(t *testing.T) {
+	c := NewChain(false)
+	r := testRequest("POST", "/containers/create")
+	body := map[string]interface{}{
+		"Image": "chainsafe/lodestar:next",
+		"Volumes": map[string]interface{}{
+			"/etc/passwd": map[string]interface{}{},
+		},
+	}
+	p := testPolicy(nil)
+	result := c.Execute(r, p, body)
+	if result.Allowed {
+		t.Fatal("expected non-whitelisted top-level Volumes key to be denied")
 	}
 }

@@ -6,7 +6,7 @@ This directory contains a [Quint](https://quint-lang.org/) formal specification 
 
 | File | Purpose |
 |------|---------|
-| `docker_socket_policy.qnt` | Single-file spec: policy types, state machine, endpoint routing table, 7 invariants (P0/P1/system/composite), 6 attack scenario simulations |
+| `docker_socket_policy.qnt` | Single-file spec: policy types, state machine, endpoint routing table, 9 invariants (6 P0 / 3 P1), 6 attack scenario simulations |
 
 ## How to Run
 

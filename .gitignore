@@ -5,6 +5,9 @@ go/docker-socket-policy
 # Dependencies
 /quint-llm-kit/
 
+# Internal planning docs
+/docs/superpowers/
+
 # TypeScript
 ts/dist/
 ts/node_modules/

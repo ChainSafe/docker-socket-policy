@@ -159,6 +159,34 @@ allowed_image_prefixes:
 	}
 }
 
+func TestGetByImage_RejectsUnrelatedPrefix(t *testing.T) {
+	dir := t.TempDir()
+	writePolicyFile(t, dir, "beacon.yaml", `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`)
+
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	if _, err := m.GetByImage("evilchainsafe-lodestar:latest"); err == nil {
+		t.Fatal("expected error for bare-substring prefix match, got nil")
+	}
+	if _, err := m.GetByImage("chainsafe/lodestar-backup:latest"); err == nil {
+		t.Fatal("expected error for sibling image matching prefix, got nil")
+	}
+	p, err := m.GetByImage("chainsafe/lodestar/beacon:latest")
+	if err != nil {
+		t.Fatalf("expected nested image under prefix to match: %v", err)
+	}
+	if p.ServiceName != "beacon" {
+		t.Fatalf("expected 'beacon', got '%s'", p.ServiceName)
+	}
+}
+
 func TestGet_UnknownService(t *testing.T) {
 	dir := t.TempDir()
 	writePolicyFile(t, dir, "beacon.yaml", `

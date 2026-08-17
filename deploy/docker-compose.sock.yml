@@ -1,4 +1,4 @@
-name: docker-socket-policy-test-sock
+name: docker-socket-policy-test-sock-${IMPL:-go}
 
 volumes:
   sock-data:
@@ -20,7 +20,7 @@ services:
 
   proxy-granted:
     build:
-      context: ../go
+      context: ../${IMPL:-go}
       dockerfile: Dockerfile
     # User 65532 with GID 2001 — has group access to the restricted socket
     user: 65532:2001
@@ -41,7 +41,7 @@ services:
 
   proxy-denied:
     build:
-      context: ../go
+      context: ../${IMPL:-go}
       dockerfile: Dockerfile
     # User 65532 with GID 3001 — NOT in dockertest group, should fail
     user: 65532:3001

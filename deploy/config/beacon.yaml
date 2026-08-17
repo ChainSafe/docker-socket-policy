@@ -1,6 +1,8 @@
 service_name: beacon
-user_id: '2001'
-group_id: '2001'
+# Host systemd service account (must be a system-level user < 1000).
+# The in-container user is set separately via container_config.user.
+user_id: '100'
+group_id: '100'
 
 allowed_image_prefixes:
   - chainsafe/lodestar

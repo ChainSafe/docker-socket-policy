@@ -5,22 +5,21 @@ import { Manager } from "./policy.js";
 import { Router } from "./proxy.js";
 import { Handler } from "./handler.js";
 import { Transport } from "./transport.js";
+import { getFlag, hasFlag, parseHostPort, parseSocketPath } from "./flags.js";
 
 const args = process.argv.slice(2);
 
-function getFlag(name: string, defaultVal: string): string {
-  const idx = args.indexOf(name);
-  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : defaultVal;
+const dockerHost = getFlag(args, "--docker-host", "/var/run/docker.sock");
+const socketPathError = parseSocketPath(dockerHost);
+if (socketPathError) {
+  console.error(socketPathError);
+  process.exit(2);
 }
-
-function hasFlag(name: string): boolean {
-  return args.includes(name);
-}
-
-const listenTCP = getFlag("--listen-tcp", "127.0.0.1:2375");
-const configDir = getFlag("--config-dir", "/etc/docker-socket-policy/services");
-const logFile = getFlag("--log-file", "/var/log/docker-socket-policy.log");
-const readonly = hasFlag("--readonly");
+const listenTCP = getFlag(args, "--listen-tcp", "127.0.0.1:2375");
+const { host: listenHost, port: listenPort } = parseHostPort(listenTCP, "127.0.0.1");
+const configDir = getFlag(args, "--config-dir", "/etc/docker-socket-policy/services");
+const logFile = getFlag(args, "--log-file", "/var/log/docker-socket-policy.log");
+const readonly = hasFlag(args, "--readonly");
 
 console.log(`loading policies from ${configDir}...`);
 
@@ -30,7 +29,7 @@ console.log(`loaded ${policyManager.list().length} policies`);
 const router = new Router(policyManager);
 const chain = new Chain(readonly);
 const audit = new AuditLogger(logFile);
-const transport = new Transport();
+const transport = new Transport(dockerHost);
 const handler = new Handler(router, chain, audit, transport);
 
 const server = createServer((req, res) => {
@@ -41,8 +40,8 @@ const server = createServer((req, res) => {
   });
 });
 
-server.listen(listenTCP, () => {
-  console.log(`listening on ${listenTCP}`);
+server.listen(listenPort, listenHost, () => {
+  console.log(`listening on ${listenHost}:${listenPort}`);
 });
 
 function shutdown(signal: string) {
