@@ -1,6 +1,7 @@
 # docker-socket-policy
 
 [![CI](https://github.com/ChainSafe/docker-socket-policy/actions/workflows/ci.yml/badge.svg)](https://github.com/ChainSafe/docker-socket-policy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ChainSafe/docker-socket-policy)](https://github.com/ChainSafe/docker-socket-policy/releases/latest)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
@@ -15,6 +16,42 @@ Key features:
 - **Audit logging**: JSON-structured logs for all requests and decisions
 - **Three implementations**: [Go](go/), [Rust](rs/), [TypeScript](ts/) — equal peer languages
 - **Minimal dependencies**: Zero external deps for Go, crate-based for Rust, npm for TypeScript
+
+## Installation
+
+### Docker Images
+
+Signed, SBOM-attested images are published to GHCR for all three implementations:
+
+```bash
+docker pull ghcr.io/chainsafe/docker-socket-policy-go:latest
+docker pull ghcr.io/chainsafe/docker-socket-policy-rs:latest
+docker pull ghcr.io/chainsafe/docker-socket-policy-ts:latest
+
+# Pin to a specific release instead of latest
+docker pull ghcr.io/chainsafe/docker-socket-policy-go:v0.2.8
+```
+
+Every image is Cosign-signed and ships with SPDX + CycloneDX SBOMs attached to the corresponding [release](https://github.com/ChainSafe/docker-socket-policy/releases/latest). See [docs/reproducible-builds.md](docs/reproducible-builds.md) to verify signatures and reproduce a build byte-for-byte.
+
+### Prebuilt Binaries
+
+Each [release](https://github.com/ChainSafe/docker-socket-policy/releases/latest) attaches a Go binary, a Rust binary, and a TypeScript build archive (plus SBOMs for each):
+
+```bash
+# Go (statically linked binary)
+curl -LO https://github.com/ChainSafe/docker-socket-policy/releases/latest/download/docker-socket-policy-go
+chmod +x docker-socket-policy-go
+
+# TypeScript (Node 22+ required; archive includes dist/ and node_modules/)
+# Replace <version> with the tag shown on the releases page, e.g. v0.2.8
+curl -LO https://github.com/ChainSafe/docker-socket-policy/releases/latest/download/docker-socket-policy-ts-<version>.tar.gz
+tar xzf docker-socket-policy-ts-<version>.tar.gz && node dist/index.js
+```
+
+The Rust binary is also attached to every release; see the release page for the exact asset name.
+
+To build any implementation from source instead, see [Build All](#build-all) below.
 
 ## Architecture
 
