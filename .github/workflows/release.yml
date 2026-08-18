@@ -277,6 +277,7 @@ jobs:
       - name: Publish release
         run: |
           gh release edit "${{ needs.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
             --draft=false \
             --prerelease=false
         env:
