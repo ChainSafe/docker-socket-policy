@@ -31,6 +31,8 @@ jobs:
           cache-dependency-path: ts/package-lock.json
       - working-directory: ts
         run: npm ci
+      - name: Install Quint
+        run: npm install -g @informalsystems/quint
       - name: Release verification gate
         run: make release-verify
 
