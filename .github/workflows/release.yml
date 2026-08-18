@@ -29,7 +29,8 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: ts/package-lock.json
-      - run: npm ci
+      - working-directory: ts
+        run: npm ci
       - name: Release verification gate
         run: make release-verify
 
