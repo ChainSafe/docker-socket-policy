@@ -4,9 +4,9 @@
 
 ### Added
 - Multi-language monorepo with Go, Rust, and TypeScript implementations
-- Rust implementation with tokio/hyper runtime (88 unit tests)
-- TypeScript implementation with Node 22 ESM (80 unit tests)
-- Go implementation moved to `go/` subdirectory
+- Rust implementation with tokio/hyper runtime (112 unit tests)
+- TypeScript implementation with Node 22 ESM (108 unit tests)
+- Go implementation moved to `go/` subdirectory (74 unit tests)
 - Unified Makefile with `build-all`, `test-all`, `lint-all` targets
 - CI pipeline with multi-language matrix (Quint, Go, Rust, TypeScript, integration)
 - GoReleaser workflow for automated releases on `v*` tags
