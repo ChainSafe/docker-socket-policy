@@ -152,8 +152,9 @@ jobs:
         run: cd rs && cargo build --release
       - name: Upload Rust binary to release
         run: |
+          cp rs/target/release/docker-socket-policy docker-socket-policy-rs-linux-amd64
           gh release upload "${{ needs.version.outputs.tag }}" \
-            rs/target/release/docker-socket-policy#docker-socket-policy-rs-linux-amd64 \
+            docker-socket-policy-rs-linux-amd64 \
             --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
