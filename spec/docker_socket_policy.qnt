@@ -381,7 +381,16 @@ module docker_socket_policy {
 
   val noPrivilegedAccess = containers.forall(c => not(c.privileged))
 
-  val alwaysHostNetwork = containers.forall(c => c.networkMode == "host")
+  // Every container's network mode is exactly what its matched policy
+  // configures — the caller cannot override it via the create request.
+  // (Not a hardcoded "host" check: the security property is that the
+  // policy YAML controls networkMode, not the untrusted request body.)
+  val alwaysHostNetwork = containers.forall(c =>
+    policies.exists(p =>
+      p.serviceName == c.serviceName
+        and c.networkMode == p.containerConfig.networkMode
+    )
+  )
 
   val imagesAlwaysAllowed = containers.forall(c =>
     if (c.imageRef.kind == "valid")

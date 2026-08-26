@@ -36,7 +36,7 @@ quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy
 | Invariant | What It Checks | Guard / Mutator |
 |-----------|---------------|-----------------|
 | `noPrivilegedAccess` | No created container has `privileged=true` | ContainerConfigMutator sets `privileged=false` |
-| `alwaysHostNetwork` | All containers use `network_mode: host` | ContainerConfigMutator enforces `networkMode=host` |
+| `alwaysHostNetwork` | Every container's network mode matches its policy's configured value (caller cannot override) | ContainerConfigMutator enforces `networkMode` from policy |
 | `imagesAlwaysAllowed` | All images match an `allowed_image_prefix` | RegistryGate via `nondet` policy match |
 | `validImagesOnly` | No container has invalid image ref (`InvalidTag`, `InvalidDigest`) | `createContainer` guard rejects invalid variants |
 | `envOnlyFromFile` | No inline env vars when policy sets `env_file` | EnvFileGate → `envAllowed()` |
@@ -49,6 +49,13 @@ quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy
 | `volumesInWhitelist` | All volume mounts are in the policy whitelist | MountSourceGate → `volumeAllowed()` |
 | `flagsInAllowlist` | All CLI flags pass allowlist + denylist | CmdGate → `flagAllowed()` |
 | `routingTableComplete` | Every endpoint in the routing table has an explicit action | Explicit `endpointsTable.contains()` check |
+
+### Modeling Notes
+
+Two invariants are structurally tautological within the Quint model — they can't be falsified by any action sequence the simulator generates, so they don't get real coverage from `quint run`/`quint verify`:
+
+- **`proxyLives`** — `proxyRunning` is set once in `init` and every action preserves it (`proxyRunning' = proxyRunning`); nothing in the model ever sets it `false`. The real guarantee ("a panic/error on one request doesn't crash the whole proxy") is enforced by language-specific mechanisms outside the model: Go's stdlib `net/http.Server` recovers per-request panics, Rust's `tokio::spawn` isolates panics per connection task, and TypeScript's request handler wraps `handle()` in a `.catch()`. These are exercised by each implementation's own test suite, not by the Quint simulation.
+- **`routingTableComplete`** — checks that `endpointsTable` (a fixed constant) contains a fixed list of literals declared in the same file. It documents the intended routing table but doesn't cross-check it against any of the three Router implementations; that comparison has to be done manually (or via `quint-analyzer`) against `go/internal/proxy/router.go`, `rs/src/proxy.rs`, and `ts/src/proxy.ts`.
 
 ### Attack Scenarios Prevented by Invariants
 
