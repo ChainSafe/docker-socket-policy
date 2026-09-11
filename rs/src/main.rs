@@ -27,6 +27,10 @@ use tracing_subscriber::EnvFilter;
 /// (`sd_listen_fds` convention: fds start at 3).
 const SYSTEMD_SOCKET_FD: RawFd = 3;
 
+/// Pause after a failed `accept` before retrying, so persistent errors
+/// (fd exhaustion, non-listening fd) don't spin the loop at 100% CPU.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[derive(Parser)]
 #[command(name = "docker-socket-policy")]
 struct Cli {
@@ -74,7 +78,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A broadcast channel lets every listener task shut down independently
     // when a signal arrives, without one listener's loop owning the others.
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    // Both receivers are created BEFORE the signal tasks spawn: a broadcast
+    // send with zero receivers is silently dropped, so subscribing later
+    // would open a window where an early signal is lost.
+    let (shutdown_tx, unix_shutdown_rx) = broadcast::channel::<()>(1);
+    let tcp_shutdown_rx = shutdown_tx.subscribe();
 
     {
         let tx = shutdown_tx.clone();
@@ -96,8 +104,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let unix_handle = spawn_unix_listener(handler.clone(), cli.listen_socket.clone(), shutdown_tx.subscribe());
-    let tcp_handle = spawn_tcp_listener(handler.clone(), cli.listen_tcp.clone(), shutdown_tx.subscribe());
+    let unix_handle = spawn_unix_listener(handler.clone(), cli.listen_socket.clone(), unix_shutdown_rx);
+    let tcp_handle = spawn_tcp_listener(handler.clone(), cli.listen_tcp.clone(), tcp_shutdown_rx);
 
     let _ = tokio::join!(unix_handle, tcp_handle);
     tracing::info!("shutdown complete");
@@ -130,10 +138,12 @@ fn bind_unix_listener(addr: &str) -> io::Result<tokio::net::UnixListener> {
 /// (set non-blocking, hand to Tokio) can be exercised in tests against an
 /// arbitrary fd, instead of only against the real systemd fd 3.
 fn unix_listener_from_raw_fd(fd: RawFd) -> io::Result<tokio::net::UnixListener> {
-    // SAFETY: the caller guarantees `fd` is a valid, open file descriptor for
-    // an already-bound and listening AF_UNIX socket that this process owns
-    // (systemd socket activation passes such a socket per the sd_listen_fds
-    // convention). We take ownership of it here.
+    // SAFETY: `from_raw_fd` requires that we take exclusive ownership of the
+    // fd, which we do — nothing else in this process uses fd 3. The fd itself
+    // comes from user input (`--listen-socket=fd://3`) and may not actually
+    // be a listening AF_UNIX socket; that is not a soundness issue, as misuse
+    // surfaces as an `io::Error` from the syscalls below (or from `accept`),
+    // never as undefined behavior.
     let std_listener = unsafe { StdUnixListener::from_raw_fd(fd) };
     std_listener.set_nonblocking(true)?;
     tokio::net::UnixListener::from_std(std_listener)
@@ -161,7 +171,13 @@ fn spawn_unix_listener(
                         Ok((stream, _)) => {
                             tokio::spawn(serve_connection(handler.clone(), stream));
                         }
-                        Err(e) => tracing::warn!("accept error on unix socket: {}", e),
+                        Err(e) => {
+                            // Back off briefly: persistent accept errors
+                            // (e.g. EMFILE, or a bad fd under socket
+                            // activation) would otherwise busy-loop.
+                            tracing::warn!("accept error on unix socket: {}", e);
+                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        }
                     }
                 }
                 _ = shutdown_rx.recv() => {
@@ -202,7 +218,12 @@ fn spawn_tcp_listener(
                         Ok((stream, _)) => {
                             tokio::spawn(serve_connection(handler.clone(), stream));
                         }
-                        Err(e) => tracing::warn!("accept error on TCP socket: {}", e),
+                        Err(e) => {
+                            // Back off briefly: persistent accept errors
+                            // (e.g. EMFILE) would otherwise busy-loop.
+                            tracing::warn!("accept error on TCP socket: {}", e);
+                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        }
                     }
                 }
                 _ = shutdown_rx.recv() => {
