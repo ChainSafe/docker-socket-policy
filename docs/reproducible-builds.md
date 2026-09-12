@@ -1,6 +1,6 @@
 # Reproducible Builds Verification
 
-This document describes how to verify that docker-socket-policy builds are reproducible and how to verify SBOMs and signatures.
+This document describes how to verify that docker-socket-policy builds are reproducible and how to verify SBOMs and signatures. docker-socket-policy is built for multiple architectures: **amd64** and **arm64**.
 
 ## Prerequisites
 
@@ -30,46 +30,79 @@ Each target builds twice with `--no-cache` and uses `cmp` to confirm bit-identic
 
 ## Verify a Single Build Step by Step
 
+### Build and Verify amd64 Binary
+
 ```bash
-# Build Go binary
+# Build Go binary for amd64
 docker build --no-cache --platform linux/amd64 \
   --build-arg VERSION=$(git describe --tags --always --dirty) \
-  --output type=local,dest=/tmp/build \
+  --output type=local,dest=/tmp/build-amd64 \
   -f go/Dockerfile go/
 
 # Check the binary
-file /tmp/build/docker-socket-policy
+file /tmp/build-amd64/docker-socket-policy
 # Expected: ELF 64-bit LSB executable, x86-64, statically linked
 
 # Generate SBOM
-syft scan /tmp/build/docker-socket-policy -o spdx-json > docker-socket-policy.spdx.json
-syft scan /tmp/build/docker-socket-policy -o cyclonedx-json > docker-socket-policy.cyclonedx.json
+syft scan /tmp/build-amd64/docker-socket-policy -o spdx-json > docker-socket-policy-amd64.spdx.json
+syft scan /tmp/build-amd64/docker-socket-policy -o cyclonedx-json > docker-socket-policy-amd64.cyclonedx.json
+```
+
+### Build and Verify arm64 Binary
+
+```bash
+# Build Go binary for arm64
+docker build --no-cache --platform linux/arm64 \
+  --build-arg VERSION=$(git describe --tags --always --dirty) \
+  --output type=local,dest=/tmp/build-arm64 \
+  -f go/Dockerfile go/
+
+# Check the binary
+file /tmp/build-arm64/docker-socket-policy
+# Expected: ELF 64-bit LSB executable, ARM aarch64, statically linked
+
+# Generate SBOM
+syft scan /tmp/build-arm64/docker-socket-policy -o spdx-json > docker-socket-policy-arm64.spdx.json
+syft scan /tmp/build-arm64/docker-socket-policy -o cyclonedx-json > docker-socket-policy-arm64.cyclonedx.json
 ```
 
 ## Verify SBOMs from a Release
+
+Binary artifacts are available for both amd64 and arm64:
 
 ```bash
 # Download SBOMs from a release
 gh release download v0.1.0 --pattern "*.spdx.json"
 gh release download v0.1.0 --pattern "*.cyclonedx.json"
 
-# Inspect SBOM
+# Available binaries: docker-socket-policy-{go,rs,ts}-linux-{amd64,arm64}
+ls -la docker-socket-policy-*-linux-*
+
+# Inspect SBOM (covers all architectures in the release)
 cat docker-socket-policy-go.spdx.json | jq '.packages[].name'
 ```
 
 ## Verify Docker Image Signatures
 
+Docker images are published as **multi-arch manifest indexes** that automatically select the correct architecture (amd64 or arm64) when pulling:
+
 ```bash
-# Verify Cosign signature (keyless via OIDC)
+# Verify Cosign signature on multi-arch image (verifies entire manifest index)
 cosign verify \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/chainsafe/docker-socket-policy-go:<version>
+
+# Pull for specific architecture (if you need to override auto-detection)
+docker pull --platform linux/amd64 ghcr.io/chainsafe/docker-socket-policy-go:<version>
+docker pull --platform linux/arm64 ghcr.io/chainsafe/docker-socket-policy-go:<version>
 ```
 
 ## Verify SBOMs Attached to Docker Images
 
+SBOMs are attached to the multi-arch manifest index, covering all architectures:
+
 ```bash
-# List attestations on an image
+# List attestations on the multi-arch image (covers amd64 and arm64)
 cosign verify-attestation \
   --type spdx \
   ghcr.io/chainsafe/docker-socket-policy-go:<version>
@@ -79,6 +112,9 @@ cosign download attestation \
   --type spdx \
   ghcr.io/chainsafe/docker-socket-policy-go:<version> \
   | jq '.payload | @base64d | fromjson'
+
+# If you need the SBOM for a specific architecture image, download from release artifacts
+# Example: docker-socket-policy-go-linux-arm64.spdx.json
 ```
 
 ## Build from Source
