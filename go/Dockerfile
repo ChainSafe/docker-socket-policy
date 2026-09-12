@@ -5,8 +5,6 @@ ARG VERSION=dev
 ENV SOURCE_DATE_EPOCH=1
 ENV CGO_ENABLED=0
 ENV GOOS=linux
-# TARGETARCH is set by docker buildx; fallback to native arch for docker build
-ENV GOARCH=${TARGETARCH:-$(go env GOARCH)}
 
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -14,14 +12,27 @@ RUN go mod download
 
 COPY . .
 
-RUN --network=none \
-  go build \
+RUN --network=none <<-'EOF'
+  # Detect target architecture: TARGETARCH is set by buildx, fallback to native arch for docker build
+  if [ -n "${TARGETARCH}" ]; then
+    goarch="${TARGETARCH}"
+  else
+    # Native build: detect machine architecture
+    case "$(uname -m)" in
+      x86_64)  goarch="amd64" ;;
+      aarch64) goarch="arm64" ;;
+      *) echo "Unsupported native architecture: $(uname -m)"; exit 1 ;;
+    esac
+  fi
+  
+  GOARCH="${goarch}" go build \
     -mod=mod \
     -trimpath \
     -buildvcs=false \
     -ldflags="-s -w -buildid= -X main.Version=${VERSION}" \
     -o /docker-socket-policy \
     .
+EOF
 
 FROM stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS run
 COPY --from=build /docker-socket-policy /docker-socket-policy
