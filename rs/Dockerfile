@@ -12,30 +12,22 @@ RUN cargo fetch --locked --target "$(uname -m)-unknown-linux-musl" 2>/dev/null |
 
 COPY src/ src/
 
-RUN --network=none sh -c '
-  # Detect target platform: TARGETPLATFORM is set by buildx, fallback to native arch for docker build
-  if [ -n "${TARGETPLATFORM}" ]; then
-    platform="${TARGETPLATFORM}"
-  else
-    # Native build: detect machine architecture
-    machine_arch=$(uname -m)
-    case "${machine_arch}" in
-      x86_64)  platform="linux/amd64" ;;
-      aarch64) platform="linux/arm64" ;;
-      *) echo "Unsupported native architecture: ${machine_arch}"; exit 1 ;;
-    esac
-  fi
-  
-  # Map platform to Rust target triple
-  case "${platform}" in
-    linux/amd64)  triple="x86_64-unknown-linux-musl" ;;
-    linux/arm64)  triple="aarch64-unknown-linux-musl" ;;
-    *) echo "Unsupported platform: ${platform}"; exit 1 ;;
-  esac
-  
-  cargo build --frozen --release --target "${triple}"
-  install -Dm755 "/target/${triple}/release/docker-socket-policy" /docker-socket-policy
-'
+RUN --network=none \
+  platform="${TARGETPLATFORM}" && \
+  if [ -z "$platform" ]; then \
+    case "$(uname -m)" in \
+      x86_64)  platform="linux/amd64" ;; \
+      aarch64) platform="linux/arm64" ;; \
+      *) echo "Unsupported native architecture: $(uname -m)"; exit 1 ;; \
+    esac \
+  fi && \
+  case "$platform" in \
+    linux/amd64)  triple="x86_64-unknown-linux-musl" ;; \
+    linux/arm64)  triple="aarch64-unknown-linux-musl" ;; \
+    *) echo "Unsupported platform: $platform"; exit 1 ;; \
+  esac && \
+  cargo build --frozen --release --target "$triple" && \
+  install -Dm755 "/target/$triple/release/docker-socket-policy" /docker-socket-policy
 
 FROM scratch AS run
 COPY --from=build /docker-socket-policy /docker-socket-policy
