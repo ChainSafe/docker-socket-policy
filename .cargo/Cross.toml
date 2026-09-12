@@ -1,0 +1,5 @@
+[build]
+target-dir = "/target"
+
+[target.aarch64-unknown-linux-musl]
+# cross handles sysroot automatically
