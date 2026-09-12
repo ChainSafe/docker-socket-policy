@@ -14,6 +14,8 @@ COPY src/ src/
 
 RUN --network=none /bin/bash << 'EOFBUILD'
 set -e
+echo "[DEBUG] TARGETPLATFORM=${TARGETPLATFORM}"
+echo "[DEBUG] uname -m=$(uname -m)"
 platform="${TARGETPLATFORM}"
 if [ -z "$platform" ]; then
   case "$(uname -m)" in
@@ -22,6 +24,7 @@ if [ -z "$platform" ]; then
     *) echo "Unsupported native architecture: $(uname -m)"; exit 1 ;;
   esac
 fi
+echo "[DEBUG] Detected platform=$platform"
 case "$platform" in
   linux/amd64)  triple="x86_64-unknown-linux-musl" ;;
   linux/arm64)  triple="aarch64-unknown-linux-musl" ;;

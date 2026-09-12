@@ -14,6 +14,8 @@ COPY . .
 
 RUN --network=none /bin/bash << 'EOFBUILD'
 set -e
+echo "[DEBUG] TARGETARCH=${TARGETARCH}"
+echo "[DEBUG] uname -m=$(uname -m)"
 goarch="${TARGETARCH}"
 if [ -z "$goarch" ]; then
   case "$(uname -m)" in
@@ -22,6 +24,7 @@ if [ -z "$goarch" ]; then
     *) echo "Unsupported native architecture: $(uname -m)"; exit 1 ;;
   esac
 fi
+echo "[DEBUG] Detected goarch=$goarch"
 GOARCH="$goarch" go build \
   -mod=mod \
   -trimpath \
