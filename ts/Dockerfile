@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 stagex/pallet-nodejs@sha256:2e09e7bc24546c76afeac30a50404ce4b2d44aa48c4d4950c40304d8bf7e057f AS build
+FROM stagex/pallet-nodejs@sha256:2e09e7bc24546c76afeac30a50404ce4b2d44aa48c4d4950c40304d8bf7e057f AS build
 
 ENV SOURCE_DATE_EPOCH=1
 
@@ -10,7 +10,7 @@ COPY . .
 
 RUN npx tsc
 
-FROM --platform=linux/amd64 stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS run
+FROM stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS run
 COPY --from=stagex/core-musl@sha256:a06cf7b4a7c57313e21ece02d460b7393eb64e0b3ee1de00e1408392ccf283f3 / /
 COPY --from=stagex/core-libcxx@sha256:414761e604c54982aaf0a33f7aa942652fa3d2de1e4f0802b15fa2413ad7ce71 / /
 COPY --from=stagex/core-libcxxabi@sha256:7b515659b7c073329e2cd09037eb0c8bad0a76acd1947efe22c7071a380f465b / /

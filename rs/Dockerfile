@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 stagex/pallet-rust@sha256:59d4d0c9e232a05ecb99348f7216b521af1b914a430059dbdb9130018f2afde1 AS build
+FROM stagex/pallet-rust@sha256:59d4d0c9e232a05ecb99348f7216b521af1b914a430059dbdb9130018f2afde1 AS build
 
 ENV SOURCE_DATE_EPOCH=1
 ENV CARGO_TARGET_DIR=/target
@@ -13,13 +13,16 @@ RUN cargo fetch --locked --target "$(uname -m)-unknown-linux-musl" 2>/dev/null |
 COPY src/ src/
 
 RUN --network=none <<-'EOF'
-  set -eux
-  triple="$(uname -m)-unknown-linux-musl"
+  case "${TARGETPLATFORM}" in
+    linux/amd64)  triple="x86_64-unknown-linux-musl" ;;
+    linux/arm64)  triple="aarch64-unknown-linux-musl" ;;
+    *) echo "Unsupported platform: ${TARGETPLATFORM}"; exit 1 ;;
+  esac
   cargo build --frozen --release --target "${triple}"
   install -Dm755 "/target/${triple}/release/docker-socket-policy" /docker-socket-policy
 EOF
 
-FROM --platform=linux/amd64 scratch AS run
+FROM scratch AS run
 COPY --from=build /docker-socket-policy /docker-socket-policy
 USER 65532:65532
 ENTRYPOINT ["/docker-socket-policy"]
