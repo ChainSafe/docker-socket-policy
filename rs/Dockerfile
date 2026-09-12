@@ -12,7 +12,7 @@ RUN cargo fetch --locked --target "$(uname -m)-unknown-linux-musl" 2>/dev/null |
 
 COPY src/ src/
 
-RUN --network=none /bin/bash << 'EOFBUILD'
+RUN --network=none /bin/bash -c << 'EOFBUILD'
 set -e
 echo "[DEBUG] TARGETPLATFORM=${TARGETPLATFORM}"
 echo "[DEBUG] uname -m=$(uname -m)"

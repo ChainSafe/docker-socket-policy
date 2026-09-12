@@ -12,7 +12,7 @@ RUN go mod download
 
 COPY . .
 
-RUN --network=none /bin/bash << 'EOFBUILD'
+RUN --network=none /bin/bash -c << 'EOFBUILD'
 set -e
 echo "[DEBUG] TARGETARCH=${TARGETARCH}"
 echo "[DEBUG] uname -m=$(uname -m)"
