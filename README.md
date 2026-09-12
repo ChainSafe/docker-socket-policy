@@ -19,6 +19,20 @@ Key features:
 
 ## Installation
 
+### Supported Architectures
+
+docker-socket-policy builds and runs on **amd64** (x86-64) and **arm64** (AArch64) Linux architectures:
+
+- **Docker Images**: Multi-arch manifest indexes automatically select the correct architecture when pulling. No platform flag needed:
+  ```bash
+  docker pull ghcr.io/chainsafe/docker-socket-policy-go:latest
+  # Pulls amd64 on x86-64, arm64 on ARM machines
+  ```
+
+- **Prebuilt Binaries**: Both amd64 and arm64 variants are published with each release.
+
+See [docs/reproducible-builds.md](docs/reproducible-builds.md) for verification and per-architecture build instructions.
+
 ### Docker Images
 
 Signed, SBOM-attested images are published to GHCR for all three implementations:
@@ -36,20 +50,37 @@ Every image is Cosign-signed and ships with SPDX + CycloneDX SBOMs attached to t
 
 ### Prebuilt Binaries
 
-Each [release](https://github.com/ChainSafe/docker-socket-policy/releases/latest) attaches a Go binary, a Rust binary, and a TypeScript build archive (plus SBOMs for each):
+Each [release](https://github.com/ChainSafe/docker-socket-policy/releases/latest) attaches binaries for amd64 and arm64 architectures, plus SBOMs for each:
 
+**Go** (statically linked ELF binary):
 ```bash
-# Go (statically linked binary)
-curl -LO https://github.com/ChainSafe/docker-socket-policy/releases/latest/download/docker-socket-policy-go
-chmod +x docker-socket-policy-go
+# amd64
+curl -LO https://github.com/ChainSafe/docker-socket-policy/releases/latest/download/docker-socket-policy-go-linux-amd64
+chmod +x docker-socket-policy-go-linux-amd64
 
-# TypeScript (Node 22+ required; archive includes dist/ and node_modules/)
-# Replace <version> with the tag shown on the releases page, e.g. v0.2.8
-curl -LO https://github.com/ChainSafe/docker-socket-policy/releases/latest/download/docker-socket-policy-ts-<version>.tar.gz
-tar xzf docker-socket-policy-ts-<version>.tar.gz && node dist/index.js
+# arm64
+curl -LO https://github.com/ChainSafe/docker-socket-policy/releases/latest/download/docker-socket-policy-go-linux-arm64
+chmod +x docker-socket-policy-go-linux-arm64
 ```
 
-The Rust binary is also attached to every release; see the release page for the exact asset name.
+**Rust** (statically linked ELF binary with musl):
+```bash
+# amd64
+curl -LO https://github.com/ChainSafe/docker-socket-policy/releases/latest/download/docker-socket-policy-rs-linux-amd64
+chmod +x docker-socket-policy-rs-linux-amd64
+
+# arm64
+curl -LO https://github.com/ChainSafe/docker-socket-policy/releases/latest/download/docker-socket-policy-rs-linux-arm64
+chmod +x docker-socket-policy-rs-linux-arm64
+```
+
+**TypeScript** (Node 22+ required; archive includes dist/, node_modules/, and package files):
+```bash
+# Extract and run (platform-independent Node archive)
+curl -LO https://github.com/ChainSafe/docker-socket-policy/releases/latest/download/docker-socket-policy-ts-<version>.tar.gz
+tar xzf docker-socket-policy-ts-<version>.tar.gz
+node dist/index.js
+```
 
 To build any implementation from source instead, see [Build All](#build-all) below.
 
@@ -188,12 +219,13 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | `--log-file` | `/var/log/docker-socket-policy.log` | Audit log path |
 | `--readonly` | `false` | Enable read-only mode |
 
-> The TypeScript implementation listens on TCP only (`--listen-tcp`); it does not
-> implement `--listen-socket`. All three implementations connect to the Docker
-> daemon over a Unix socket only: Go and Rust treat `--docker-host` as a Unix
-> socket path, and TypeScript additionally rejects `tcp://`/`http://` schemes
-> outright. Connecting to the daemon over TCP would bypass the socket's
-> user/group ownership, which is the security boundary.
+> **Unix socket security boundary**: Go and Rust support `--listen-socket` for
+> binding to a Unix socket, enabling socket-level access control via file
+> permissions and Unix groups. TypeScript does not implement `--listen-socket`
+> and listens on TCP only (`--listen-tcp`). All three implementations connect
+> to the Docker daemon over Unix sockets exclusively; they reject `tcp://` and
+> `http://` schemes for `--docker-host`. TCP connections would bypass socket
+> ownership-based access control, breaking the security model.
 
 ### Systemd Socket Activation
 
