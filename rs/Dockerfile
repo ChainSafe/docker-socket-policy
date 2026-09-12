@@ -12,7 +12,7 @@ RUN cargo fetch --locked --target "$(uname -m)-unknown-linux-musl" 2>/dev/null |
 
 COPY src/ src/
 
-RUN --network=none <<-'EOF'
+RUN --network=none sh -c '
   # Detect target platform: TARGETPLATFORM is set by buildx, fallback to native arch for docker build
   if [ -n "${TARGETPLATFORM}" ]; then
     platform="${TARGETPLATFORM}"
@@ -35,7 +35,7 @@ RUN --network=none <<-'EOF'
   
   cargo build --frozen --release --target "${triple}"
   install -Dm755 "/target/${triple}/release/docker-socket-policy" /docker-socket-policy
-EOF
+'
 
 FROM scratch AS run
 COPY --from=build /docker-socket-policy /docker-socket-policy

@@ -12,7 +12,7 @@ RUN go mod download
 
 COPY . .
 
-RUN --network=none <<-'EOF'
+RUN --network=none sh -c '
   # Detect target architecture: TARGETARCH is set by buildx, fallback to native arch for docker build
   if [ -n "${TARGETARCH}" ]; then
     goarch="${TARGETARCH}"
@@ -32,7 +32,7 @@ RUN --network=none <<-'EOF'
     -ldflags="-s -w -buildid= -X main.Version=${VERSION}" \
     -o /docker-socket-policy \
     .
-EOF
+'
 
 FROM stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS run
 COPY --from=build /docker-socket-policy /docker-socket-policy
