@@ -12,27 +12,26 @@ RUN go mod download
 
 COPY . .
 
-RUN --network=none /bin/bash -c << 'EOFBUILD'
-set -e
-echo "[DEBUG] TARGETARCH=${TARGETARCH}"
-echo "[DEBUG] uname -m=$(uname -m)"
-goarch="${TARGETARCH}"
-if [ -z "$goarch" ]; then
-  case "$(uname -m)" in
-    x86_64)  goarch="amd64" ;;
-    aarch64) goarch="arm64" ;;
-    *) echo "Unsupported native architecture: $(uname -m)"; exit 1 ;;
-  esac
-fi
-echo "[DEBUG] Detected goarch=$goarch"
+RUN --network=none /bin/bash -c '\
+set -e; \
+echo "[DEBUG] TARGETARCH=${TARGETARCH}"; \
+echo "[DEBUG] uname -m=$(uname -m)"; \
+goarch="${TARGETARCH}"; \
+if [ -z "$goarch" ]; then \
+  case "$(uname -m)" in \
+    x86_64)  goarch="amd64" ;; \
+    aarch64) goarch="arm64" ;; \
+    *) echo "Unsupported native architecture: $(uname -m)"; exit 1 ;; \
+  esac; \
+fi; \
+echo "[DEBUG] Detected goarch=$goarch"; \
 GOARCH="$goarch" go build \
   -mod=mod \
   -trimpath \
   -buildvcs=false \
   -ldflags="-s -w -buildid= -X main.Version=${VERSION}" \
   -o /docker-socket-policy \
-  .
-EOFBUILD
+  .'
 
 FROM stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS run
 COPY --from=build /docker-socket-policy /docker-socket-policy
