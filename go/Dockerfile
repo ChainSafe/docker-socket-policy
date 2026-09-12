@@ -5,7 +5,8 @@ ARG VERSION=dev
 ENV SOURCE_DATE_EPOCH=1
 ENV CGO_ENABLED=0
 ENV GOOS=linux
-ENV GOARCH=${TARGETARCH}
+# TARGETARCH is set by docker buildx; fallback to native arch for docker build
+ENV GOARCH=${TARGETARCH:-$(go env GOARCH)}
 
 WORKDIR /app
 COPY go.mod go.sum ./
