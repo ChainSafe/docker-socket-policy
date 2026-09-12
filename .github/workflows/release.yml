@@ -73,6 +73,9 @@ jobs:
   release-go:
     needs: [version]
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -80,16 +83,20 @@ jobs:
           go-version: '1.22'
           cache-dependency-path: go/go.sum
       - name: Build Go binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
         run: |
           cd go && go build \
             -trimpath \
             -ldflags="-s -w -buildid= -X main.Version=${{ needs.version.outputs.tag }}" \
-            -o ../docker-socket-policy-go \
+            -o ../docker-socket-policy-go-linux-${{ matrix.goarch }} \
             .
       - name: Upload Go binary to release
         run: |
           gh release upload "${{ needs.version.outputs.tag }}" \
-            docker-socket-policy-go \
+            docker-socket-policy-go-linux-${{ matrix.goarch }} \
             --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
