@@ -5,7 +5,7 @@ ENV CARGO_TARGET_DIR=/target
 ENV CARGO_INCREMENTAL=0
 ENV RUSTFLAGS="-C codegen-units=1 -C target-feature=+crt-static -C strip=symbols --remap-path-prefix=/app=. --remap-path-prefix=/target=target"
 
-SHELL ["/bin/bash", "-c"]
+SHELL ["/bin/sh", "-c"]
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./

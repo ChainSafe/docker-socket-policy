@@ -6,7 +6,7 @@ ENV SOURCE_DATE_EPOCH=1
 ENV CGO_ENABLED=0
 ENV GOOS=linux
 
-SHELL ["/bin/bash", "-c"]
+SHELL ["/bin/sh", "-c"]
 
 WORKDIR /app
 COPY go.mod go.sum ./
