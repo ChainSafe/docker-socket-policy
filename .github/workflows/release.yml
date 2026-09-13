@@ -170,9 +170,21 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "1.85"
-          targets: ${{ matrix.rust_target }}
+          # `target` (singular). The action rejected `targets` with
+          # "Unexpected input(s) 'targets'" and silently installed nothing.
+          target: ${{ matrix.rust_target }}
+      # --locked is REQUIRED, not a nicety. Without it `cargo install`
+      # re-resolves cross's dependencies to the newest semver-compatible
+      # versions on crates.io, ignoring the lockfile cross was released with.
+      # Those newer crates raised their MSRV above the toolchain pinned above,
+      # which broke this job with no change on our side:
+      #   home@0.5.12 requires rustc 1.88
+      #   textwrap@0.16.3 requires rustc 1.90
+      #   (toolchain here is 1.85)
+      # --locked builds cross from its own Cargo.lock, so this step stops
+      # depending on what the wider crates.io ecosystem published today.
       - name: Install cross
-        run: cargo install cross
+        run: cargo install cross --locked
       - name: Build Rust binary
         run: cd rs && cross build --release --target ${{ matrix.rust_target }}
       - name: Upload Rust binary to release
