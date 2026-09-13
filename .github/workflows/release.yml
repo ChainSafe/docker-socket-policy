@@ -73,6 +73,9 @@ jobs:
   release-go:
     needs: [version]
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -80,24 +83,24 @@ jobs:
           go-version: '1.22'
           cache-dependency-path: go/go.sum
       - name: Build Go binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
         run: |
           cd go && go build \
             -trimpath \
             -ldflags="-s -w -buildid= -X main.Version=${{ needs.version.outputs.tag }}" \
-            -o ../docker-socket-policy-go \
+            -o ../docker-socket-policy-go-linux-${{ matrix.goarch }} \
             .
       - name: Upload Go binary to release
         run: |
           gh release upload "${{ needs.version.outputs.tag }}" \
-            docker-socket-policy-go \
+            docker-socket-policy-go-linux-${{ matrix.goarch }} \
             --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Docker image build, SBOM, and Cosign steps only run in the amd64 job.
       # buildx handles multi-arch in a single operation (platforms: linux/amd64,linux/arm64).
-       - if: matrix.goarch == 'amd64'
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
       - if: matrix.goarch == 'amd64'
         name: Log in to GHCR
         uses: docker/login-action@v4
@@ -198,10 +201,7 @@ jobs:
             --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-       # Docker image build, SBOM, and Cosign steps only run in the amd64 job.
-       - if: matrix.arch_name == 'amd64'
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # Docker image build, SBOM, and Cosign steps only run in the amd64 job.
       - if: matrix.arch_name == 'amd64'
         name: Log in to GHCR
         uses: docker/login-action@v4
@@ -286,8 +286,6 @@ jobs:
             --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
