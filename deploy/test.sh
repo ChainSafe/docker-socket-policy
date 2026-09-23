@@ -99,9 +99,11 @@ echo "--- Transport ---"
 # connection refused, which proves the host resolved and nothing accepted on
 # 2375. Treating any non-zero exit as success would also pass when the name
 # does not resolve (exit 6), which proves nothing at all.
+# `|| rc=$?` keeps set -e from aborting here: this curl is expected to fail,
+# and a bare failing command would terminate the script before rc is read.
+rc=0
 curl -s -o /dev/null --max-time 3 --connect-timeout 2 \
-  "http://${PROXY_HOST:-proxy}:2375/_ping" 2>/dev/null
-rc=$?
+  "http://${PROXY_HOST:-proxy}:2375/_ping" 2>/dev/null || rc=$?
 case "$rc" in
   0)
     echo "  FAIL: proxy answered on TCP 2375 (it must listen on a Unix socket only)"
