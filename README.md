@@ -228,10 +228,19 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > Docker daemon over Unix sockets exclusively and reject `tcp://` and `http://`
 > schemes for `--docker-host`.
 >
-> To grant a service access, place its container user in the group that owns
-> the socket and bind-mount the socket in. To revoke it, remove the group
+> To grant access, place the caller's container user in the group that owns the
+> listening socket and bind-mount that socket in; to revoke it, remove the group
 > membership. If the proxy cannot reach the daemon socket because of its own
 > group permissions, requests surface as `403`.
+>
+> **What the socket does not give you is per-service isolation.** The proxy
+> performs no caller authentication: it selects a policy from the `Image` field
+> of the request body, not from the identity of the connection. Every caller of
+> one socket therefore shares one trust domain, and can act under any policy in
+> that proxy's `--config-dir` by naming that policy's image. Treat the socket as
+> a boundary around the whole proxy, not around a single service. To isolate
+> services from one another, run a proxy instance per service, each with its own
+> socket and a `--config-dir` containing only that service's policy.
 
 ### Systemd Socket Activation
 
