@@ -16,12 +16,15 @@ DENIED_SOCK="${PROXY_DENIED_SOCK:-/sock/denied.sock}"
 URL="http://localhost"
 
 # busybox wget cannot speak to a Unix socket, so the helpers below need curl.
+# It is baked into Dockerfile.test rather than installed here, so a run does
+# not depend on the Alpine CDN being reachable.
 if ! command -v curl >/dev/null 2>&1; then
-  apk add --no-cache curl >/dev/null 2>&1 || {
-    echo "ERROR: curl is required to talk to the proxies over Unix sockets"
-    exit 1
-  }
+  echo "ERROR: curl is missing from the test image (see deploy/Dockerfile.test)"
+  exit 1
 fi
+
+# Bound every request; curl has no default overall timeout.
+TIMEOUT="--max-time 10 --connect-timeout 2"
 
 # Both helpers take the target socket as their first argument, since this
 # suite talks to two proxies with deliberately different socket permissions.
@@ -29,14 +32,16 @@ fi
 # abort the run instead of reporting a failed assertion, so connection failures
 # are normalised to the synthetic status 000. This matters more here than in
 # test.sh: the wait loops below poll sockets that do not exist yet.
+# curl still prints %{http_code} when it exits non-zero, so the fallback only
+# applies when it produced nothing at all.
 get_status() {
-  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$1" "$2" 2>/dev/null) || out="000"
-  echo "$out"
+  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$1" "$2" 2>/dev/null || true)
+  echo "${out:-000}"
 }
 post_json() {
-  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$1" \
-    -X POST -H "Content-Type: application/json" -d "$2" "$3" 2>/dev/null) || out="000"
-  echo "$out"
+  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$1" \
+    -X POST -H "Content-Type: application/json" -d "$2" "$3" 2>/dev/null || true)
+  echo "${out:-000}"
 }
 
 check() {
@@ -75,7 +80,14 @@ while [ $i -lt 30 ]; do
 done
 if [ $i -eq 30 ]; then
   echo ""
-  echo "WARNING: proxy-granted not ready after 30s"
+  # Fail here rather than letting every assertion come back 000, which reads
+  # as a policy bug when the real cause is that the proxy never started.
+  if [ ! -S "$GRANTED_SOCK" ]; then
+    echo "ERROR: proxy-granted never created $GRANTED_SOCK — it failed to bind"
+  else
+    echo "ERROR: proxy-granted is listening but not answering after 30s"
+  fi
+  exit 1
 fi
 
 # proxy-denied: it listens fine but cannot reach the Docker socket, so it can
@@ -94,7 +106,12 @@ while [ $i -lt 15 ]; do
 done
 if [ $i -eq 15 ]; then
   echo ""
-  echo "WARNING: proxy-denied not responding after 15s"
+  if [ ! -S "$DENIED_SOCK" ]; then
+    echo "ERROR: proxy-denied never created $DENIED_SOCK — it failed to bind"
+  else
+    echo "ERROR: proxy-denied is listening but not answering after 15s"
+  fi
+  exit 1
 fi
 echo ""
 

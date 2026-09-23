@@ -1,0 +1,11 @@
+# Test runner for the integration suites.
+#
+# The proxy listens on a Unix socket only, and busybox wget cannot address one,
+# so the suites need curl. docker:28-cli does not ship it (the upstream image
+# installs only ca-certificates, openssh-client and git), so installing it at
+# runtime would put the Alpine CDN on the critical path of every test run and
+# of `make release-verify`. Baking it into a cached layer keeps the suites
+# runnable offline once built.
+FROM docker:28-cli
+
+RUN apk add --no-cache curl

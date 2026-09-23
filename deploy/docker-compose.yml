@@ -17,11 +17,16 @@ services:
       - --log-file=/tmp/docker-socket-policy.log
 
   test:
-    image: docker:28-cli
+    build:
+      context: .
+      dockerfile: Dockerfile.test
     depends_on:
       - proxy
     environment:
       PROXY_SOCK: /sock/proxy.sock
+      # Hostname the proxy would have been reachable on when it still had a
+      # TCP listener, so the suite can assert that it no longer is.
+      PROXY_HOST: proxy
     volumes:
       - ./test.sh:/test.sh:ro
       - proxy-sock:/sock

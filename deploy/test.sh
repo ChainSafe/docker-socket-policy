@@ -16,18 +16,23 @@ PROXY_SOCK="${PROXY_SOCK:-/sock/proxy.sock}"
 PROXY="http://localhost"
 
 # busybox wget cannot speak to a Unix socket, so the helpers below need curl.
+# It is baked into Dockerfile.test rather than installed here, so a run does
+# not depend on the Alpine CDN being reachable.
 if ! command -v curl >/dev/null 2>&1; then
-  apk add --no-cache curl >/dev/null 2>&1 || {
-    echo "ERROR: curl is required to talk to the proxy over a Unix socket"
-    exit 1
-  }
+  echo "ERROR: curl is missing from the test image (see deploy/Dockerfile.test)"
+  exit 1
 fi
+
+# Bound every request. curl has no default overall timeout, so without this a
+# proxy that accepts the connection and then never answers would hang the run
+# instead of failing it — and the readiness counter below would never advance.
+TIMEOUT="--max-time 10 --connect-timeout 2"
 
 # Wait for the proxy to create and serve its socket.
 echo "Waiting for proxy at ${PROXY_SOCK}..."
 i=0
 while [ $i -lt 30 ]; do
-  if curl -sf --unix-socket "$PROXY_SOCK" "$PROXY/_ping" >/dev/null 2>&1; then
+  if curl -sf $TIMEOUT --unix-socket "$PROXY_SOCK" "$PROXY/_ping" >/dev/null 2>&1; then
     echo "Proxy ready."
     break
   fi
@@ -46,19 +51,22 @@ echo ""
 # curl exits non-zero when it cannot connect at all, which under `set -e` would
 # abort the run instead of reporting a failed assertion, so connection failures
 # are normalised to the synthetic status 000.
+# curl still prints %{http_code} when it exits non-zero, so the fallback only
+# applies when it produced nothing at all. Overwriting unconditionally would
+# discard a real status on a mid-response error and report it as 000.
 get_status() {
-  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$PROXY_SOCK" "$1" 2>/dev/null) || out="000"
-  echo "$out"
+  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" "$1" 2>/dev/null || true)
+  echo "${out:-000}"
 }
 post_json() {
-  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$PROXY_SOCK" \
-    -X POST -H "Content-Type: application/json" -d "$1" "$2" 2>/dev/null) || out="000"
-  echo "$out"
+  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+    -X POST -H "Content-Type: application/json" -d "$1" "$2" 2>/dev/null || true)
+  echo "${out:-000}"
 }
 post_empty() {
-  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$PROXY_SOCK" \
-    -X POST -H "Content-Type: application/json" -d "" "$1" 2>/dev/null) || out="000"
-  echo "$out"
+  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+    -X POST -H "Content-Type: application/json" -d "" "$1" 2>/dev/null || true)
+  echo "${out:-000}"
 }
 
 check() {
@@ -79,6 +87,21 @@ echo "============================================"
 echo "  docker-socket-policy integration tests"
 echo "============================================"
 echo ""
+
+# ─── Transport: Unix socket only ────────────────────────────────
+
+# Regression guard. Every other assertion in this file goes over the Unix
+# socket and would pass just as happily if the proxy were also serving TCP,
+# so without this nothing here would notice a TCP listener coming back.
+echo "--- Transport ---"
+
+if curl -s -o /dev/null --max-time 3 --connect-timeout 2 "http://${PROXY_HOST:-proxy}:2375/_ping" 2>/dev/null; then
+  echo "  FAIL: proxy answered on TCP 2375 (it must listen on a Unix socket only)"
+  FAIL=$((FAIL+1))
+else
+  echo "  PASS: no TCP listener on 2375"
+  PASS=$((PASS+1))
+fi
 
 # ─── Read-only endpoints (always allowed) ───────────────────────
 
