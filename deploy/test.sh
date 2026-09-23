@@ -95,13 +95,29 @@ echo ""
 # so without this nothing here would notice a TCP listener coming back.
 echo "--- Transport ---"
 
-if curl -s -o /dev/null --max-time 3 --connect-timeout 2 "http://${PROXY_HOST:-proxy}:2375/_ping" 2>/dev/null; then
-  echo "  FAIL: proxy answered on TCP 2375 (it must listen on a Unix socket only)"
-  FAIL=$((FAIL+1))
-else
-  echo "  PASS: no TCP listener on 2375"
-  PASS=$((PASS+1))
-fi
+# Assert the specific failure rather than "curl failed somehow": exit 7 is
+# connection refused, which proves the host resolved and nothing accepted on
+# 2375. Treating any non-zero exit as success would also pass when the name
+# does not resolve (exit 6), which proves nothing at all.
+curl -s -o /dev/null --max-time 3 --connect-timeout 2 \
+  "http://${PROXY_HOST:-proxy}:2375/_ping" 2>/dev/null
+rc=$?
+case "$rc" in
+  0)
+    echo "  FAIL: proxy answered on TCP 2375 (it must listen on a Unix socket only)"
+    FAIL=$((FAIL+1))
+    ;;
+  7)
+    echo "  PASS: no TCP listener on 2375 (connection refused)"
+    PASS=$((PASS+1))
+    ;;
+  *)
+    echo "  FAIL: inconclusive TCP probe of ${PROXY_HOST:-proxy}:2375 (curl exit $rc);"
+    echo "        expected 7 (connection refused). Exit 6 means the name did not"
+    echo "        resolve, so this assertion would prove nothing."
+    FAIL=$((FAIL+1))
+    ;;
+esac
 
 # ─── Read-only endpoints (always allowed) ───────────────────────
 
