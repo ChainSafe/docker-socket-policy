@@ -6,15 +6,13 @@ services:
       context: ../${IMPL:-go}
       dockerfile: Dockerfile
     user: "0:0"
-    ports:
-      - "12375:2375"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./config:/etc/docker-socket-policy/services:ro
+      - proxy-sock:/sock
     command:
       - --docker-host=/var/run/docker.sock
-      - --listen-tcp=0.0.0.0:2375
-      - --listen-socket=/tmp/docker-socket-policy.sock
+      - --listen-socket=/sock/proxy.sock
       - --config-dir=/etc/docker-socket-policy/services
       - --log-file=/tmp/docker-socket-policy.log
 
@@ -23,7 +21,14 @@ services:
     depends_on:
       - proxy
     environment:
-      DOCKER_HOST: tcp://proxy:2375
+      PROXY_SOCK: /sock/proxy.sock
     volumes:
       - ./test.sh:/test.sh:ro
+      - proxy-sock:/sock
     entrypoint: ["/bin/sh", "/test.sh"]
+
+# The proxy is reachable only over this shared Unix socket: there is no
+# published port, because filesystem ownership on the socket is the
+# access-control boundary the proxy enforces.
+volumes:
+  proxy-sock:

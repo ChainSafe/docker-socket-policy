@@ -8,33 +8,26 @@ set -e
 
 PASS=0
 FAIL=0
-PROXY="${DOCKER_HOST:-tcp://proxy:2375}"
-# Strip tcp:// prefix for HTTP clients
-case "$PROXY" in
-  tcp://*) PROXY="http://${PROXY#tcp://}" ;;
-  unix://*) echo "ERROR: unix:// DOCKER_HOST not supported for HTTP tests"; exit 1 ;;
-esac
 
-# Wait for proxy to become available
-echo "Waiting for proxy at ${PROXY}..."
+# The proxy listens on a Unix socket only, shared with this container through
+# a volume. The host part of the URL is ignored when curl is given
+# --unix-socket, but it still has to be present for the URL to parse.
+PROXY_SOCK="${PROXY_SOCK:-/sock/proxy.sock}"
+PROXY="http://localhost"
+
+# busybox wget cannot speak to a Unix socket, so the helpers below need curl.
+if ! command -v curl >/dev/null 2>&1; then
+  apk add --no-cache curl >/dev/null 2>&1 || {
+    echo "ERROR: curl is required to talk to the proxy over a Unix socket"
+    exit 1
+  }
+fi
+
+# Wait for the proxy to create and serve its socket.
+echo "Waiting for proxy at ${PROXY_SOCK}..."
 i=0
 while [ $i -lt 30 ]; do
-  if wget -qO- "$PROXY/_ping" >/dev/null 2>&1; then
-    echo "Proxy ready."
-    break
-  fi
-  printf "."
-  sleep 1
-  i=$((i + 1))
-done
-if [ $i -eq 30 ]; then
-  echo ""
-  echo "ERROR: Proxy failed to respond within 30s"
-  exit 1
-fi
-echo ""
-while [ $i -lt 30 ]; do
-  if wget -qO- "$PROXY/_ping" >/dev/null 2>&1; then
+  if curl -sf --unix-socket "$PROXY_SOCK" "$PROXY/_ping" >/dev/null 2>&1; then
     echo "Proxy ready."
     break
   fi
@@ -49,15 +42,23 @@ if [ $i -eq 30 ]; then
 fi
 echo ""
 
-# Helpers: extract HTTP status code from wget --server-response output
+# Helpers: report the HTTP status code of a request sent over the Unix socket.
+# curl exits non-zero when it cannot connect at all, which under `set -e` would
+# abort the run instead of reporting a failed assertion, so connection failures
+# are normalised to the synthetic status 000.
 get_status() {
-  wget -qO /dev/null -S "$1" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -1 | awk '{print $2}'
+  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$PROXY_SOCK" "$1" 2>/dev/null) || out="000"
+  echo "$out"
 }
 post_json() {
-  wget -qO /dev/null -S --post-data="$1" --header="Content-Type: application/json" "$2" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -1 | awk '{print $2}'
+  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$PROXY_SOCK" \
+    -X POST -H "Content-Type: application/json" -d "$1" "$2" 2>/dev/null) || out="000"
+  echo "$out"
 }
 post_empty() {
-  wget -qO /dev/null -S --post-data="" --header="Content-Type: application/json" "$1" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -1 | awk '{print $2}'
+  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$PROXY_SOCK" \
+    -X POST -H "Content-Type: application/json" -d "" "$1" 2>/dev/null) || out="000"
+  echo "$out"
 }
 
 check() {

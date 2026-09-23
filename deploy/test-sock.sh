@@ -8,14 +8,35 @@ set -e
 
 PASS=0
 FAIL=0
-GRANTED="${PROXY_GRANTED:-http://proxy-granted:2375}"
-DENIED="${PROXY_DENIED:-http://proxy-denied:2375}"
 
+# Each proxy listens on its own Unix socket in the shared volume. The host part
+# of the URL is ignored when curl is given --unix-socket, but must still parse.
+GRANTED_SOCK="${PROXY_GRANTED_SOCK:-/sock/granted.sock}"
+DENIED_SOCK="${PROXY_DENIED_SOCK:-/sock/denied.sock}"
+URL="http://localhost"
+
+# busybox wget cannot speak to a Unix socket, so the helpers below need curl.
+if ! command -v curl >/dev/null 2>&1; then
+  apk add --no-cache curl >/dev/null 2>&1 || {
+    echo "ERROR: curl is required to talk to the proxies over Unix sockets"
+    exit 1
+  }
+fi
+
+# Both helpers take the target socket as their first argument, since this
+# suite talks to two proxies with deliberately different socket permissions.
+# curl exits non-zero when it cannot connect at all, which under `set -e` would
+# abort the run instead of reporting a failed assertion, so connection failures
+# are normalised to the synthetic status 000. This matters more here than in
+# test.sh: the wait loops below poll sockets that do not exist yet.
 get_status() {
-  wget -qO /dev/null -S "$1" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -1 | awk '{print $2}'
+  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$1" "$2" 2>/dev/null) || out="000"
+  echo "$out"
 }
 post_json() {
-  wget -qO /dev/null -S --post-data="$1" --header="Content-Type: application/json" "$2" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -1 | awk '{print $2}'
+  out=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$1" \
+    -X POST -H "Content-Type: application/json" -d "$2" "$3" 2>/dev/null) || out="000"
+  echo "$out"
 }
 
 check() {
@@ -40,10 +61,10 @@ echo ""
 # ─── Wait for proxies to be ready ──────────────────────
 
 # proxy-granted needs the socat socket to be ready; poll _ping until 200
-echo "Waiting for proxy-granted at $GRANTED..."
+echo "Waiting for proxy-granted at $GRANTED_SOCK..."
 i=0
 while [ $i -lt 30 ]; do
-  S=$(get_status "$GRANTED/_ping")
+  S=$(get_status "$GRANTED_SOCK" "$URL/_ping")
   if [ "$S" = "200" ]; then
     echo "proxy-granted ready."
     break
@@ -57,12 +78,13 @@ if [ $i -eq 30 ]; then
   echo "WARNING: proxy-granted not ready after 30s"
 fi
 
-# proxy-denied: just verify TCP port is open (will always return 403 on requests)
-host="${DENIED#http://}"
-echo "Waiting for proxy-denied at $DENIED..."
+# proxy-denied: it listens fine but cannot reach the Docker socket, so it can
+# never return 200. Wait for the listening socket itself to accept a request,
+# whatever status that request comes back with.
+echo "Waiting for proxy-denied at $DENIED_SOCK..."
 i=0
 while [ $i -lt 15 ]; do
-  if nc -z "${host%:*}" "${host#*:}" 2>/dev/null; then
+  if [ "$(get_status "$DENIED_SOCK" "$URL/_ping")" != "000" ]; then
     echo "proxy-denied ready."
     break
   fi
@@ -80,17 +102,17 @@ echo ""
 
 echo "--- proxy-granted (GID 2001, has group access) ---"
 
-S=$(get_status "$GRANTED/_ping")
+S=$(get_status "$GRANTED_SOCK" "$URL/_ping")
 check "GET /_ping -> 200" "200" "$S"
 
-S=$(get_status "$GRANTED/version")
+S=$(get_status "$GRANTED_SOCK" "$URL/version")
 check "GET /version -> 200" "200" "$S"
 
-S=$(get_status "$GRANTED/containers/json")
+S=$(get_status "$GRANTED_SOCK" "$URL/containers/json")
 check "GET /containers/json -> 200" "200" "$S"
 
 # Allowed image create passes through to Docker (daemon returns 404, not 403)
-S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml"]}' "$GRANTED/containers/create")
+S=$(post_json "$GRANTED_SOCK" '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml"]}' "$URL/containers/create")
 if [ "$S" = "201" ] || [ "$S" = "404" ]; then
   echo "  PASS: create container -> $S (not 403)"
   PASS=$((PASS+1))
@@ -106,16 +128,16 @@ echo "--- proxy-denied (GID 3001, no group access) ---"
 
 # The proxy starts and listens, but cannot connect to the Docker socket.
 # Permission denied on the Unix socket returns 403 Forbidden.
-S=$(get_status "$DENIED/_ping")
+S=$(get_status "$DENIED_SOCK" "$URL/_ping")
 check "GET /_ping -> 403 (permission denied on socket)" "403" "$S"
 
-S=$(get_status "$DENIED/version")
+S=$(get_status "$DENIED_SOCK" "$URL/version")
 check "GET /version -> 403" "403" "$S"
 
-S=$(get_status "$DENIED/containers/json")
+S=$(get_status "$DENIED_SOCK" "$URL/containers/json")
 check "GET /containers/json -> 403" "403" "$S"
 
-S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml"]}' "$DENIED/containers/create")
+S=$(post_json "$DENIED_SOCK" '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml"]}' "$URL/containers/create")
 check "POST /containers/create -> 403" "403" "$S"
 
 # ─── Summary ──────────────────────────────────────────

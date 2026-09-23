@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { getFlag, hasFlag, parseHostPort, parseSocketPath } from "./flags.js";
+import { getFlag, hasFlag, parseListenSocket, parseSocketPath } from "./flags.js";
 
 describe("flags", () => {
   describe("getFlag", () => {
@@ -30,7 +30,7 @@ describe("flags", () => {
 
     it("does not match a different flag's value", () => {
       assert.equal(
-        getFlag(["--listen-tcp", "0.0.0.0:2375"], "--config-dir", "d"),
+        getFlag(["--listen-socket", "/run/dsp.sock"], "--config-dir", "d"),
         "d",
       );
     });
@@ -58,18 +58,41 @@ describe("flags", () => {
     });
   });
 
-  describe("parseHostPort", () => {
-    it("parses host:port", () => {
-      assert.deepEqual(parseHostPort("0.0.0.0:2375"), { host: "0.0.0.0", port: 2375 });
-      assert.deepEqual(parseHostPort("127.0.0.1:2375"), { host: "127.0.0.1", port: 2375 });
+  describe("parseListenSocket", () => {
+    it("accepts a plain unix socket path", () => {
+      assert.deepEqual(parseListenSocket("/var/run/docker-socket-policy.sock"), {
+        kind: "path",
+        path: "/var/run/docker-socket-policy.sock",
+      });
     });
 
-    it("defaults to all interfaces for a bare port", () => {
-      assert.deepEqual(parseHostPort("2375"), { host: "0.0.0.0", port: 2375 });
+    it("accepts fd://3 for systemd socket activation", () => {
+      assert.deepEqual(parseListenSocket("fd://3"), { kind: "fd", fd: 3 });
     });
 
-    it("accepts a custom default host for bare port", () => {
-      assert.deepEqual(parseHostPort("2375", "127.0.0.1"), { host: "127.0.0.1", port: 2375 });
+    it("rejects socket activation on any fd other than 3", () => {
+      const result = parseListenSocket("fd://4");
+      assert.equal(result.kind, "error");
+      assert.match(result.kind === "error" ? result.message : "", /only supports fd:\/\/3/);
+    });
+
+    it("rejects TCP and HTTP listen addresses", () => {
+      for (const input of [
+        "tcp://0.0.0.0:2375",
+        "http://0.0.0.0:2375",
+        "https://0.0.0.0:2375",
+        "unix:///var/run/docker-socket-policy.sock",
+      ]) {
+        const result = parseListenSocket(input);
+        assert.equal(result.kind, "error", `expected ${input} to be rejected`);
+        assert.match(result.kind === "error" ? result.message : "", /Unix socket paths/);
+      }
+    });
+
+    it("rejects empty values", () => {
+      const result = parseListenSocket("");
+      assert.equal(result.kind, "error");
+      assert.match(result.kind === "error" ? result.message : "", /must not be empty/);
     });
   });
 

@@ -22,8 +22,6 @@ var Version = "dev"
 func main() {
 	listenSocket := flag.String("listen-socket", "/var/run/docker-socket-policy.sock",
 		"Unix socket to listen on (or fd://3 for systemd socket activation)")
-	listenTCP := flag.String("listen-tcp", "127.0.0.1:2375",
-		"TCP address to listen on")
 	dockerHost := flag.String("docker-host", "/var/run/docker.sock",
 		"Docker daemon socket path")
 	configDir := flag.String("config-dir", "/etc/docker-socket-policy/services",
@@ -56,8 +54,13 @@ func main() {
 	transport := proxy.NewTransport(*dockerHost)
 	handler := proxy.NewHandler(router, chain, auditLog, transport)
 
-	go startListener(ctx, "unix", *listenSocket, handler)
-	startListener(ctx, "tcp", *listenTCP, handler)
+	listener, err := unixListener(*listenSocket)
+	if err != nil {
+		slog.Error("failed to start listener", "addr", *listenSocket, "error", err)
+		os.Exit(1)
+	}
+
+	go serve(ctx, listener, *listenSocket, handler)
 
 	<-ctx.Done()
 	slog.Info("shutting down...")
@@ -69,25 +72,18 @@ func main() {
 	slog.Info("shutdown complete")
 }
 
-func startListener(ctx context.Context, network, addr string, handler http.Handler) {
-	var listener net.Listener
-	var err error
-
-	if network == "unix" {
-		if addr == "fd://3" {
-			listener, err = net.FileListener(os.NewFile(3, "socket"))
-		} else {
-			_ = os.Remove(addr)
-			listener, err = net.Listen("unix", addr)
-		}
-	} else {
-		listener, err = net.Listen("tcp", addr)
+// unixListener binds the proxy's only listening socket. Listening is Unix-socket
+// only by design: peer credentials and filesystem ownership on the socket are the
+// access-control boundary, and a TCP listener would have neither.
+func unixListener(addr string) (net.Listener, error) {
+	if addr == "fd://3" {
+		return net.FileListener(os.NewFile(3, "socket"))
 	}
-	if err != nil {
-		slog.Error("failed to start listener", "network", network, "addr", addr, "error", err)
-		return
-	}
+	_ = os.Remove(addr)
+	return net.Listen("unix", addr)
+}
 
+func serve(ctx context.Context, listener net.Listener, addr string, handler http.Handler) {
 	server := &http.Server{Handler: handler}
 	go func() {
 		<-ctx.Done()
@@ -96,8 +92,8 @@ func startListener(ctx context.Context, network, addr string, handler http.Handl
 		server.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("listening", "network", network, "addr", addr)
+	slog.Info("listening", "network", "unix", "addr", addr)
 	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-		slog.Error("server error", "network", network, "addr", addr, "error", err)
+		slog.Error("server error", "network", "unix", "addr", addr, "error", err)
 	}
 }

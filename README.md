@@ -212,20 +212,26 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--listen-socket` | `/var/run/docker-socket-policy.sock` | Unix socket (or `fd://3` for systemd). **Go/Rust only** |
-| `--listen-tcp` | `127.0.0.1:2375` | TCP listen address |
+| `--listen-socket` | `/var/run/docker-socket-policy.sock` | Unix socket to listen on (or `fd://3` for systemd) |
 | `--docker-host` | `/var/run/docker.sock` | Docker daemon socket path (Unix socket only) |
 | `--config-dir` | `/etc/docker-socket-policy/services` | Policy config directory |
 | `--log-file` | `/var/log/docker-socket-policy.log` | Audit log path |
 | `--readonly` | `false` | Enable read-only mode |
 
-> **Unix socket security boundary**: Go and Rust support `--listen-socket` for
-> binding to a Unix socket, enabling socket-level access control via file
-> permissions and Unix groups. TypeScript does not implement `--listen-socket`
-> and listens on TCP only (`--listen-tcp`). All three implementations connect
-> to the Docker daemon over Unix sockets exclusively; they reject `tcp://` and
-> `http://` schemes for `--docker-host`. TCP connections would bypass socket
-> ownership-based access control, breaking the security model.
+> **Unix socket security boundary**: the proxy listens on a Unix socket only,
+> in all three implementations. Access control is the file permissions and Unix
+> group on that socket — a caller is authorised because it can `connect(2)` to
+> it. A TCP listener carries no peer identity, so anything able to reach the
+> port would be implicitly trusted; there is no `--listen-tcp`.
+>
+> The same rule applies outbound: all three implementations connect to the
+> Docker daemon over Unix sockets exclusively and reject `tcp://` and `http://`
+> schemes for `--docker-host`.
+>
+> To grant a service access, place its container user in the group that owns
+> the socket and bind-mount the socket in. To revoke it, remove the group
+> membership. If the proxy cannot reach the daemon socket because of its own
+> group permissions, requests surface as `403`.
 
 ### Systemd Socket Activation
 
@@ -235,7 +241,6 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 ListenStream=/var/run/docker-socket-policy.sock
 SocketMode=0660
 SocketGroup=builders
-ListenStream=127.0.0.1:2375
 ```
 
 **`docker-socket-policy.service`**:

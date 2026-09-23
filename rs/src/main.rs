@@ -37,9 +37,6 @@ struct Cli {
     #[arg(long, default_value = "/var/run/docker-socket-policy.sock")]
     listen_socket: String,
 
-    #[arg(long, default_value = "127.0.0.1:2375")]
-    listen_tcp: String,
-
     #[arg(long, default_value = "/var/run/docker.sock")]
     docker_host: String,
 
@@ -76,13 +73,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport: Box<dyn transport::Transport> = Box::new(transport::UnixSocketTransport::new(&cli.docker_host));
     let handler = Arc::new(handler::Handler::new(router, chain, audit, transport));
 
-    // A broadcast channel lets every listener task shut down independently
-    // when a signal arrives, without one listener's loop owning the others.
-    // Both receivers are created BEFORE the signal tasks spawn: a broadcast
-    // send with zero receivers is silently dropped, so subscribing later
-    // would open a window where an early signal is lost.
+    // A broadcast channel lets the listener task shut down independently when a
+    // signal arrives, without the signal handlers owning the listener's loop.
+    // The receiver is created BEFORE the signal tasks spawn: a broadcast send
+    // with zero receivers is silently dropped, so subscribing later would open
+    // a window where an early signal is lost.
     let (shutdown_tx, unix_shutdown_rx) = broadcast::channel::<()>(1);
-    let tcp_shutdown_rx = shutdown_tx.subscribe();
 
     {
         let tx = shutdown_tx.clone();
@@ -104,16 +100,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let unix_handle = spawn_unix_listener(handler.clone(), cli.listen_socket.clone(), unix_shutdown_rx);
-    let tcp_handle = spawn_tcp_listener(handler.clone(), cli.listen_tcp.clone(), tcp_shutdown_rx);
+    // Bind before spawning so a bind failure is fatal: the Unix socket is the
+    // process's only listener, so a running-but-unbound proxy is never useful.
+    let listener = bind_unix_listener(&cli.listen_socket).map_err(|e| {
+        tracing::error!("failed to bind unix socket {}: {}", cli.listen_socket, e);
+        e
+    })?;
+    let unix_handle = spawn_unix_listener(
+        handler.clone(),
+        listener,
+        cli.listen_socket.clone(),
+        unix_shutdown_rx,
+    );
 
-    let _ = tokio::join!(unix_handle, tcp_handle);
+    let _ = unix_handle.await;
     tracing::info!("shutdown complete");
 
     Ok(())
 }
 
 /// Binds the Unix socket listener for `--listen-socket`.
+///
+/// This is the proxy's only listener by design: peer credentials and filesystem
+/// ownership on the socket are the access-control boundary, and a TCP listener
+/// would have neither.
 ///
 /// `fd://3` selects systemd socket activation (the socket is already bound
 /// and listening; we just adopt the fd). Any other value is treated as a
@@ -151,17 +161,11 @@ fn unix_listener_from_raw_fd(fd: RawFd) -> io::Result<tokio::net::UnixListener> 
 
 fn spawn_unix_listener(
     handler: Arc<handler::Handler>,
+    listener: tokio::net::UnixListener,
     addr: String,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let listener = match bind_unix_listener(&addr) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("failed to bind unix socket {}: {}", addr, e);
-                return;
-            }
-        };
         tracing::info!("listening on unix socket {}", addr);
 
         loop {
@@ -182,52 +186,6 @@ fn spawn_unix_listener(
                 }
                 _ = shutdown_rx.recv() => {
                     tracing::info!("unix socket listener shutting down");
-                    break;
-                }
-            }
-        }
-    })
-}
-
-fn spawn_tcp_listener(
-    handler: Arc<handler::Handler>,
-    addr: String,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let socket_addr: std::net::SocketAddr = match addr.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!("invalid TCP listen address {}: {}", addr, e);
-                return;
-            }
-        };
-        let listener = match tokio::net::TcpListener::bind(socket_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("failed to bind TCP {}: {}", socket_addr, e);
-                return;
-            }
-        };
-        tracing::info!("listening on TCP {}", socket_addr);
-
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, _)) => {
-                            tokio::spawn(serve_connection(handler.clone(), stream));
-                        }
-                        Err(e) => {
-                            // Back off briefly: persistent accept errors
-                            // (e.g. EMFILE) would otherwise busy-loop.
-                            tracing::warn!("accept error on TCP socket: {}", e);
-                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                        }
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    tracing::info!("TCP listener shutting down");
                     break;
                 }
             }

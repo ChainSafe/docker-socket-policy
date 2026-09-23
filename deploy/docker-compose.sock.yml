@@ -10,6 +10,11 @@ services:
       - sh
       - -c
       - |
+        # chmod first, before the slow apk fetch: the proxies bind their own
+        # listening sockets in this directory as non-root, and anything they
+        # attempt before this runs fails with EACCES. The access control under
+        # test is the mode on docker.sock below, not the mode on the directory.
+        chmod 0777 /sock
         apk add --no-cache socat
         addgroup -g 2001 dockertest
         socat UNIX-LISTEN:/sock/docker.sock,unlink-early,fork,group=dockertest,perm=660 \
@@ -17,6 +22,13 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - sock-data:/sock
+    # Gates the proxies below. service_started would only mean "the container
+    # process exists", which was racing the chmod and the socat bind above.
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -S /sock/docker.sock"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
 
   proxy-granted:
     build:
@@ -26,16 +38,13 @@ services:
     user: 65532:2001
     depends_on:
       sock-perms:
-        condition: service_started
-    ports:
-      - "12376:2375"
+        condition: service_healthy
     volumes:
       - ./config:/etc/docker-socket-policy/services:ro
       - sock-data:/sock
     command:
       - --docker-host=/sock/docker.sock
-      - --listen-tcp=0.0.0.0:2375
-      - --listen-socket=/tmp/docker-socket-policy.sock
+      - --listen-socket=/sock/granted.sock
       - --config-dir=/etc/docker-socket-policy/services
       - --log-file=/tmp/docker-socket-policy.log
 
@@ -47,16 +56,13 @@ services:
     user: 65532:3001
     depends_on:
       sock-perms:
-        condition: service_started
-    ports:
-      - "12377:2375"
+        condition: service_healthy
     volumes:
       - ./config:/etc/docker-socket-policy/services:ro
       - sock-data:/sock
     command:
       - --docker-host=/sock/docker.sock
-      - --listen-tcp=0.0.0.0:2375
-      - --listen-socket=/tmp/docker-socket-policy.sock
+      - --listen-socket=/sock/denied.sock
       - --config-dir=/etc/docker-socket-policy/services
       - --log-file=/tmp/docker-socket-policy.log
 
@@ -66,8 +72,9 @@ services:
       - proxy-granted
       - proxy-denied
     environment:
-      PROXY_GRANTED: http://proxy-granted:2375
-      PROXY_DENIED: http://proxy-denied:2375
+      PROXY_GRANTED_SOCK: /sock/granted.sock
+      PROXY_DENIED_SOCK: /sock/denied.sock
     volumes:
       - ./test-sock.sh:/test-sock.sh:ro
+      - sock-data:/sock
     entrypoint: ["/bin/sh", "/test-sock.sh"]
