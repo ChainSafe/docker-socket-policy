@@ -46,6 +46,42 @@ deploy/ — Docker Compose + integration tests
 - TypeScript: `node:test` framework, `npm run build && node --test dist/*.test.js`
 - Integration: `make test-integration` (26 test cases via Docker Compose)
 
+## Contribution Workflow
+
+Every change follows issue → branch → PR. Do not skip the issue: it is where the
+problem and the rejected alternatives are recorded, and the PR body is a poor
+substitute.
+
+1. **Open an issue first.** Use the `.github/ISSUE_TEMPLATE/` structure
+   (`bug_report.md` or `feature_request.md`). State the problem and the concrete
+   evidence (`file:line`), the proposed solution, and the alternatives considered
+   *and why they were rejected*. Tick the affected implementations — a change
+   landing in only one of Go/Rust/TS needs justifying against the equal-peers rule.
+2. **Label it.** `Type: *` is required (`Bug`, `Enhancement`, `Feature`,
+   `Documentation`). Add `Status: Break Change` for anything that alters CLI flags,
+   config schema, or on-the-wire behaviour. `Priority: P0`–`P3` for bugs.
+3. **Branch off `main`**, never off another feature branch. Naming follows the
+   commit type: `feat/…`, `fix/…`, `docs/…`, `spec/…`. Verify with
+   `git log origin/main --oneline -1` that you branched from the current head;
+   merged branches linger locally and are easy to land on by mistake.
+4. **Commit with Conventional Commits** (`feat:`, `fix:`, `docs:`, `spec:`,
+   `chore:`), optionally scoped — `fix(release):`. The release pipeline derives
+   version bumps from these, so the type is not cosmetic. Mark breaking changes
+   with `!` (`feat!:`) or a `BREAKING CHANGE:` footer.
+5. **Open the PR with a closing keyword** so the issue auto-closes on merge:
+   `Closes #123` in the body. Fill in `.github/PULL_REQUEST_TEMPLATE.md` honestly —
+   only tick test boxes for suites actually run, and paste the evidence.
+6. **Verify before marking ready.** `make test-all`, `make lint-all`,
+   `make verify`, and `make test-integration` for anything touching the request
+   path. Claims of passing tests require pasted output.
+
+Useful checks:
+```sh
+gh issue create --title "..." --body-file <file> --label "Type: Enhancement"
+gh pr create --base main --title "..." --body-file <file>   # body contains "Closes #N"
+gh pr view --json closingIssuesReferences                   # confirm the link landed
+```
+
 ## Repo Standard Reference
 
 When implementing code or bootstrapping a new ChainSafe open source repo, follow the [ChainSafe Open Source Repository Standard](docs/repo-standard.md). This defines the required file structure, CI/CD, community files, and release pipeline for all ChainSafe public repos. This repo (`docker-socket-policy`) is the living reference implementation of that standard.
