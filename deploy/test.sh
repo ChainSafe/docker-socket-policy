@@ -8,33 +8,31 @@ set -e
 
 PASS=0
 FAIL=0
-PROXY="${DOCKER_HOST:-tcp://proxy:2375}"
-# Strip tcp:// prefix for HTTP clients
-case "$PROXY" in
-  tcp://*) PROXY="http://${PROXY#tcp://}" ;;
-  unix://*) echo "ERROR: unix:// DOCKER_HOST not supported for HTTP tests"; exit 1 ;;
-esac
 
-# Wait for proxy to become available
-echo "Waiting for proxy at ${PROXY}..."
+# The proxy listens on a Unix socket only, shared with this container through
+# a volume. The host part of the URL is ignored when curl is given
+# --unix-socket, but it still has to be present for the URL to parse.
+PROXY_SOCK="${PROXY_SOCK:-/sock/proxy.sock}"
+PROXY="http://localhost"
+
+# busybox wget cannot speak to a Unix socket, so the helpers below need curl.
+# It is baked into Dockerfile.test rather than installed here, so a run does
+# not depend on the Alpine CDN being reachable.
+if ! command -v curl >/dev/null 2>&1; then
+  echo "ERROR: curl is missing from the test image (see deploy/Dockerfile.test)"
+  exit 1
+fi
+
+# Bound every request. curl has no default overall timeout, so without this a
+# proxy that accepts the connection and then never answers would hang the run
+# instead of failing it — and the readiness counter below would never advance.
+TIMEOUT="--max-time 10 --connect-timeout 2"
+
+# Wait for the proxy to create and serve its socket.
+echo "Waiting for proxy at ${PROXY_SOCK}..."
 i=0
 while [ $i -lt 30 ]; do
-  if wget -qO- "$PROXY/_ping" >/dev/null 2>&1; then
-    echo "Proxy ready."
-    break
-  fi
-  printf "."
-  sleep 1
-  i=$((i + 1))
-done
-if [ $i -eq 30 ]; then
-  echo ""
-  echo "ERROR: Proxy failed to respond within 30s"
-  exit 1
-fi
-echo ""
-while [ $i -lt 30 ]; do
-  if wget -qO- "$PROXY/_ping" >/dev/null 2>&1; then
+  if curl -sf $TIMEOUT --unix-socket "$PROXY_SOCK" "$PROXY/_ping" >/dev/null 2>&1; then
     echo "Proxy ready."
     break
   fi
@@ -49,15 +47,26 @@ if [ $i -eq 30 ]; then
 fi
 echo ""
 
-# Helpers: extract HTTP status code from wget --server-response output
+# Helpers: report the HTTP status code of a request sent over the Unix socket.
+# curl exits non-zero when it cannot connect at all, which under `set -e` would
+# abort the run instead of reporting a failed assertion, so connection failures
+# are normalised to the synthetic status 000.
+# curl still prints %{http_code} when it exits non-zero, so the fallback only
+# applies when it produced nothing at all. Overwriting unconditionally would
+# discard a real status on a mid-response error and report it as 000.
 get_status() {
-  wget -qO /dev/null -S "$1" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -1 | awk '{print $2}'
+  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" "$1" 2>/dev/null || true)
+  echo "${out:-000}"
 }
 post_json() {
-  wget -qO /dev/null -S --post-data="$1" --header="Content-Type: application/json" "$2" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -1 | awk '{print $2}'
+  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+    -X POST -H "Content-Type: application/json" -d "$1" "$2" 2>/dev/null || true)
+  echo "${out:-000}"
 }
 post_empty() {
-  wget -qO /dev/null -S --post-data="" --header="Content-Type: application/json" "$1" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -1 | awk '{print $2}'
+  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+    -X POST -H "Content-Type: application/json" -d "" "$1" 2>/dev/null || true)
+  echo "${out:-000}"
 }
 
 check() {
@@ -78,6 +87,39 @@ echo "============================================"
 echo "  docker-socket-policy integration tests"
 echo "============================================"
 echo ""
+
+# ─── Transport: Unix socket only ────────────────────────────────
+
+# Regression guard. Every other assertion in this file goes over the Unix
+# socket and would pass just as happily if the proxy were also serving TCP,
+# so without this nothing here would notice a TCP listener coming back.
+echo "--- Transport ---"
+
+# Assert the specific failure rather than "curl failed somehow": exit 7 is
+# connection refused, which proves the host resolved and nothing accepted on
+# 2375. Treating any non-zero exit as success would also pass when the name
+# does not resolve (exit 6), which proves nothing at all.
+# `|| rc=$?` keeps set -e from aborting here: this curl is expected to fail,
+# and a bare failing command would terminate the script before rc is read.
+rc=0
+curl -s -o /dev/null --max-time 3 --connect-timeout 2 \
+  "http://${PROXY_HOST:-proxy}:2375/_ping" 2>/dev/null || rc=$?
+case "$rc" in
+  0)
+    echo "  FAIL: proxy answered on TCP 2375 (it must listen on a Unix socket only)"
+    FAIL=$((FAIL+1))
+    ;;
+  7)
+    echo "  PASS: no TCP listener on 2375 (connection refused)"
+    PASS=$((PASS+1))
+    ;;
+  *)
+    echo "  FAIL: inconclusive TCP probe of ${PROXY_HOST:-proxy}:2375 (curl exit $rc);"
+    echo "        expected 7 (connection refused). Exit 6 means the name did not"
+    echo "        resolve, so this assertion would prove nothing."
+    FAIL=$((FAIL+1))
+    ;;
+esac
 
 # ─── Read-only endpoints (always allowed) ───────────────────────
 

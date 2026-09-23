@@ -107,9 +107,10 @@ test-integration-rs:
 test-integration-ts:
 	$(MAKE) test-integration IMPL=ts
 
-# Unix-socket provisioning tests. The proxy only connects to the Docker
-# daemon over a Unix socket — TCP would bypass user/group socket ownership,
-# which is the security model this target exercises. Not run in CI (uses
+# Unix-socket provisioning tests. The proxy both listens and connects over
+# Unix sockets only — TCP would bypass user/group socket ownership, which is
+# the security model this target exercises: proxy-granted is in the socket's
+# group and succeeds, proxy-denied is not and gets 403. Not run in CI (uses
 # group-restricted socket setup); run locally per IMPL.
 test-integration-sock:
 	IMPL=$(IMPL) docker compose -f deploy/docker-compose.sock.yml down --remove-orphans -v 2>/dev/null; \

@@ -1,6 +1,5 @@
-// Only the `Cli` struct fields legitimately go unread if a listener is
-// disabled by config; broader dead_code cleanup across policy/proxy/
-// middleware (pre-existing, unrelated to this fix) is tracked separately.
+// Broader dead_code cleanup across policy/proxy/middleware (pre-existing,
+// unrelated to this change) is tracked separately.
 #![allow(dead_code)]
 
 mod audit;
@@ -15,6 +14,7 @@ use hyper::body::Incoming as IncomingBody;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use std::io;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::sync::Arc;
@@ -37,9 +37,6 @@ struct Cli {
     #[arg(long, default_value = "/var/run/docker-socket-policy.sock")]
     listen_socket: String,
 
-    #[arg(long, default_value = "127.0.0.1:2375")]
-    listen_tcp: String,
-
     #[arg(long, default_value = "/var/run/docker.sock")]
     docker_host: String,
 
@@ -61,6 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    if let Err(msg) = validate_listen_socket(&cli.listen_socket) {
+        tracing::error!("{}", msg);
+        std::process::exit(2);
+    }
+    if let Err(msg) = validate_docker_host(&cli.docker_host) {
+        tracing::error!("{}", msg);
+        std::process::exit(2);
+    }
+
     let policy_manager = policy::Manager::new(&cli.config_dir)?;
     tracing::info!("loaded {} policies", policy_manager.list().len());
 
@@ -76,13 +82,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport: Box<dyn transport::Transport> = Box::new(transport::UnixSocketTransport::new(&cli.docker_host));
     let handler = Arc::new(handler::Handler::new(router, chain, audit, transport));
 
-    // A broadcast channel lets every listener task shut down independently
-    // when a signal arrives, without one listener's loop owning the others.
-    // Both receivers are created BEFORE the signal tasks spawn: a broadcast
-    // send with zero receivers is silently dropped, so subscribing later
-    // would open a window where an early signal is lost.
+    // A broadcast channel lets the listener task shut down independently when a
+    // signal arrives, without the signal handlers owning the listener's loop.
+    // The receiver is created BEFORE the signal tasks spawn: a broadcast send
+    // with zero receivers is silently dropped, so subscribing later would open
+    // a window where an early signal is lost.
     let (shutdown_tx, unix_shutdown_rx) = broadcast::channel::<()>(1);
-    let tcp_shutdown_rx = shutdown_tx.subscribe();
 
     {
         let tx = shutdown_tx.clone();
@@ -104,10 +109,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let unix_handle = spawn_unix_listener(handler.clone(), cli.listen_socket.clone(), unix_shutdown_rx);
-    let tcp_handle = spawn_tcp_listener(handler.clone(), cli.listen_tcp.clone(), tcp_shutdown_rx);
+    // Bind before spawning so a bind failure is fatal: the Unix socket is the
+    // process's only listener, so a running-but-unbound proxy is never useful.
+    let listener = bind_unix_listener(&cli.listen_socket).map_err(|e| {
+        tracing::error!("failed to bind unix socket {}: {}", cli.listen_socket, e);
+        e
+    })?;
+    let unix_handle = spawn_unix_listener(
+        handler.clone(),
+        listener,
+        cli.listen_socket.clone(),
+        unix_shutdown_rx,
+    );
 
-    let _ = tokio::join!(unix_handle, tcp_handle);
+    let _ = unix_handle.await;
     tracing::info!("shutdown complete");
 
     Ok(())
@@ -115,21 +130,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Binds the Unix socket listener for `--listen-socket`.
 ///
+/// This is the proxy's only listener by design: peer credentials and filesystem
+/// ownership on the socket are the access-control boundary, and a TCP listener
+/// would have neither.
+///
 /// `fd://3` selects systemd socket activation (the socket is already bound
 /// and listening; we just adopt the fd). Any other value is treated as a
-/// filesystem path: a stale socket file left over from a previous run is
-/// removed before binding, matching the Go implementation.
+/// filesystem path: a stale socket left over from a previous run is removed
+/// before binding, matching the Go implementation.
 fn bind_unix_listener(addr: &str) -> io::Result<tokio::net::UnixListener> {
     if addr == "fd://3" {
         return unix_listener_from_raw_fd(SYSTEMD_SOCKET_FD);
     }
 
-    if let Err(e) = std::fs::remove_file(addr) {
-        if e.kind() != io::ErrorKind::NotFound {
-            return Err(e);
+    // Remove a stale socket, but only a socket: blindly removing would let a
+    // mistyped path silently delete an operator's file, so anything that is
+    // not a socket is an error rather than something to clear out of the way.
+    match std::fs::symlink_metadata(addr) {
+        Ok(meta) => {
+            if !meta.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("refusing to remove {}: not a socket ({:?})", addr, meta.file_type()),
+                ));
+            }
+            std::fs::remove_file(addr)?;
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     tokio::net::UnixListener::bind(addr)
+}
+
+/// Rejects `--listen-socket` values that would not produce a filesystem-visible
+/// Unix socket. Several of them otherwise bind something surprising rather than
+/// failing: `tcp://0.0.0.0:2375` becomes a file named `tcp:/0.0.0.0:2375`.
+/// Mirrors `validateListenSocket` in Go and `parseListenSocket` in TypeScript.
+fn validate_listen_socket(addr: &str) -> Result<(), String> {
+    let activation = format!("fd://{}", SYSTEMD_SOCKET_FD);
+    if addr.is_empty() {
+        Err("--listen-socket must not be empty".to_string())
+    } else if addr == activation {
+        Ok(())
+    } else if addr.starts_with("fd://") {
+        Err(format!(
+            "--listen-socket only supports {} for socket activation, got: {}",
+            activation, addr
+        ))
+    } else if ["tcp://", "http://", "https://", "unix://"]
+        .iter()
+        .any(|s| addr.starts_with(s))
+    {
+        Err(format!(
+            "--listen-socket only supports Unix socket paths, got: {}",
+            addr
+        ))
+    } else if addr.starts_with('@') || addr.starts_with('\0') {
+        Err(format!(
+            "--listen-socket must be a filesystem path; abstract sockets have no permissions \
+             and would be reachable by any process, got: {}",
+            addr
+        ))
+    } else if !addr.starts_with('/') {
+        Err(format!("--listen-socket must be an absolute path, got: {}", addr))
+    } else {
+        Ok(())
+    }
+}
+
+/// Rejects non-Unix Docker daemon addresses. Connecting to the daemon over TCP
+/// would bypass the user/group ownership on the daemon socket, which is what
+/// constrains the proxy's own access.
+fn validate_docker_host(addr: &str) -> Result<(), String> {
+    if addr.is_empty() {
+        return Err("--docker-host must not be empty".to_string());
+    }
+    if ["tcp://", "http://", "https://", "unix://"]
+        .iter()
+        .any(|s| addr.starts_with(s))
+    {
+        return Err(format!(
+            "--docker-host only supports Unix socket paths, got: {}",
+            addr
+        ));
+    }
+    Ok(())
 }
 
 /// Wraps an existing raw fd as a Tokio `UnixListener`.
@@ -145,23 +230,33 @@ fn unix_listener_from_raw_fd(fd: RawFd) -> io::Result<tokio::net::UnixListener> 
     // surfaces as an `io::Error` from the syscalls below (or from `accept`),
     // never as undefined behavior.
     let std_listener = unsafe { StdUnixListener::from_raw_fd(fd) };
+
+    // Confirm the fd really is an AF_UNIX socket rather than relying on a later
+    // accept to fail. A unit with ListenStream=127.0.0.1:2375 hands us a TCP
+    // socket, and treating it as a Unix socket would either serve plain TCP or
+    // wedge the accept loop warning at every retry.
+    std_listener.local_addr().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "fd {} is not a Unix socket ({}): set ListenStream to a filesystem path \
+                 in the .socket unit",
+                fd, e
+            ),
+        )
+    })?;
+
     std_listener.set_nonblocking(true)?;
     tokio::net::UnixListener::from_std(std_listener)
 }
 
 fn spawn_unix_listener(
     handler: Arc<handler::Handler>,
+    listener: tokio::net::UnixListener,
     addr: String,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let listener = match bind_unix_listener(&addr) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("failed to bind unix socket {}: {}", addr, e);
-                return;
-            }
-        };
         tracing::info!("listening on unix socket {}", addr);
 
         loop {
@@ -182,52 +277,6 @@ fn spawn_unix_listener(
                 }
                 _ = shutdown_rx.recv() => {
                     tracing::info!("unix socket listener shutting down");
-                    break;
-                }
-            }
-        }
-    })
-}
-
-fn spawn_tcp_listener(
-    handler: Arc<handler::Handler>,
-    addr: String,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let socket_addr: std::net::SocketAddr = match addr.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!("invalid TCP listen address {}: {}", addr, e);
-                return;
-            }
-        };
-        let listener = match tokio::net::TcpListener::bind(socket_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("failed to bind TCP {}: {}", socket_addr, e);
-                return;
-            }
-        };
-        tracing::info!("listening on TCP {}", socket_addr);
-
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, _)) => {
-                            tokio::spawn(serve_connection(handler.clone(), stream));
-                        }
-                        Err(e) => {
-                            // Back off briefly: persistent accept errors
-                            // (e.g. EMFILE) would otherwise busy-loop.
-                            tracing::warn!("accept error on TCP socket: {}", e);
-                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                        }
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    tracing::info!("TCP listener shutting down");
                     break;
                 }
             }
@@ -263,19 +312,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bind_unix_listener_removes_stale_socket_file() {
+    async fn test_bind_unix_listener_removes_stale_socket() {
         let path = unique_socket_path();
-        // Simulate a stale socket file left behind by a previous run.
-        std::fs::write(&path, b"stale").unwrap();
+        // A real socket left behind by an unclean shutdown. Dropping the
+        // listener does not unlink it, so the file outlives the process.
+        let stale = StdUnixListener::bind(&path).unwrap();
+        drop(stale);
+        assert!(path.exists(), "precondition: stale socket should still be on disk");
 
         let result = bind_unix_listener(path.to_str().unwrap());
         assert!(
             result.is_ok(),
-            "expected stale socket file to be removed and bind to succeed: {:?}",
+            "expected stale socket to be removed and bind to succeed: {:?}",
             result.err()
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_bind_unix_listener_refuses_to_delete_non_socket() {
+        // A mistyped --listen-socket must not silently destroy data.
+        let path = unique_socket_path();
+        std::fs::write(&path, b"important data").unwrap();
+
+        let result = bind_unix_listener(path.to_str().unwrap());
+        assert!(result.is_err(), "expected a regular file to be refused, not deleted");
+        assert!(
+            result.unwrap_err().to_string().contains("not a socket"),
+            "error should explain that the path is not a socket"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"important data",
+            "the file must be left untouched"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_validate_listen_socket() {
+        // Accepted.
+        for addr in ["/var/run/docker-socket-policy.sock", "fd://3"] {
+            assert!(validate_listen_socket(addr).is_ok(), "{} should be accepted", addr);
+        }
+
+        // Rejected, with the reason that should be reported.
+        let cases = [
+            ("", "must not be empty"),
+            ("fd://4", "only supports fd://3"),
+            ("fd://0", "only supports fd://3"),
+            ("fd://abc", "only supports fd://3"),
+            ("tcp://0.0.0.0:2375", "only supports Unix socket paths"),
+            ("http://0.0.0.0:2375", "only supports Unix socket paths"),
+            ("https://0.0.0.0:2375", "only supports Unix socket paths"),
+            ("unix:///var/run/d.sock", "only supports Unix socket paths"),
+            ("@dsp", "abstract sockets have no permissions"),
+            ("\0dsp", "abstract sockets have no permissions"),
+            // The likeliest --listen-tcp migration mistake: drop the scheme,
+            // keep the address. Binding it would create a file called
+            // "0.0.0.0:2375" and report success while being unreachable.
+            ("0.0.0.0:2375", "must be an absolute path"),
+            ("dsp.sock", "must be an absolute path"),
+        ];
+        for (addr, want) in cases {
+            let err = validate_listen_socket(addr)
+                .expect_err(&format!("{:?} should be rejected", addr));
+            assert!(err.contains(want), "error for {:?} was {:?}, want it to contain {:?}", addr, err, want);
+        }
+    }
+
+    #[test]
+    fn test_validate_docker_host() {
+        assert!(validate_docker_host("/var/run/docker.sock").is_ok());
+
+        let cases = [
+            ("", "must not be empty"),
+            ("tcp://dind:2375", "only supports Unix socket paths"),
+            ("http://dind:2375", "only supports Unix socket paths"),
+            ("https://dind:2375", "only supports Unix socket paths"),
+            ("unix:///var/run/docker.sock", "only supports Unix socket paths"),
+        ];
+        for (addr, want) in cases {
+            let err = validate_docker_host(addr)
+                .expect_err(&format!("{:?} should be rejected", addr));
+            assert!(err.contains(want), "error for {:?} was {:?}", addr, err);
+        }
     }
 
     #[tokio::test]
@@ -299,5 +422,22 @@ mod tests {
         assert!(result.is_ok(), "expected wrapping an existing listening fd to succeed: {:?}", result.err());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression guard for socket activation handing back the wrong socket
+    /// family: a unit with ListenStream=127.0.0.1:2375 would otherwise wedge
+    /// the accept loop instead of failing, while the process looked healthy.
+    #[tokio::test]
+    async fn test_unix_listener_from_raw_fd_rejects_tcp_socket() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = tcp.into_raw_fd();
+
+        let err = unix_listener_from_raw_fd(fd)
+            .expect_err("expected a TCP socket at the activation fd to be rejected");
+        assert!(
+            err.to_string().contains("not a Unix socket"),
+            "error should explain the fd is not a Unix socket, got: {}",
+            err
+        );
     }
 }
