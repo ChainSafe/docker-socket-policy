@@ -212,20 +212,35 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--listen-socket` | `/var/run/docker-socket-policy.sock` | Unix socket (or `fd://3` for systemd). **Go/Rust only** |
-| `--listen-tcp` | `127.0.0.1:2375` | TCP listen address |
+| `--listen-socket` | `/var/run/docker-socket-policy.sock` | Unix socket to listen on (or `fd://3` for systemd) |
 | `--docker-host` | `/var/run/docker.sock` | Docker daemon socket path (Unix socket only) |
 | `--config-dir` | `/etc/docker-socket-policy/services` | Policy config directory |
 | `--log-file` | `/var/log/docker-socket-policy.log` | Audit log path |
 | `--readonly` | `false` | Enable read-only mode |
 
-> **Unix socket security boundary**: Go and Rust support `--listen-socket` for
-> binding to a Unix socket, enabling socket-level access control via file
-> permissions and Unix groups. TypeScript does not implement `--listen-socket`
-> and listens on TCP only (`--listen-tcp`). All three implementations connect
-> to the Docker daemon over Unix sockets exclusively; they reject `tcp://` and
-> `http://` schemes for `--docker-host`. TCP connections would bypass socket
-> ownership-based access control, breaking the security model.
+> **Unix socket security boundary**: the proxy listens on a Unix socket only,
+> in all three implementations. Access control is the file permissions and Unix
+> group on that socket — a caller is authorised because it can `connect(2)` to
+> it. A TCP listener carries no peer identity, so anything able to reach the
+> port would be implicitly trusted; there is no `--listen-tcp`.
+>
+> The same rule applies outbound: all three implementations connect to the
+> Docker daemon over Unix sockets exclusively and reject `tcp://` and `http://`
+> schemes for `--docker-host`.
+>
+> To grant access, place the caller's container user in the group that owns the
+> listening socket and bind-mount that socket in; to revoke it, remove the group
+> membership. If the proxy cannot reach the daemon socket because of its own
+> group permissions, requests surface as `403`.
+>
+> **What the socket does not give you is per-service isolation.** The proxy
+> performs no caller authentication: it selects a policy from the `Image` field
+> of the request body, not from the identity of the connection. Every caller of
+> one socket therefore shares one trust domain, and can act under any policy in
+> that proxy's `--config-dir` by naming that policy's image. Treat the socket as
+> a boundary around the whole proxy, not around a single service. To isolate
+> services from one another, run a proxy instance per service, each with its own
+> socket and a `--config-dir` containing only that service's policy.
 
 ### Systemd Socket Activation
 
@@ -235,7 +250,6 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 ListenStream=/var/run/docker-socket-policy.sock
 SocketMode=0660
 SocketGroup=builders
-ListenStream=127.0.0.1:2375
 ```
 
 **`docker-socket-policy.service`**:
