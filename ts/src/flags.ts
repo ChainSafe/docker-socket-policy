@@ -1,6 +1,8 @@
 // Minimal CLI flag parser supporting both "--name value" and "--name=value"
 // forms, matching Go's flag package and Rust's clap behavior.
 
+import { readFileSync } from "node:fs";
+
 export function getFlag(
   args: string[],
   name: string,
@@ -108,6 +110,85 @@ export function parseListenSocket(input: string): ListenTarget {
     return { kind: "error", message: "--listen-socket must not be empty" };
   }
   return { kind: "path", path: input };
+}
+
+// Mode applied to the listening socket when --listen-socket-mode is omitted.
+// connect(2) on an AF_UNIX socket requires write permission, so 0o660 is what
+// actually grants the owning group access.
+export const DEFAULT_LISTEN_SOCKET_MODE = 0o660;
+
+// Set around bind(2) so the socket is created at 0600 and is never briefly
+// reachable by group or world. bind() applies 0777 & ~umask, and
+// 0777 & ~0177 === 0600. Correcting with chmod afterwards would leave a window
+// in which the socket is already listening at the ambient mode.
+export const BIND_UMASK = 0o177;
+
+export type SocketMode = { mode: number } | { error: string };
+
+// Parses an octal mode and rejects anything world-writable. A world-writable
+// socket is connectable by every local uid, which removes the boundary
+// entirely, so there is deliberately no opt-out.
+export function parseSocketMode(input: string): SocketMode {
+  if (input.length === 0) {
+    return { error: "--listen-socket-mode must not be empty" };
+  }
+  if (!/^[0-7]+$/.test(input)) {
+    return { error: `--listen-socket-mode ${JSON.stringify(input)}: not an octal mode` };
+  }
+  const mode = parseInt(input, 8);
+  if (mode > 0o777) {
+    return { error: `--listen-socket-mode ${JSON.stringify(input)}: must be within 0777` };
+  }
+  if (mode & 0o002) {
+    return {
+      error:
+        `--listen-socket-mode ${JSON.stringify(input)} is world-writable: every local user ` +
+        `could connect to the proxy, which disables the access-control boundary`,
+    };
+  }
+  return { mode };
+}
+
+export type GroupId = { gid: number } | { error: string };
+
+// Maps --listen-socket-group to a gid. A numeric value is used as-is so a
+// deployment without the group defined can still be configured.
+//
+// Node exposes no getgrnam equivalent, so a name is resolved by reading
+// /etc/group. That covers the container case this proxy targets but not
+// NSS-backed directories (LDAP, SSSD) — pass a numeric gid for those. Go uses
+// os/user.LookupGroup and Rust uses getgrnam_r, both of which do consult NSS.
+export function resolveGroup(input: string, groupFile = "/etc/group"): GroupId {
+  if (/^\d+$/.test(input)) {
+    return { gid: parseInt(input, 10) };
+  }
+  let contents: string;
+  try {
+    contents = readFileSync(groupFile, "utf8");
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    return {
+      error: `--listen-socket-group ${JSON.stringify(input)}: cannot read ${groupFile}: ${e.message}`,
+    };
+  }
+  for (const line of contents.split("\n")) {
+    // name:password:gid:members
+    const parts = line.split(":");
+    if (parts.length >= 3 && parts[0] === input) {
+      const gid = parseInt(parts[2], 10);
+      if (Number.isNaN(gid)) {
+        return {
+          error: `--listen-socket-group ${JSON.stringify(input)}: gid ${JSON.stringify(parts[2])} is not numeric`,
+        };
+      }
+      return { gid };
+    }
+  }
+  return {
+    error:
+      `--listen-socket-group ${JSON.stringify(input)}: no such group in ${groupFile} ` +
+      `(Node cannot query NSS; pass a numeric gid if the group is not in ${groupFile})`,
+  };
 }
 
 // Validates a Docker daemon address supplied via --docker-host. Only Unix

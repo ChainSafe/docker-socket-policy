@@ -20,3 +20,6 @@ regex = "1"
 rand = "0.8"
 chrono = "0.4"
 async-trait = "0.1"
+# Already present transitively via tokio; needed directly for umask(2) and
+# getgrnam_r(3), neither of which std exposes.
+libc = "0.2"

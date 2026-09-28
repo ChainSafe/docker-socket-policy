@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -107,7 +110,7 @@ func shortTempDir(t *testing.T) string {
 func TestUnixListenerBindsFreshPath(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "fresh.sock")
 
-	l, err := unixListener(path)
+	l, err := unixListener(path, defaultListenSocketMode, -1)
 	if err != nil {
 		t.Fatalf("unixListener(%q) = %v, want nil", path, err)
 	}
@@ -139,7 +142,7 @@ func TestUnixListenerReplacesStaleSocket(t *testing.T) {
 	}
 	_ = stale
 
-	l, err := unixListener(path)
+	l, err := unixListener(path, defaultListenSocketMode, -1)
 	if err != nil {
 		t.Fatalf("unixListener over stale socket = %v, want nil", err)
 	}
@@ -155,7 +158,7 @@ func TestUnixListenerRefusesToDeleteNonSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := unixListener(path); err == nil {
+		if _, err := unixListener(path, defaultListenSocketMode, -1); err == nil {
 			t.Fatal("unixListener over a regular file = nil, want error")
 		} else if !strings.Contains(err.Error(), "not a socket") {
 			t.Fatalf("error = %q, want it to mention 'not a socket'", err)
@@ -174,7 +177,7 @@ func TestUnixListenerRefusesToDeleteNonSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := unixListener(path); err == nil {
+		if _, err := unixListener(path, defaultListenSocketMode, -1); err == nil {
 			t.Fatal("unixListener over a directory = nil, want error")
 		}
 		if _, err := os.Stat(path); err != nil {
@@ -257,7 +260,7 @@ func unixClient(path string) *http.Client {
 // suites assert HTTP status codes and cannot observe process lifecycle.
 func TestServeReturnsPromptlyWhenIdle(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "idle.sock")
-	l, err := unixListener(path)
+	l, err := unixListener(path, defaultListenSocketMode, -1)
 	if err != nil {
 		t.Fatalf("unixListener: %v", err)
 	}
@@ -280,7 +283,7 @@ func TestServeReturnsPromptlyWhenIdle(t *testing.T) {
 // signal arrives must be allowed to finish.
 func TestServeWaitsForInFlightRequest(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "inflight.sock")
-	l, err := unixListener(path)
+	l, err := unixListener(path, defaultListenSocketMode, -1)
 	if err != nil {
 		t.Fatalf("unixListener: %v", err)
 	}
@@ -339,7 +342,7 @@ func TestServeWaitsForInFlightRequest(t *testing.T) {
 // closed, not merely ignored: a connection attempt after shutdown must fail.
 func TestServeStopsAcceptingAfterShutdown(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "closed.sock")
-	l, err := unixListener(path)
+	l, err := unixListener(path, defaultListenSocketMode, -1)
 	if err != nil {
 		t.Fatalf("unixListener: %v", err)
 	}
@@ -351,5 +354,118 @@ func TestServeStopsAcceptingAfterShutdown(t *testing.T) {
 
 	if _, err := net.Dial("unix", path); err == nil {
 		t.Fatal("connected after shutdown, want the listener closed")
+	}
+}
+
+func TestParseSocketMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    os.FileMode
+		wantErr string
+	}{
+		{"default", "0660", 0o660, ""},
+		{"no leading zero", "660", 0o660, ""},
+		{"owner only", "0600", 0o600, ""},
+		{"group read only", "0640", 0o640, ""},
+		{"empty", "", 0, "must not be empty"},
+		{"not octal", "0x1ff", 0, "not an octal mode"},
+		{"decimal 8 is invalid octal", "668", 0, "not an octal mode"},
+		{"too wide", "1777", 0, "within 0777"},
+		// connect(2) needs write, so o+w means every local uid can connect.
+		{"world writable", "0666", 0, "world-writable"},
+		{"world writable 0777", "0777", 0, "world-writable"},
+		{"world writable 0602", "0602", 0, "world-writable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseSocketMode(tt.in)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("parseSocketMode(%q) = %v, want nil", tt.in, err)
+				}
+				if got != tt.want {
+					t.Fatalf("parseSocketMode(%q) = %o, want %o", tt.in, got, tt.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("parseSocketMode(%q) = nil error, want %q", tt.in, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("parseSocketMode(%q) error = %q, want it to contain %q", tt.in, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestUnixListenerAppliesMode is the regression test for #40: the mode used to
+// be whatever the umask left behind, which is 0755 by default. connect(2)
+// requires write permission, so the group grant the README documents silently
+// did not work, and under umask 0 the socket was 0777 to every local uid.
+func TestUnixListenerAppliesMode(t *testing.T) {
+	for _, mode := range []os.FileMode{0o660, 0o600, 0o640} {
+		t.Run(fmt.Sprintf("%o", mode), func(t *testing.T) {
+			path := filepath.Join(shortTempDir(t), "mode.sock")
+			l, err := unixListener(path, mode, -1)
+			if err != nil {
+				t.Fatalf("unixListener: %v", err)
+			}
+			defer l.Close()
+
+			info, err := os.Lstat(path)
+			if err != nil {
+				t.Fatalf("stat: %v", err)
+			}
+			if got := info.Mode().Perm(); got != mode {
+				t.Fatalf("socket mode = %o, want %o", got, mode)
+			}
+		})
+	}
+}
+
+// The ambient umask must not influence the result: that was the whole bug.
+func TestUnixListenerIgnoresAmbientUmask(t *testing.T) {
+	// umask 0 is the dangerous case — it used to produce a 0777 socket.
+	old := syscall.Umask(0)
+	defer syscall.Umask(old)
+
+	path := filepath.Join(shortTempDir(t), "umask.sock")
+	l, err := unixListener(path, 0o660, -1)
+	if err != nil {
+		t.Fatalf("unixListener: %v", err)
+	}
+	defer l.Close()
+
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o660 {
+		t.Fatalf("socket mode = %o under umask 0, want 0660", got)
+	}
+	if info.Mode().Perm()&0o002 != 0 {
+		t.Fatal("socket is world-writable: any local uid could connect")
+	}
+}
+
+func TestResolveGroup(t *testing.T) {
+	if gid, err := resolveGroup(""); err != nil || gid != -1 {
+		t.Fatalf("resolveGroup(\"\") = %d, %v; want -1, nil", gid, err)
+	}
+	// A numeric value is taken as a gid without consulting /etc/group, so a
+	// container without the group defined can still be configured.
+	if gid, err := resolveGroup("2001"); err != nil || gid != 2001 {
+		t.Fatalf("resolveGroup(\"2001\") = %d, %v; want 2001, nil", gid, err)
+	}
+	if _, err := resolveGroup("definitely-no-such-group-xyz"); err == nil {
+		t.Fatal("resolveGroup on an unknown group = nil error, want a failure")
+	}
+	// Every Unix has gid 0 under some name; resolve it by name and check it
+	// round-trips to a number.
+	if g, err := user.LookupGroupId("0"); err == nil {
+		if gid, err := resolveGroup(g.Name); err != nil || gid != 0 {
+			t.Fatalf("resolveGroup(%q) = %d, %v; want 0, nil", g.Name, gid, err)
+		}
 	}
 }
