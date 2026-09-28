@@ -6,6 +6,7 @@ import { Manager } from "./policy.js";
 import { Router } from "./proxy.js";
 import { Handler } from "./handler.js";
 import { Transport } from "./transport.js";
+import { createShutdown } from "./shutdown.js";
 import {
   getFlag,
   hasFlag,
@@ -115,13 +116,7 @@ if (listenTarget.kind === "fd") {
   });
 }
 
-function shutdown(signal: string) {
-  console.log(`received ${signal}, shutting down...`);
-  server.close(() => {
-    console.log("server closed");
-    process.exit(0);
-  });
-}
+const shutdown = createShutdown(server);
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));

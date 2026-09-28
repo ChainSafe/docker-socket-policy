@@ -73,15 +73,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	go serve(ctx, listener, *listenSocket, handler)
+	done := serve(ctx, listener, *listenSocket, handler)
 
 	<-ctx.Done()
 	slog.Info("shutting down...")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
-	<-shutdownCtx.Done()
+	// Wait for the drain to actually finish. Waiting on a timer instead would
+	// stall every shutdown for the full timeout: docker stop allows 10s before
+	// SIGKILL, so the proxy would never shut down gracefully at all.
+	<-done
 	slog.Info("shutdown complete")
 }
 
@@ -179,17 +179,44 @@ func unixListener(addr string) (net.Listener, error) {
 	return net.Listen("unix", addr)
 }
 
-func serve(ctx context.Context, listener net.Listener, addr string, handler http.Handler) {
+// shutdownTimeout bounds how long in-flight requests are given to finish once
+// a signal arrives. It is an upper bound, not a delay: shutdown returns as
+// soon as the last request drains.
+const shutdownTimeout = 30 * time.Second
+
+// serve runs the proxy until ctx is cancelled and returns a channel that is
+// closed once the server has finished draining. Callers must wait on that
+// channel rather than on a timer, so that shutdown takes as long as the
+// in-flight requests need and no longer.
+func serve(ctx context.Context, listener net.Listener, addr string, handler http.Handler) <-chan struct{} {
 	server := &http.Server{Handler: handler}
+	done := make(chan struct{})
+	served := make(chan struct{})
+
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer shutdownCancel()
-		server.Shutdown(shutdownCtx)
+		defer close(served)
+		slog.Info("listening", "network", "unix", "addr", addr)
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server error", "network", "unix", "addr", addr, "error", err)
+		}
 	}()
 
-	slog.Info("listening", "network", "unix", "addr", addr)
-	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-		slog.Error("server error", "network", "unix", "addr", addr, "error", err)
-	}
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		// Shutdown closes idle keep-alive connections immediately and waits
+		// only on active requests, so an idle proxy exits at once.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			slog.Error("drain deadline exceeded", "addr", addr, "error", err)
+		}
+		// Shutdown can win the race against Serve even starting, in which case
+		// Serve closes the listener on its own way out. Wait for that, or the
+		// process can exit while the socket is still bound and leave the file
+		// behind for the next start to clean up.
+		<-served
+	}()
+
+	return done
 }

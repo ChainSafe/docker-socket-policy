@@ -31,6 +31,11 @@ const SYSTEMD_SOCKET_FD: RawFd = 3;
 /// (fd exhaustion, non-listening fd) don't spin the loop at 100% CPU.
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Upper bound on how long in-flight requests are given to finish after a
+/// shutdown signal. This is a cap, not a delay: shutdown returns as soon as
+/// the last connection closes. Matches the Go and TypeScript implementations.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Parser)]
 #[command(name = "docker-socket-policy")]
 struct Cli {
@@ -120,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         cli.listen_socket.clone(),
         unix_shutdown_rx,
+        shutdown_tx.clone(),
     );
 
     let _ = unix_handle.await;
@@ -255,16 +261,30 @@ fn spawn_unix_listener(
     listener: tokio::net::UnixListener,
     addr: String,
     mut shutdown_rx: broadcast::Receiver<()>,
+    shutdown_tx: broadcast::Sender<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("listening on unix socket {}", addr);
+
+        // Connections are tracked rather than detached. `tokio::spawn`ing them
+        // and returning would drop the runtime with the tasks still running,
+        // aborting in-flight responses mid-write.
+        let mut conns = tokio::task::JoinSet::new();
 
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _)) => {
-                            tokio::spawn(serve_connection(handler.clone(), stream));
+                            // Subscribe per connection so a keep-alive
+                            // connection sitting idle between requests is told
+                            // to close, instead of holding shutdown open until
+                            // the timeout.
+                            conns.spawn(serve_connection(
+                                handler.clone(),
+                                stream,
+                                shutdown_tx.subscribe(),
+                            ));
                         }
                         Err(e) => {
                             // Back off briefly: persistent accept errors
@@ -281,11 +301,51 @@ fn spawn_unix_listener(
                 }
             }
         }
+
+        // Stop accepting, then drain. Each connection has already been told to
+        // shut down gracefully, so this returns as soon as the last in-flight
+        // request finishes rather than waiting out the timeout.
+        drop(listener);
+        unlink_listen_socket(&addr);
+        let drained = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            while conns.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            tracing::error!(
+                "drain deadline exceeded after {:?}, abandoning in-flight connections",
+                SHUTDOWN_TIMEOUT
+            );
+            conns.shutdown().await;
+        }
     })
 }
 
-async fn serve_connection<S>(handler: Arc<handler::Handler>, stream: S)
-where
+/// Removes the listening socket after a clean shutdown.
+///
+/// Unlike Go's `net.UnixListener` and Node, tokio's `UnixListener` does not
+/// unlink the path when dropped, so without this a clean exit leaves the socket
+/// file behind. It is recovered on the next start (`bind_unix_listener` clears
+/// a stale socket), but the three implementations should behave the same.
+///
+/// Under socket activation the socket belongs to systemd, which will hand the
+/// same fd to the next start — unlinking it there would break the socket unit.
+fn unlink_listen_socket(addr: &str) {
+    if addr == format!("fd://{}", SYSTEMD_SOCKET_FD) {
+        return;
+    }
+    match std::fs::remove_file(addr) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("could not remove socket {}: {}", addr, e),
+    }
+}
+
+async fn serve_connection<S>(
+    handler: Arc<handler::Handler>,
+    stream: S,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
@@ -294,11 +354,23 @@ where
         async move { Ok::<_, hyper::Error>(h.handle(req).await) }
     });
 
-    if let Err(e) = hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, svc)
-        .await
-    {
-        tracing::warn!("connection error: {}", e);
+    let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
+    tokio::pin!(conn);
+
+    tokio::select! {
+        res = conn.as_mut() => {
+            if let Err(e) = res {
+                tracing::warn!("connection error: {}", e);
+            }
+        }
+        _ = shutdown_rx.recv() => {
+            // Finish the request currently being served, then close rather
+            // than reading another off this keep-alive connection.
+            conn.as_mut().graceful_shutdown();
+            if let Err(e) = conn.await {
+                tracing::warn!("connection error during graceful shutdown: {}", e);
+            }
+        }
     }
 }
 
@@ -439,5 +511,194 @@ mod tests {
             "error should explain the fd is not a Unix socket, got: {}",
             err
         );
+    }
+
+    /// Transport that stalls before replying, so a request can be held
+    /// in-flight while a shutdown signal is delivered.
+    struct SlowTransport {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl transport::Transport for SlowTransport {
+        async fn forward(
+            &self,
+            _req: hyper::Request<http_body_util::Full<bytes::Bytes>>,
+        ) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, transport::TransportError>
+        {
+            tokio::time::sleep(self.delay).await;
+            Ok(hyper::Response::builder()
+                .status(418)
+                .body(http_body_util::Full::new(bytes::Bytes::from("teapot")))
+                .unwrap())
+        }
+    }
+
+    fn test_handler(delay: std::time::Duration) -> Arc<handler::Handler> {
+        let manager = policy::Manager::from_map(std::collections::HashMap::new());
+        let router = Arc::new(proxy::Router::new(manager));
+        let chain = middleware::Chain::new(false);
+        let audit = audit::AuditLogger::new("/dev/null").unwrap();
+        Arc::new(handler::Handler::new(
+            router,
+            chain,
+            audit,
+            Box::new(SlowTransport { delay }),
+        ))
+    }
+
+    /// Sends a minimal HTTP/1.1 request over the Unix socket and reads the
+    /// whole reply. Written by hand to keep the test free of a client dep.
+    async fn get_over_unix(path: &std::path::Path, target: &str) -> io::Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(path).await?;
+        stream
+            .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// Regression test: the listener task must return promptly once signalled.
+    /// Waiting out `SHUTDOWN_TIMEOUT` would mean `docker stop` (10s grace)
+    /// always escalates to SIGKILL.
+    #[tokio::test]
+    async fn test_listener_shuts_down_promptly_when_idle() {
+        let path = unique_socket_path();
+        let listener = bind_unix_listener(path.to_str().unwrap()).unwrap();
+        let (tx, rx) = broadcast::channel::<()>(1);
+
+        let handle = spawn_unix_listener(
+            test_handler(std::time::Duration::ZERO),
+            listener,
+            path.to_str().unwrap().to_string(),
+            rx,
+            tx.clone(),
+        );
+
+        tx.send(()).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("listener did not shut down within 5s")
+            .expect("listener task panicked");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Exiting fast is only correct if it still drains. A request that is
+    /// mid-flight when the signal lands must receive its response.
+    #[tokio::test]
+    async fn test_listener_drains_in_flight_request() {
+        let path = unique_socket_path();
+        let listener = bind_unix_listener(path.to_str().unwrap()).unwrap();
+        let (tx, rx) = broadcast::channel::<()>(1);
+
+        let handle = spawn_unix_listener(
+            test_handler(std::time::Duration::from_millis(300)),
+            listener,
+            path.to_str().unwrap().to_string(),
+            rx,
+            tx.clone(),
+        );
+
+        let req_path = path.clone();
+        let request = tokio::spawn(async move { get_over_unix(&req_path, "/_ping").await });
+
+        // Let the request reach the (stalling) transport before signalling.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tx.send(()).unwrap();
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("in-flight request never completed")
+            .expect("request task panicked")
+            .expect("in-flight request was aborted by shutdown");
+        assert!(
+            reply.contains("418"),
+            "in-flight request should have been drained, got: {reply}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("listener did not return after draining")
+            .expect("listener task panicked");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A clean shutdown must not leave the socket file on disk, matching Go
+    /// and TypeScript. tokio does not unlink on drop, so this is explicit.
+    #[tokio::test]
+    async fn test_listener_unlinks_socket_on_shutdown() {
+        let path = unique_socket_path();
+        let listener = bind_unix_listener(path.to_str().unwrap()).unwrap();
+        let (tx, rx) = broadcast::channel::<()>(1);
+
+        let handle = spawn_unix_listener(
+            test_handler(std::time::Duration::ZERO),
+            listener,
+            path.to_str().unwrap().to_string(),
+            rx,
+            tx.clone(),
+        );
+
+        assert!(path.exists(), "precondition: socket should be bound");
+        tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("listener did not shut down")
+            .expect("listener task panicked");
+
+        assert!(
+            !path.exists(),
+            "socket file was left behind after a clean shutdown"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Socket activation is the exception: the socket belongs to systemd and
+    /// must survive the process, or the unit cannot hand it to the next start.
+    #[test]
+    fn test_unlink_listen_socket_spares_socket_activation() {
+        let path = unique_socket_path();
+        std::fs::write(&path, b"stand-in for a systemd-owned socket").unwrap();
+
+        unlink_listen_socket(&format!("fd://{}", SYSTEMD_SOCKET_FD));
+        assert!(path.exists(), "precondition check only");
+
+        unlink_listen_socket(path.to_str().unwrap());
+        assert!(!path.exists(), "a path-based socket should be removed");
+    }
+
+    /// An idle keep-alive connection must not hold shutdown open until the
+    /// timeout: the connection is told to close, not merely left alone.
+    #[tokio::test]
+    async fn test_listener_releases_idle_keepalive_connection() {
+        let path = unique_socket_path();
+        let listener = bind_unix_listener(path.to_str().unwrap()).unwrap();
+        let (tx, rx) = broadcast::channel::<()>(1);
+
+        let handle = spawn_unix_listener(
+            test_handler(std::time::Duration::ZERO),
+            listener,
+            path.to_str().unwrap().to_string(),
+            rx,
+            tx.clone(),
+        );
+
+        // Open a connection and leave it parked with no request on it.
+        let _idle = tokio::net::UnixStream::connect(&path).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        tx.send(()).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("idle keep-alive connection held shutdown open")
+            .expect("listener task panicked");
+
+        std::fs::remove_file(&path).ok();
     }
 }

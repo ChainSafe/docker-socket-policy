@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateListenSocket(t *testing.T) {
@@ -232,5 +235,121 @@ func TestListenerFromFileAcceptsUnixSocket(t *testing.T) {
 
 	if _, ok := l.(*net.UnixListener); !ok {
 		t.Fatalf("listenerFromFile returned %T, want *net.UnixListener", l)
+	}
+}
+
+// unixClient returns an HTTP client that talks to a Unix socket.
+func unixClient(path string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", path)
+			},
+		},
+	}
+}
+
+// TestServeReturnsPromptlyWhenIdle is the regression test for the shutdown
+// path. main() used to wait on the shutdown timeout context itself, so every
+// signal cost a fixed 30s whether or not anything was in flight. docker stop
+// allows 10s before SIGKILL, so the proxy was always killed and graceful
+// shutdown never once completed. Nothing caught it because the integration
+// suites assert HTTP status codes and cannot observe process lifecycle.
+func TestServeReturnsPromptlyWhenIdle(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "idle.sock")
+	l, err := unixListener(path)
+	if err != nil {
+		t.Fatalf("unixListener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := serve(ctx, l, path, http.NotFoundHandler())
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("serve did not return within 5s of cancellation; "+
+			"shutdownTimeout is %s, so this is the fixed-delay bug", shutdownTimeout)
+	}
+}
+
+// TestServeWaitsForInFlightRequest guards the opposite failure: exiting fast
+// is only correct if it still drains. A handler that is mid-response when the
+// signal arrives must be allowed to finish.
+func TestServeWaitsForInFlightRequest(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "inflight.sock")
+	l, err := unixListener(path)
+	if err != nil {
+		t.Fatalf("unixListener: %v", err)
+	}
+
+	const work = 300 * time.Millisecond
+	started := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		time.Sleep(work)
+		w.WriteHeader(http.StatusTeapot)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := serve(ctx, l, path, handler)
+
+	type result struct {
+		code int
+		err  error
+	}
+	res := make(chan result, 1)
+	go func() {
+		resp, err := unixClient(path).Get("http://localhost/slow")
+		if err != nil {
+			res <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		res <- result{code: resp.StatusCode}
+	}()
+
+	// Signal only once the handler is genuinely mid-flight.
+	<-started
+	cancel()
+
+	select {
+	case r := <-res:
+		if r.err != nil {
+			t.Fatalf("in-flight request aborted by shutdown: %v", r.err)
+		}
+		if r.code != http.StatusTeapot {
+			t.Fatalf("in-flight request got %d, want %d", r.code, http.StatusTeapot)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight request never completed")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after the in-flight request drained")
+	}
+}
+
+// TestServeStopsAcceptingAfterShutdown confirms the listener is actually
+// closed, not merely ignored: a connection attempt after shutdown must fail.
+func TestServeStopsAcceptingAfterShutdown(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "closed.sock")
+	l, err := unixListener(path)
+	if err != nil {
+		t.Fatalf("unixListener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := serve(ctx, l, path, http.NotFoundHandler())
+	cancel()
+	<-done
+
+	if _, err := net.Dial("unix", path); err == nil {
+		t.Fatal("connected after shutdown, want the listener closed")
 	}
 }
