@@ -14,7 +14,7 @@ use hyper::body::Incoming as IncomingBody;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use std::io;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::sync::Arc;
@@ -30,6 +30,12 @@ const SYSTEMD_SOCKET_FD: RawFd = 3;
 /// Pause after a failed `accept` before retrying, so persistent errors
 /// (fd exhaustion, non-listening fd) don't spin the loop at 100% CPU.
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Set around bind(2) so the socket is created at 0600 and is never briefly
+/// reachable by group or world. bind() applies 0777 & !umask, and
+/// 0777 & !0177 == 0600. A chmod after the fact would leave a window in which
+/// the socket is already listening at the ambient mode.
+const BIND_UMASK: libc::mode_t = 0o177;
 
 /// Upper bound on how long in-flight requests are given to finish after a
 /// shutdown signal. This is a cap, not a delay: shutdown returns as soon as
@@ -53,6 +59,14 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     readonly: bool,
+
+    /// Octal mode for the listening socket (ignored for fd://3).
+    #[arg(long, default_value = "0660")]
+    listen_socket_mode: String,
+
+    /// Group name or gid to own the listening socket (ignored for fd://3).
+    #[arg(long)]
+    listen_socket_group: Option<String>,
 }
 
 #[tokio::main]
@@ -71,6 +85,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!("{}", msg);
         std::process::exit(2);
     }
+    let socket_mode = match parse_socket_mode(&cli.listen_socket_mode) {
+        Ok(m) => m,
+        Err(msg) => {
+            tracing::error!("{}", msg);
+            std::process::exit(2);
+        }
+    };
+    let socket_gid = match cli.listen_socket_group.as_deref().map(resolve_group).transpose() {
+        Ok(g) => g,
+        Err(msg) => {
+            tracing::error!("{}", msg);
+            std::process::exit(2);
+        }
+    };
 
     let policy_manager = policy::Manager::new(&cli.config_dir)?;
     tracing::info!("loaded {} policies", policy_manager.list().len());
@@ -116,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind before spawning so a bind failure is fatal: the Unix socket is the
     // process's only listener, so a running-but-unbound proxy is never useful.
-    let listener = bind_unix_listener(&cli.listen_socket).map_err(|e| {
+    let listener = bind_unix_listener(&cli.listen_socket, socket_mode, socket_gid).map_err(|e| {
         tracing::error!("failed to bind unix socket {}: {}", cli.listen_socket, e);
         e
     })?;
@@ -144,8 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// and listening; we just adopt the fd). Any other value is treated as a
 /// filesystem path: a stale socket left over from a previous run is removed
 /// before binding, matching the Go implementation.
-fn bind_unix_listener(addr: &str) -> io::Result<tokio::net::UnixListener> {
+fn bind_unix_listener(addr: &str, mode: u32, gid: Option<u32>) -> io::Result<tokio::net::UnixListener> {
     if addr == "fd://3" {
+        // Under socket activation systemd owns the socket and applies its own
+        // SocketMode/SocketGroup; re-chmod'ing here would fight the unit.
         return unix_listener_from_raw_fd(SYSTEMD_SOCKET_FD);
     }
 
@@ -165,7 +195,87 @@ fn bind_unix_listener(addr: &str) -> io::Result<tokio::net::UnixListener> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    tokio::net::UnixListener::bind(addr)
+
+    // umask is process-global and not thread-safe. This runs during startup,
+    // before any connection is served, so nothing else is creating files.
+    // SAFETY: umask(2) cannot fail and has no preconditions.
+    let previous = unsafe { libc::umask(BIND_UMASK) };
+    let listener = tokio::net::UnixListener::bind(addr);
+    // SAFETY: as above; restores the caller's umask.
+    unsafe { libc::umask(previous) };
+    let listener = listener?;
+
+    // Widen from 0600 to the configured mode only once ownership is correct,
+    // so the socket is never reachable by the wrong group.
+    if let Some(gid) = gid {
+        std::os::unix::fs::chown(addr, None, Some(gid)).map_err(|e| {
+            io::Error::new(e.kind(), format!("setting group on {}: {}", addr, e))
+        })?;
+    }
+    std::fs::set_permissions(addr, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| io::Error::new(e.kind(), format!("setting mode on {}: {}", addr, e)))?;
+
+    Ok(listener)
+}
+
+/// Maps `--listen-socket-group` to a gid. A numeric value is used as-is so a
+/// deployment without the group in /etc/group (or NSS) can still be configured.
+fn resolve_group(group: &str) -> Result<u32, String> {
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+    let name = std::ffi::CString::new(group)
+        .map_err(|_| format!("--listen-socket-group {:?}: contains a NUL byte", group))?;
+
+    // getgrnam_r is the reentrant form; the non-_r variant returns a pointer
+    // into a shared static buffer.
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0_i8; 4096];
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: all pointers are valid for the duration of the call and the
+    // buffer length matches the allocation.
+    let rc = unsafe {
+        libc::getgrnam_r(
+            name.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "--listen-socket-group {:?}: lookup failed: {}",
+            group,
+            io::Error::from_raw_os_error(rc)
+        ));
+    }
+    if result.is_null() {
+        return Err(format!("--listen-socket-group {:?}: no such group", group));
+    }
+    Ok(grp.gr_gid)
+}
+
+/// Parses an octal mode and rejects anything world-writable. connect(2) on an
+/// AF_UNIX socket requires write permission, so a world-writable socket is
+/// reachable by every local uid — there is deliberately no opt-out.
+fn parse_socket_mode(s: &str) -> Result<u32, String> {
+    if s.is_empty() {
+        return Err("--listen-socket-mode must not be empty".to_string());
+    }
+    let mode = u32::from_str_radix(s, 8)
+        .map_err(|_| format!("--listen-socket-mode {:?}: not an octal mode", s))?;
+    if mode > 0o777 {
+        return Err(format!("--listen-socket-mode {:?}: must be within 0777", s));
+    }
+    if mode & 0o002 != 0 {
+        return Err(format!(
+            "--listen-socket-mode {:?} is world-writable: every local user could connect \
+             to the proxy, which disables the access-control boundary",
+            s
+        ));
+    }
+    Ok(mode)
 }
 
 /// Rejects `--listen-socket` values that would not produce a filesystem-visible
@@ -392,7 +502,7 @@ mod tests {
         drop(stale);
         assert!(path.exists(), "precondition: stale socket should still be on disk");
 
-        let result = bind_unix_listener(path.to_str().unwrap());
+        let result = bind_unix_listener(path.to_str().unwrap(), 0o660, None);
         assert!(
             result.is_ok(),
             "expected stale socket to be removed and bind to succeed: {:?}",
@@ -408,7 +518,7 @@ mod tests {
         let path = unique_socket_path();
         std::fs::write(&path, b"important data").unwrap();
 
-        let result = bind_unix_listener(path.to_str().unwrap());
+        let result = bind_unix_listener(path.to_str().unwrap(), 0o660, None);
         assert!(result.is_err(), "expected a regular file to be refused, not deleted");
         assert!(
             result.unwrap_err().to_string().contains("not a socket"),
@@ -477,7 +587,7 @@ mod tests {
     async fn test_bind_unix_listener_binds_fresh_path() {
         let path = unique_socket_path();
 
-        let result = bind_unix_listener(path.to_str().unwrap());
+        let result = bind_unix_listener(path.to_str().unwrap(), 0o660, None);
         assert!(result.is_ok(), "expected bind to a fresh path to succeed: {:?}", result.err());
         assert!(path.exists(), "expected socket file to be created");
 
@@ -566,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn test_listener_shuts_down_promptly_when_idle() {
         let path = unique_socket_path();
-        let listener = bind_unix_listener(path.to_str().unwrap()).unwrap();
+        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
         let (tx, rx) = broadcast::channel::<()>(1);
 
         let handle = spawn_unix_listener(
@@ -592,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn test_listener_drains_in_flight_request() {
         let path = unique_socket_path();
-        let listener = bind_unix_listener(path.to_str().unwrap()).unwrap();
+        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
         let (tx, rx) = broadcast::channel::<()>(1);
 
         let handle = spawn_unix_listener(
@@ -628,12 +738,81 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[test]
+    fn test_parse_socket_mode() {
+        for (input, want) in [("0660", 0o660), ("660", 0o660), ("0600", 0o600), ("0640", 0o640)] {
+            assert_eq!(parse_socket_mode(input), Ok(want), "{} should parse", input);
+        }
+        for (input, want) in [
+            ("", "must not be empty"),
+            ("0x1ff", "not an octal mode"),
+            ("668", "not an octal mode"),
+            ("1777", "within 0777"),
+            // connect(2) needs write, so o+w means every local uid can connect.
+            ("0666", "world-writable"),
+            ("0777", "world-writable"),
+            ("0602", "world-writable"),
+        ] {
+            let err = parse_socket_mode(input)
+                .expect_err(&format!("{:?} should be rejected", input));
+            assert!(err.contains(want), "error for {:?} was {:?}", input, err);
+        }
+    }
+
+    /// Regression test for #40: the mode used to be whatever the umask left
+    /// behind, which is 0755 by default. connect(2) requires write permission,
+    /// so the documented group grant silently did not work, and under umask 0
+    /// the socket was 0777 to every local uid.
+    #[tokio::test]
+    async fn test_bind_applies_socket_mode() {
+        for mode in [0o660_u32, 0o600, 0o640] {
+            let path = unique_socket_path();
+            let listener = bind_unix_listener(path.to_str().unwrap(), mode, None).unwrap();
+
+            let got = std::fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(got, mode, "socket mode was {:o}, want {:o}", got, mode);
+
+            drop(listener);
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// The ambient umask must not influence the result: that was the bug.
+    #[tokio::test]
+    async fn test_bind_ignores_ambient_umask() {
+        // SAFETY: umask(2) cannot fail. Restored below.
+        let previous = unsafe { libc::umask(0) };
+        let path = unique_socket_path();
+        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
+        // SAFETY: as above.
+        unsafe { libc::umask(previous) };
+
+        let got = std::fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(got, 0o660, "socket mode was {:o} under umask 0, want 0660", got);
+        assert_eq!(got & 0o002, 0, "socket is world-writable: any local uid could connect");
+
+        drop(listener);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_resolve_group() {
+        // A numeric value is taken as a gid without consulting /etc/group.
+        assert_eq!(resolve_group("2001"), Ok(2001));
+        assert!(resolve_group("definitely-no-such-group-xyz").is_err());
+        // Whatever gid 0 is called on this platform must round-trip.
+        let root_group = if cfg!(target_os = "macos") { "wheel" } else { "root" };
+        if let Ok(gid) = resolve_group(root_group) {
+            assert_eq!(gid, 0, "{} should be gid 0", root_group);
+        }
+    }
+
     /// A clean shutdown must not leave the socket file on disk, matching Go
     /// and TypeScript. tokio does not unlink on drop, so this is explicit.
     #[tokio::test]
     async fn test_listener_unlinks_socket_on_shutdown() {
         let path = unique_socket_path();
-        let listener = bind_unix_listener(path.to_str().unwrap()).unwrap();
+        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
         let (tx, rx) = broadcast::channel::<()>(1);
 
         let handle = spawn_unix_listener(
@@ -677,7 +856,7 @@ mod tests {
     #[tokio::test]
     async fn test_listener_releases_idle_keepalive_connection() {
         let path = unique_socket_path();
-        let listener = bind_unix_listener(path.to_str().unwrap()).unwrap();
+        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
         let (tx, rx) = broadcast::channel::<()>(1);
 
         let handle = spawn_unix_listener(

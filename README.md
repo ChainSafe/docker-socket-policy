@@ -125,10 +125,15 @@ make validate
 ```bash
 ./docker-socket-policy \
   --listen-socket=/var/run/docker-socket-policy.sock \
+  --listen-socket-group=builders \
   --docker-host=/var/run/docker.sock \
   --config-dir=./config \
   --log-file=/tmp/docker-socket-policy.log
 ```
+
+The socket is created `0660` owned by `--listen-socket-group`, so members of
+that group can connect and nobody else can. Omit the flag and only the proxy's
+own user can reach it.
 
 ### Configure a Service
 
@@ -217,6 +222,8 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | `--config-dir` | `/etc/docker-socket-policy/services` | Policy config directory |
 | `--log-file` | `/var/log/docker-socket-policy.log` | Audit log path |
 | `--readonly` | `false` | Enable read-only mode |
+| `--listen-socket-mode` | `0660` | Octal mode for the listening socket (ignored for `fd://3`) |
+| `--listen-socket-group` | *(none)* | Group name or gid owning the listening socket (ignored for `fd://3`) |
 
 > **Unix socket security boundary**: the proxy listens on a Unix socket only,
 > in all three implementations. Access control is the file permissions and Unix
@@ -228,10 +235,25 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > Docker daemon over Unix sockets exclusively and reject `tcp://` and `http://`
 > schemes for `--docker-host`.
 >
-> To grant access, place the caller's container user in the group that owns the
-> listening socket and bind-mount that socket in; to revoke it, remove the group
-> membership. If the proxy cannot reach the daemon socket because of its own
-> group permissions, requests surface as `403`.
+> To grant access, set `--listen-socket-group` to a group, place the caller's
+> container user in that group, and bind-mount the socket in; to revoke it,
+> remove the group membership. If the proxy cannot reach the daemon socket
+> because of its own group permissions, requests surface as `403`.
+>
+> The socket is created at `--listen-socket-mode` (default `0660`) regardless of
+> the ambient umask. This matters: `bind(2)` applies `0777 & ~umask`, so left to
+> a default umask the socket would be `0755`, and `connect(2)` on a Unix socket
+> requires **write** permission — the group grant above would silently not work.
+> Under `umask 0` it would be `0777`, reachable by every local uid. A
+> world-writable mode is rejected at startup and there is no opt-out.
+>
+> Without `--listen-socket-group` the socket is `0660` owned by the proxy's own
+> user and group, so only that user can connect. The group is what makes the
+> mode useful.
+>
+> Under `fd://3` the socket belongs to systemd: use `SocketMode=` and
+> `SocketGroup=` in the `.socket` unit instead, as in the example below. Both
+> flags are ignored in that mode.
 >
 > **What the socket does not give you is per-service isolation.** The proxy
 > performs no caller authentication: it selects a policy from the `Image` field

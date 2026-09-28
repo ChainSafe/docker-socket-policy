@@ -7,17 +7,27 @@ import { Router } from "./proxy.js";
 import { Handler } from "./handler.js";
 import { Transport } from "./transport.js";
 import { createShutdown } from "./shutdown.js";
+import { listenOnSocket } from "./listen.js";
 import {
   getFlag,
   hasFlag,
   parseListenSocket,
+  parseSocketMode,
   parseSocketPath,
+  resolveGroup,
   validateFlags,
 } from "./flags.js";
 
 const args = process.argv.slice(2);
 
-const VALUE_FLAGS = ["--listen-socket", "--docker-host", "--config-dir", "--log-file"];
+const VALUE_FLAGS = [
+  "--listen-socket",
+  "--docker-host",
+  "--config-dir",
+  "--log-file",
+  "--listen-socket-mode",
+  "--listen-socket-group",
+];
 const BOOL_FLAGS = ["--readonly"];
 
 const flagError = validateFlags(args, VALUE_FLAGS, BOOL_FLAGS);
@@ -38,6 +48,24 @@ if (listenTarget.kind === "error") {
   console.error(listenTarget.message);
   process.exit(2);
 }
+const parsedMode = parseSocketMode(getFlag(args, "--listen-socket-mode", "0660"));
+if ("error" in parsedMode) {
+  console.error(parsedMode.error);
+  process.exit(2);
+}
+const socketMode = parsedMode.mode;
+
+const groupFlag = getFlag(args, "--listen-socket-group", "");
+let socketGid: number | undefined;
+if (groupFlag !== "") {
+  const resolved = resolveGroup(groupFlag);
+  if ("error" in resolved) {
+    console.error(resolved.error);
+    process.exit(2);
+  }
+  socketGid = resolved.gid;
+}
+
 const configDir = getFlag(args, "--config-dir", "/etc/docker-socket-policy/services");
 const logFile = getFlag(args, "--log-file", "/var/log/docker-socket-policy.log");
 const readonly = hasFlag(args, "--readonly");
@@ -111,9 +139,17 @@ if (listenTarget.kind === "fd") {
       process.exit(1);
     }
   }
-  server.listen(path, () => {
-    console.log(`listening on unix socket ${path}`);
-  });
+  listenOnSocket(server, path, socketMode, socketGid).then(
+    () => {
+      console.log(
+        `listening on unix socket ${path} (mode ${socketMode.toString(8).padStart(4, "0")})`,
+      );
+    },
+    (err: NodeJS.ErrnoException) => {
+      console.error(`failed to listen on ${path}: ${err.message}`);
+      process.exit(1);
+    },
+  );
 }
 
 const shutdown = createShutdown(server);

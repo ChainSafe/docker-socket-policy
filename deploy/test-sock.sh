@@ -115,6 +115,37 @@ if [ $i -eq 15 ]; then
 fi
 echo ""
 
+# ─── Listening socket permissions ─────────────────────
+
+# Regression guard for #40. The listening socket's mode used to be whatever the
+# ambient umask left behind — 0755 by default, 0777 under umask 0. connect(2)
+# on a Unix socket needs write permission, so at 0755 the documented group
+# grant did not work, and at 0777 every local uid could drive the Docker API.
+echo "--- listening socket permissions ---"
+
+MODE=$(stat -c '%a' "$GRANTED_SOCK" 2>/dev/null || echo "?")
+check "granted.sock mode is 660, not the umask default" "660" "$MODE"
+
+GROUP=$(stat -c '%g' "$GRANTED_SOCK" 2>/dev/null || echo "?")
+check "granted.sock is owned by --listen-socket-group 2001" "2001" "$GROUP"
+
+# The specific failure mode that removes the boundary entirely.
+case "$MODE" in
+  *[2367])
+    echo "  FAIL: granted.sock is world-writable (mode $MODE) — any local uid could connect"
+    FAIL=$((FAIL+1))
+    ;;
+  *)
+    echo "  PASS: granted.sock is not world-writable"
+    PASS=$((PASS+1))
+    ;;
+esac
+
+MODE=$(stat -c '%a' "$DENIED_SOCK" 2>/dev/null || echo "?")
+check "denied.sock mode is 660" "660" "$MODE"
+
+echo ""
+
 # ─── proxy-granted: should work ───────────────────────
 
 echo "--- proxy-granted (GID 2001, has group access) ---"

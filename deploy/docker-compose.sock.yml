@@ -59,6 +59,10 @@ services:
     command:
       - --docker-host=/sock/docker.sock
       - --listen-socket=/sock/granted.sock
+      # Exercises the #40 flags: the socket must come out 0660 owned by this
+      # group regardless of the image's umask.
+      - --listen-socket-mode=0660
+      - --listen-socket-group=2001
       - --config-dir=/etc/docker-socket-policy/services
       - --log-file=/tmp/docker-socket-policy.log
 
@@ -77,6 +81,8 @@ services:
     command:
       - --docker-host=/sock/docker.sock
       - --listen-socket=/sock/denied.sock
+      - --listen-socket-mode=0660
+      - --listen-socket-group=3001
       - --config-dir=/etc/docker-socket-policy/services
       - --log-file=/tmp/docker-socket-policy.log
 

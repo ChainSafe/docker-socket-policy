@@ -1,10 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   getFlag,
   hasFlag,
   parseListenSocket,
+  parseSocketMode,
   parseSocketPath,
+  resolveGroup,
   validateFlags,
 } from "./flags.js";
 
@@ -187,5 +192,79 @@ describe("flags", () => {
     it("rejects empty values", () => {
       assert.match(parseSocketPath("") ?? "", /must not be empty/);
     });
+  });
+});
+
+describe("parseSocketMode", () => {
+  it("accepts octal modes with and without a leading zero", () => {
+    for (const [input, want] of [
+      ["0660", 0o660],
+      ["660", 0o660],
+      ["0600", 0o600],
+      ["0640", 0o640],
+    ] as const) {
+      const got = parseSocketMode(input);
+      assert.deepEqual(got, { mode: want }, `${input} should parse`);
+    }
+  });
+
+  // connect(2) needs write permission, so o+w means every local uid can
+  // connect. There is deliberately no opt-out for this.
+  it("rejects world-writable modes", () => {
+    for (const input of ["0666", "0777", "0602"]) {
+      const got = parseSocketMode(input);
+      assert.ok("error" in got, `${input} should be rejected`);
+      assert.match(got.error, /world-writable/);
+    }
+  });
+
+  it("rejects malformed and out-of-range modes", () => {
+    for (const [input, want] of [
+      ["", /must not be empty/],
+      ["0x1ff", /not an octal mode/],
+      ["668", /not an octal mode/],
+      ["1777", /within 0777/],
+    ] as const) {
+      const got = parseSocketMode(input);
+      assert.ok("error" in got, `${input} should be rejected`);
+      assert.match(got.error, want);
+    }
+  });
+});
+
+describe("resolveGroup", () => {
+  function groupFile(contents: string): string {
+    const p = join(mkdtempSync(join(tmpdir(), "grp-")), "group");
+    writeFileSync(p, contents);
+    return p;
+  }
+
+  it("takes a numeric value as a gid without consulting the group file", () => {
+    assert.deepEqual(resolveGroup("2001", "/nonexistent"), { gid: 2001 });
+  });
+
+  it("resolves a name from the group file", () => {
+    const f = groupFile("root:x:0:\ndocker:x:999:alice,bob\n");
+    assert.deepEqual(resolveGroup("docker", f), { gid: 999 });
+  });
+
+  it("reports an unknown group", () => {
+    const f = groupFile("root:x:0:\n");
+    const got = resolveGroup("nope", f);
+    assert.ok("error" in got);
+    assert.match(got.error, /no such group/);
+  });
+
+  it("reports a non-numeric gid field", () => {
+    const f = groupFile("broken:x:notanumber:\n");
+    const got = resolveGroup("broken", f);
+    assert.ok("error" in got);
+    assert.match(got.error, /not numeric/);
+  });
+
+  it("reports an unreadable group file", () => {
+    const got = resolveGroup("docker", "/nonexistent-group-file");
+    assert.ok("error" in got);
+    assert.match(got.error, /cannot read/);
   });
 });
