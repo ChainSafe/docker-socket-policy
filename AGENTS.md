@@ -64,6 +64,20 @@ substitute.
    commit type: `feat/…`, `fix/…`, `docs/…`, `spec/…`. Verify with
    `git log origin/main --oneline -1` that you branched from the current head;
    merged branches linger locally and are easy to land on by mistake.
+
+   Stacking a PR on another open PR fails in two ways that are easy to miss:
+
+   - **No CI.** `ci.yml` is `on: pull_request: branches: [main]`, so a PR
+     targeting a feature branch runs nothing. `gh pr checks` reports
+     "no checks reported", which reads as benign but means untested.
+     Retargeting to `main` afterwards does *not* help on its own: changing the
+     base fires `edited`, which is not one of the default activity types
+     (`opened`, `synchronize`, `reopened`). Close and reopen the PR to trigger it.
+   - **Squash-merge swallows the parent.** Merging the stacked PR squashes the
+     parent's commits in too. The parent PR is then left open with its content
+     already on `main`, unmergeable, and merging it anyway would revert the
+     child. This happened to #38 and #41: #38 had to be closed unmerged and
+     its issue closed by hand.
 4. **Commit with Conventional Commits** (`feat:`, `fix:`, `docs:`, `spec:`,
    `chore:`), optionally scoped — `fix(release):`. The release pipeline derives
    version bumps from these, so the type is not cosmetic. Mark breaking changes
