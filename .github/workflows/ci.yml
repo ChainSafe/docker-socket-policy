@@ -18,6 +18,7 @@ jobs:
           node-version: "22"
       - run: npm install -g @informalsystems/quint
       - run: make typecheck
+      - run: make test-spec
       - run: make verify BACKEND=typescript
 
   go:

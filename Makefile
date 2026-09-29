@@ -3,9 +3,10 @@ OUTPUT_DIR ?= .
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 QUINT ?= $(shell command -v quint 2>/dev/null || echo node $$HOME/.hermes/node/lib/node_modules/@informalsystems/quint/dist/src/cli.js)
 SPEC ?= spec/docker_socket_policy.qnt
+LISTENER_SPEC ?= spec/listener.qnt
 BACKEND ?=
 
-.PHONY: build clean test lint verify typecheck validate ci-verify release-verify
+.PHONY: build clean test lint verify typecheck test-spec validate ci-verify release-verify
 .PHONY: build-go test-go lint-go build-rs test-rs build-ts test-ts
 
 # ─── Go ──────────────────────────────────────────────
@@ -65,16 +66,23 @@ clean:
 
 typecheck:
 	$(QUINT) typecheck $(SPEC)
+	$(QUINT) typecheck $(LISTENER_SPEC)
 
 verify:
 	if [ -n "$(BACKEND)" ]; then \
-		$(QUINT) run --max-steps=100 --invariants allInvariants --backend $(BACKEND) $(SPEC); \
+		$(QUINT) run $(SPEC) --max-steps=100 --invariants allInvariants --backend $(BACKEND) && \
+		$(QUINT) run $(LISTENER_SPEC) --main=listener_locked --max-steps=30 --invariant allListenerInvariants --backend $(BACKEND); \
 	else \
-		$(QUINT) run --max-steps=100 --invariants allInvariants $(SPEC); \
+		$(QUINT) run $(SPEC) --max-steps=100 --invariants allInvariants && \
+		$(QUINT) run $(LISTENER_SPEC) --main=listener_locked --max-steps=30 --invariant allListenerInvariants; \
 	fi
 
+test-spec:
+	$(QUINT) test $(LISTENER_SPEC) --main=listener_locked
+	$(QUINT) test $(LISTENER_SPEC) --main=listener_unlocked
+
 verify-ts:
-	$(QUINT) run --max-steps=50 --invariants allInvariants --backend typescript $(SPEC)
+	$(QUINT) run $(SPEC) --max-steps=50 --invariants allInvariants --backend typescript
 
 ci-verify:
 	$(MAKE) typecheck
