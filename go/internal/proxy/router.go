@@ -177,10 +177,22 @@ func matchEndpoint(path, resource, endpoint string) bool {
 	return parts[0] == resource && parts[1] == endpoint
 }
 
+// reservedContainerSegments are Docker endpoints that sit where a container
+// name would: /containers/json lists, /containers/create creates. Treating one
+// as a container name routes the request down the lifecycle path, where an
+// unknown container is allowed through — so DELETE /containers/json would be
+// allowed rather than denied. Rust (rs/src/proxy.rs) and TypeScript
+// (ts/src/proxy.ts) exclude the same set.
+var reservedContainerSegments = map[string]bool{
+	"create": true,
+	"json":   true,
+	"exec":   true,
+}
+
 func extractContainerName(path string) string {
 	path = strings.TrimPrefix(path, "/")
 	parts := strings.Split(path, "/")
-	if len(parts) >= 2 && parts[0] == "containers" {
+	if len(parts) >= 2 && parts[0] == "containers" && !reservedContainerSegments[parts[1]] {
 		return parts[1]
 	}
 	return ""

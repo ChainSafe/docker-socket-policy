@@ -439,6 +439,45 @@ mod tests {
         assert_eq!(result.action, Action::Allow);
     }
 
+    /// Cross-language parity guard for #24. /containers/<x> is ambiguous: <x>
+    /// is usually a container name, but Docker also has reserved endpoints at
+    /// that position. Treating one as a container name routes the request down
+    /// the lifecycle path, where an unknown container is allowed through — Go
+    /// allowed DELETE /containers/json for exactly that reason.
+    #[test]
+    fn test_route_reserved_path_segments() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let cases = [
+            // Reserved: must not be mistaken for a container to remove.
+            ("DELETE", "/containers/json", Action::Deny),
+            ("DELETE", "/containers/create", Action::Deny),
+            // Listing stays allowed, via the GET/HEAD passthrough.
+            ("GET", "/containers/json", Action::Allow),
+            // A real container name is still routed as a container.
+            ("DELETE", "/containers/mycontainer", Action::Allow),
+            ("GET", "/containers/mycontainer", Action::Allow),
+            // Reserved words are only reserved in the name position.
+            ("GET", "/containers/mycontainer/json", Action::Allow),
+        ];
+        for (method, path, want) in cases {
+            let got = router.route(method, path, None);
+            assert_eq!(got.action, want, "route({} {})", method, path);
+        }
+    }
+
+    #[test]
+    fn test_extract_container_name_skips_reserved_segments() {
+        for reserved in ["create", "json", "exec"] {
+            let path = format!("/containers/{}", reserved);
+            assert_eq!(extract_container_name(&path), None, "{} should be reserved", path);
+        }
+        assert_eq!(extract_container_name("/containers/mycontainer"), Some("mycontainer"));
+        assert_eq!(
+            extract_container_name("/containers/mycontainer/json"),
+            Some("mycontainer")
+        );
+    }
+
     #[test]
     fn test_route_image_pull() {
         let router = Router::new(make_manager(vec!["alpine"]));

@@ -68,6 +68,11 @@ post_empty() {
     -X POST -H "Content-Type: application/json" -d "" "$1" 2>/dev/null || true)
   echo "${out:-000}"
 }
+delete_status() {
+  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+    -X DELETE "$1" 2>/dev/null || true)
+  echo "${out:-000}"
+}
 
 check() {
   desc="$1"
@@ -295,6 +300,20 @@ check "POST /volumes/create -> 403" "403" "$S"
 
 S=$(post_empty "$PROXY/containers/test")
 check "PATCH /containers/test -> 403" "403" "$S"
+
+# Reserved path segments (#24). /containers/json is the list endpoint, not a
+# container called "json". Treating it as a container name sent the request
+# down the lifecycle path, where an unknown container is allowed through, so Go
+# allowed this while Rust and TypeScript denied it.
+S=$(delete_status "$PROXY/containers/json")
+check "DELETE /containers/json -> 403 (reserved, not a container)" "403" "$S"
+
+S=$(delete_status "$PROXY/containers/create")
+check "DELETE /containers/create -> 403 (reserved, not a container)" "403" "$S"
+
+# Listing must still work: it reaches the GET/HEAD passthrough instead.
+S=$(get_status "$PROXY/containers/json")
+check "GET /containers/json -> 200 (still the list endpoint)" "200" "$S"
 
 # ─── Summary ──────────────────────────────────────────
 
