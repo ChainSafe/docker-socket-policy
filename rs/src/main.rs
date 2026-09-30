@@ -1142,6 +1142,10 @@ mod tests {
                 Err(format!("--listen-socket-group {:?}: gid out of range (0-4294967294)", v))
             );
         }
+        // Only a digit string is numeric; a sign makes it a (nonexistent) name.
+        for v in ["+4294967296", "+5"] {
+            assert!(resolve_group(v).is_err(), "resolve_group({:?}) should fail", v);
+        }
     }
 
     /// Mirrors the Quint group_* actions and Go's TestSelectSocketGroup.

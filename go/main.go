@@ -212,11 +212,8 @@ func resolveGroup(group string) (int, error) {
 		}
 		return int(gid), nil
 	}
-	if gid, err := strconv.Atoi(group); err == nil {
-		if gid < 0 {
-			return -1, fmt.Errorf("--listen-socket-group %q: negative gid", group)
-		}
-		return gid, nil
+	if strings.HasPrefix(group, "-") && isAllDigits(group[1:]) {
+		return -1, fmt.Errorf("--listen-socket-group %q: negative gid", group)
 	}
 	g, err := user.LookupGroup(group)
 	if err != nil {

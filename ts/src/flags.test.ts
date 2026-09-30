@@ -252,6 +252,12 @@ describe("resolveGroup rejects out-of-range gid", () => {
         error: `--listen-socket-group ${JSON.stringify(v)}: gid out of range (0-4294967294)`,
       });
     }
+    // Only a digit string is numeric; a sign makes it a (nonexistent) name.
+    const f = join(mkdtempSync(join(tmpdir(), "grp-")), "group");
+    writeFileSync(f, "root:x:0:\n");
+    for (const v of ["+4294967296", "+5"]) {
+      assert.ok("error" in resolveGroup(v, f), `resolveGroup(${JSON.stringify(v)}) should fail`);
+    }
   });
 });
 

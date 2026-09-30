@@ -250,7 +250,7 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > | not passed | no | the proxy's own group, with the warning `group docker-socket-policy not found, using the proxy's own group <gid>` |
 > | `=name` | yes | that group |
 > | `=name` | no | none: startup fails, exit 2 |
-> | `=gid` | — | that gid, used as-is (no lookup) |
+> | `=gid` | — | that gid, used as-is (no lookup). Digits only, `0-4294967294`; a larger value fails with exit 2 |
 > | `=""` | — | the proxy's own group, no warning |
 >
 > To grant access, create the group once and add callers to it:
@@ -293,7 +293,7 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > it**, especially while the proxy is running: deleting it lets a second
 > instance take the socket. A `.lock` left by another uid (for example an
 > earlier run as root on a persistent volume) makes startup fail with
-> `opening lock …: permission denied`, exit 1; delete that lock file only when
+> `opening lock …` and a permission-denied error, exit 1; delete that lock file only when
 > no instance is running.
 >
 > *TypeScript exception:* Node has no `flock`, so the TypeScript

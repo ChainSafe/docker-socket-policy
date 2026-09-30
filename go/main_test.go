@@ -746,6 +746,15 @@ func TestResolveGroupRejectsOutOfRangeGid(t *testing.T) {
 			t.Fatalf("resolveGroup(%q) error = %v, want %q", v, err, want)
 		}
 	}
+	// Only a digit string is numeric; a sign makes it a (nonexistent) name.
+	for _, v := range []string{"+4294967296", "+5"} {
+		if gid, err := resolveGroup(v); err == nil {
+			t.Fatalf("resolveGroup(%q) = %d, nil; want an error", v, gid)
+		}
+	}
+	if _, err := resolveGroup("-5"); err == nil || !strings.Contains(err.Error(), "negative gid") {
+		t.Fatalf("resolveGroup(\"-5\") error = %v, want a negative gid error", err)
+	}
 }
 
 // TestSelectSocketGroup has one case per row of the group-selection table in
