@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -370,9 +372,6 @@ func TestUnixListenerIgnoresAmbientUmask(t *testing.T) {
 }
 
 func TestResolveGroup(t *testing.T) {
-	if gid, err := resolveGroup(""); err != nil || gid != -1 {
-		t.Fatalf("resolveGroup(\"\") = %d, %v; want -1, nil", gid, err)
-	}
 	// A numeric value is taken as a gid without consulting /etc/group, so a
 	// container without the group defined can still be configured.
 	if gid, err := resolveGroup("2001"); err != nil || gid != 2001 {
@@ -387,5 +386,129 @@ func TestResolveGroup(t *testing.T) {
 		if gid, err := resolveGroup(g.Name); err != nil || gid != 0 {
 			t.Fatalf("resolveGroup(%q) = %d, %v; want 0, nil", g.Name, gid, err)
 		}
+	}
+}
+
+// TestSelectSocketGroup has one case per row of the group-selection table in
+// spec/listener-design.md; the subtest names match the Quint runs.
+func TestSelectSocketGroup(t *testing.T) {
+	const egid = 65532
+	known := func(groups map[string]int) func(string) (int, error) {
+		return func(name string) (int, error) {
+			if gid, ok := groups[name]; ok {
+				return gid, nil
+			}
+			return -1, fmt.Errorf("--listen-socket-group %q: unknown group", name)
+		}
+	}
+	both := known(map[string]int{"docker-socket-policy": 2001, "ops": 3001})
+
+	tests := []struct {
+		name        string
+		flagValue   *string
+		lookup      func(string) (int, error)
+		wantGID     int
+		wantWarning string
+		wantErr     bool
+	}{
+		{"groupDefaultPresent", nil, both, 2001, "", false},
+		{"groupDefaultMissingWarns", nil, known(nil), egid,
+			"group docker-socket-policy not found, using the proxy's own group 65532", false},
+		{"groupExplicitPresent", ptr("ops"), both, 3001, "", false},
+		{"groupExplicitMissingFails", ptr("nope"), both, 0, "", true},
+		{"groupEmptyUsesOwn", ptr(""), both, egid, "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gid, warning, err := selectSocketGroup(tt.flagValue, tt.lookup, egid)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("selectSocketGroup = %d, %q, nil; want an error", gid, warning)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("selectSocketGroup error = %v, want nil", err)
+			}
+			if gid != tt.wantGID {
+				t.Fatalf("gid = %d, want %d", gid, tt.wantGID)
+			}
+			if warning != tt.wantWarning {
+				t.Fatalf("warning = %q, want %q", warning, tt.wantWarning)
+			}
+		})
+	}
+}
+
+// groupFlagFromArgs parses args with a fresh flag set and reports the
+// --listen-socket-group value the way main does, via flagValueIfSet.
+func groupFlagFromArgs(args []string) *string {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.String("listen-socket-group", "", "")
+	if err := fs.Parse(args); err != nil {
+		panic(err)
+	}
+	return flagValueIfSet(fs, "listen-socket-group")
+}
+
+// An explicit empty value means "the proxy's own group" and must not be
+// confused with the flag being absent, which means the default group.
+func TestFlagEmptyVsAbsent(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want *string
+	}{
+		{"absent", []string{}, nil},
+		{"equals empty", []string{"--listen-socket-group="}, ptr("")},
+		{"separate empty", []string{"--listen-socket-group", ""}, ptr("")},
+		{"named", []string{"--listen-socket-group=ops"}, ptr("ops")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := groupFlagFromArgs(tt.args)
+			switch {
+			case tt.want == nil && got != nil:
+				t.Fatalf("groupFlagFromArgs(%q) = %q, want nil", tt.args, *got)
+			case tt.want != nil && got == nil:
+				t.Fatalf("groupFlagFromArgs(%q) = nil, want %q", tt.args, *tt.want)
+			case tt.want != nil && *got != *tt.want:
+				t.Fatalf("groupFlagFromArgs(%q) = %q, want %q", tt.args, *got, *tt.want)
+			}
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }
+
+// A non-root proxy that is not a member of the selected group cannot chown the
+// socket to it. The error must say what to fix rather than surface a bare EPERM.
+func TestUnixListenerChownEPERMNamesGroup(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can chown to any group")
+	}
+	if groups, err := os.Getgroups(); err == nil {
+		for _, g := range groups {
+			if g == 0 {
+				t.Skip("process is a member of gid 0, so chown to it succeeds")
+			}
+		}
+	}
+	dir := shortTempDir(t)
+	// BSD semantics (macOS) give a new file its directory's group, which is
+	// gid 0 under /tmp, and chown to the current group is always allowed.
+	// Give the directory our own group so the socket starts out not in gid 0.
+	if err := os.Chown(dir, -1, os.Getegid()); err != nil {
+		t.Fatalf("chown temp dir to egid: %v", err)
+	}
+	path := filepath.Join(dir, "eperm.sock")
+	l, err := unixListener(path, 0)
+	if err == nil {
+		l.Close()
+		t.Fatal("unixListener(path, 0) as non-root = nil, want EPERM")
+	}
+	if want := "the proxy's user must be a member of it"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want it to contain %q", err, want)
 	}
 }

@@ -36,8 +36,10 @@ func main() {
 		"Audit log file (JSON)")
 	readonly := flag.Bool("readonly", false,
 		"Enable read-only mode (deny all POST/PUT/DELETE)")
-	listenSocketGroup := flag.String("listen-socket-group", "",
-		"Group name or gid to own the listening socket")
+	// The value is read with flagValueIfSet, never through the returned
+	// pointer: absent (default group) and "" (own group) must stay distinct.
+	flag.String("listen-socket-group", "",
+		`Group owning the socket (default docker-socket-policy; "" = the proxy's own group)`)
 	flag.Parse()
 
 	if err := validateListenSocket(*listenSocket); err != nil {
@@ -48,10 +50,14 @@ func main() {
 		slog.Error(err.Error())
 		os.Exit(2)
 	}
-	socketGID, err := resolveGroup(*listenSocketGroup)
+	socketGID, warning, err := selectSocketGroup(
+		flagValueIfSet(flag.CommandLine, "listen-socket-group"), resolveGroup, os.Getegid())
 	if err != nil {
 		slog.Error(err.Error())
 		os.Exit(2)
+	}
+	if warning != "" {
+		slog.Warn(warning)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -145,12 +151,51 @@ const socketMode os.FileMode = 0o660
 // window in which the socket is already listening at the ambient mode.
 const bindUmask = 0o177
 
-// resolveGroup maps --listen-socket-group to a gid. A numeric value is used
+// defaultSocketGroup is the group the socket is given when
+// --listen-socket-group is not passed, as dockerd defaults to "docker".
+const defaultSocketGroup = "docker-socket-policy"
+
+// flagValueIfSet returns the value of the named flag if it was passed on the
+// command line, or nil if it was not. It distinguishes an absent flag from one
+// explicitly set to "".
+func flagValueIfSet(fs *flag.FlagSet, name string) *string {
+	var value *string
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			v := f.Value.String()
+			value = &v
+		}
+	})
+	return value
+}
+
+// selectSocketGroup picks the socket's group the way dockerd does
+// (moby/daemon/listeners/listeners_linux.go). A nil flagValue means the flag
+// was not passed: the default group is used if it exists, and otherwise the
+// proxy falls back to its own group with a warning. An explicit group that
+// does not resolve is an error. An explicit "" selects the proxy's own group.
+func selectSocketGroup(flagValue *string, lookup func(string) (int, error), egid int) (int, string, error) {
+	if flagValue == nil {
+		gid, err := lookup(defaultSocketGroup)
+		if err != nil {
+			return egid, fmt.Sprintf("group %s not found, using the proxy's own group %d",
+				defaultSocketGroup, egid), nil
+		}
+		return gid, "", nil
+	}
+	if *flagValue == "" {
+		return egid, "", nil
+	}
+	gid, err := lookup(*flagValue)
+	if err != nil {
+		return -1, "", err
+	}
+	return gid, "", nil
+}
+
+// resolveGroup maps a group name or gid to a gid. A numeric value is used
 // as-is so deployments without the group in /etc/group (or NSS) still work.
 func resolveGroup(group string) (int, error) {
-	if group == "" {
-		return -1, nil
-	}
 	if gid, err := strconv.Atoi(group); err == nil {
 		if gid < 0 {
 			return -1, fmt.Errorf("--listen-socket-group %q: negative gid", group)
@@ -176,6 +221,9 @@ func resolveGroup(group string) (int, error) {
 // Left to the umask the socket is 0755 by default — connect(2) needs write, so
 // the documented "add the caller to the socket's group" grant does not work —
 // and 0777 under umask 0, which lets any local uid drive the Docker API.
+//
+// main always passes the gid chosen by selectSocketGroup; a negative gid skips
+// the chown and exists only for tests.
 func unixListener(addr string, gid int) (net.Listener, error) {
 	// Remove a stale socket from a previous run, but only a socket: os.Remove
 	// also unlinks regular files and rmdir's empty directories, so ignoring its
@@ -205,6 +253,10 @@ func unixListener(addr string, gid int) (net.Listener, error) {
 	if gid >= 0 {
 		if err := os.Chown(addr, -1, gid); err != nil {
 			l.Close()
+			if errors.Is(err, syscall.EPERM) {
+				return nil, fmt.Errorf("cannot give %s to group %d: the proxy's user must be a member of it "+
+					"(SupplementaryGroups= / group_add:)", addr, gid)
+			}
 			return nil, fmt.Errorf("setting group on %s: %w", addr, err)
 		}
 	}
