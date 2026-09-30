@@ -86,6 +86,7 @@ verify-ts:
 
 ci-verify:
 	$(MAKE) typecheck
+	$(MAKE) test-spec
 	$(MAKE) verify BACKEND=typescript
 	$(MAKE) test-all
 	$(MAKE) test-integration
