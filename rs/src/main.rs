@@ -143,8 +143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind before spawning so a bind failure is fatal: the Unix socket is the
     // process's only listener, so a running-but-unbound proxy is never useful.
-    let listener = bind_unix_listener(&cli.listen_socket, Some(socket_gid)).map_err(|e| {
-        tracing::error!("failed to bind unix socket {}: {}", cli.listen_socket, e);
+    // `_lock`, not `_`: a `_` pattern drops the File at once, releasing the
+    // single-instance lock while the proxy is still serving.
+    let (listener, _lock) = open_listener(&cli.listen_socket, Some(socket_gid)).map_err(|e| {
+        tracing::error!("failed to start listener on {}: {}", cli.listen_socket, e);
         e
     })?;
     let unix_handle = spawn_unix_listener(
@@ -156,9 +158,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let _ = unix_handle.await;
+    // Release the lock only once the socket is closed and unlinked, so the
+    // next instance never finds our socket still in place.
+    drop(_lock);
     tracing::info!("shutdown complete");
 
     Ok(())
+}
+
+/// Takes the single-instance lock, clears the socket path and binds it. The
+/// returned lock must be held for the life of the process: dropping it would
+/// let a second instance take the path.
+fn open_listener(addr: &str, gid: Option<u32>) -> io::Result<(tokio::net::UnixListener, std::fs::File)> {
+    // On an error below, `lock` is dropped on return, releasing the flock.
+    let lock = acquire_instance_lock(addr)?;
+    prepare_socket_path(addr)?;
+    let listener = bind_unix_listener(addr, gid)?;
+    Ok((listener, lock))
+}
+
+/// Takes an exclusive flock on `<socket_path>.lock`, which replaces dockerd's
+/// pidfile. The kernel drops the lock on any exit, including SIGKILL, so it
+/// never goes stale, and it needs no PID check, so it also works across PID
+/// namespaces. The file is never truncated or unlinked: unlinking a lock file
+/// reopens the race it exists to close. O_NOFOLLOW stops a symlink planted at
+/// the lock path from redirecting O_CREAT elsewhere.
+fn acquire_instance_lock(socket_path: &str) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = format!("{}.lock", socket_path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|e| io::Error::new(e.kind(), format!("opening lock {}: {}", lock_path, e)))?;
+    // SAFETY: the fd is owned by `file` and open for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("{} is in use by another instance (lock {} held)", socket_path, lock_path),
+            ));
+        }
+        return Err(io::Error::new(e.kind(), format!("locking {}: {}", lock_path, e)));
+    }
+    Ok(file)
+}
+
+/// Bounds the connect(2) that tells a live socket from a stale one.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Clears the socket path for bind, following the existing-path table in
+/// spec/listener-design.md. Only a socket that refuses connections is removed.
+/// A live one belongs to another process, possibly an instance that takes no
+/// lock (TypeScript, or v0.2.21 and earlier), and replacing it would cut that
+/// process off silently. Anything that is not a socket is refused, so a
+/// mistyped path cannot silently delete an operator's data.
+fn prepare_socket_path(path: &str) -> io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io::Error::new(e.kind(), format!("checking {}: {}", path, e))),
+    };
+    if !meta.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("refusing to remove {}: not a socket ({:?})", path, meta.file_type()),
+        ));
+    }
+
+    // std's connect has no timeout, so it runs on its own thread. On timeout
+    // the thread is left to finish on its own; the socket is live either way.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target = path.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::os::unix::net::UnixStream::connect(target).map(drop));
+    });
+    let in_use = || io::Error::new(io::ErrorKind::AddrInUse, format!("{} is in use by another process", path));
+    match rx.recv_timeout(PROBE_TIMEOUT) {
+        Ok(Ok(())) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(in_use()),
+        Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+        Ok(Err(e)) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("refusing to remove {}: connect: {}", path, e),
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(io::Error::other(format!(
+                "refusing to remove {}: connect probe did not complete",
+                path
+            )))
+        }
+    }
+
+    std::fs::remove_file(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("removing stale socket {}: {}", path, e)))
 }
 
 /// Binds the Unix socket listener for `--listen-socket`.
@@ -167,26 +267,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// ownership on the socket are the access-control boundary, and a TCP listener
 /// would have neither.
 ///
-/// A stale socket left over from a previous run is removed before binding,
-/// matching the Go implementation.
+/// The path must already be clear; `open_listener` runs `prepare_socket_path`
+/// first.
 fn bind_unix_listener(addr: &str, gid: Option<u32>) -> io::Result<tokio::net::UnixListener> {
-    // Remove a stale socket, but only a socket: blindly removing would let a
-    // mistyped path silently delete an operator's file, so anything that is
-    // not a socket is an error rather than something to clear out of the way.
-    match std::fs::symlink_metadata(addr) {
-        Ok(meta) => {
-            if !meta.file_type().is_socket() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("refusing to remove {}: not a socket ({:?})", addr, meta.file_type()),
-                ));
-            }
-            std::fs::remove_file(addr)?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-
     // umask is process-global and not thread-safe. This runs during startup,
     // before any connection is served, so nothing else is creating files.
     // SAFETY: umask(2) cannot fail and has no preconditions.
@@ -399,7 +482,7 @@ fn spawn_unix_listener(
 ///
 /// Unlike Go's `net.UnixListener` and Node, tokio's `UnixListener` does not
 /// unlink the path when dropped, so without this a clean exit leaves the socket
-/// file behind. It is recovered on the next start (`bind_unix_listener` clears
+/// file behind. It is recovered on the next start (`prepare_socket_path` clears
 /// a stale socket), but the three implementations should behave the same.
 fn unlink_listen_socket(addr: &str) {
     match std::fs::remove_file(addr) {
@@ -451,44 +534,360 @@ mod tests {
         std::env::temp_dir().join(format!("dsp-test-{}.sock", rand::random::<u64>()))
     }
 
-    #[tokio::test]
-    async fn test_bind_unix_listener_removes_stale_socket() {
-        let path = unique_socket_path();
-        // A real socket left behind by an unclean shutdown. Dropping the
-        // listener does not unlink it, so the file outlives the process.
-        let stale = StdUnixListener::bind(&path).unwrap();
-        drop(stale);
-        assert!(path.exists(), "precondition: stale socket should still be on disk");
+    /// A directory under the temp dir, removed on drop. Paths inside it stay
+    /// well under macOS's 104-byte sun_path limit.
+    struct TempDir(std::path::PathBuf);
 
-        let result = bind_unix_listener(path.to_str().unwrap(), None);
-        assert!(
-            result.is_ok(),
-            "expected stale socket to be removed and bind to succeed: {:?}",
-            result.err()
-        );
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("dsp-{}", rand::random::<u32>()));
+            std::fs::create_dir(&dir).unwrap();
+            // Set explicitly: bind_unix_listener's umask is process-global, so
+            // a bind in a parallel test can strip the directory's x bit.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            TempDir(dir)
+        }
 
-        std::fs::remove_file(&path).ok();
+        fn join(&self, name: &str) -> String {
+            self.0.join(name).to_str().unwrap().to_string()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// Held by `test_lock_released_on_sigkill` from before its fork until the
+    /// child has closed every inherited fd, and by tests that rely on closing
+    /// an fd. Without it a child forked at the wrong moment keeps a copy of a
+    /// "closed" listener or lock alive, so a stale socket probes as live or a
+    /// dropped lock stays held.
+    static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
+        FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Leaves a socket file at path with nothing listening on it, as an
+    /// unclean shutdown would: connect(2) to it is refused. Dropping a std
+    /// listener does not unlink its path.
+    fn seed_stale_socket(path: &str) {
+        let _guard = fork_guard();
+        drop(StdUnixListener::bind(path).unwrap());
+    }
+
+    fn inode(path: &str) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: geteuid(2) cannot fail.
+        unsafe { libc::geteuid() == 0 }
     }
 
     #[tokio::test]
-    async fn test_bind_unix_listener_refuses_to_delete_non_socket() {
-        // A mistyped --listen-socket must not silently destroy data.
-        let path = unique_socket_path();
+    async fn test_open_listener_replaces_stale_socket() {
+        let dir = TempDir::new();
+        let path = dir.join("stale.sock");
+        seed_stale_socket(&path);
+
+        let result = open_listener(&path, None);
+        assert!(result.is_ok(), "open_listener over a stale socket: {:?}", result.err());
+    }
+
+    /// A mistyped --listen-socket must not silently destroy data.
+    #[tokio::test]
+    async fn test_open_listener_refuses_to_delete_non_socket() {
+        let dir = TempDir::new();
+
+        let path = dir.join("important.txt");
         std::fs::write(&path, b"important data").unwrap();
+        let err = open_listener(&path, None).expect_err("regular file was not refused");
+        assert!(err.to_string().contains("not a socket"), "error = {:?}", err.to_string());
+        assert_eq!(std::fs::read(&path).unwrap(), b"important data", "file was modified");
 
-        let result = bind_unix_listener(path.to_str().unwrap(), None);
-        assert!(result.is_err(), "expected a regular file to be refused, not deleted");
-        assert!(
-            result.unwrap_err().to_string().contains("not a socket"),
-            "error should explain that the path is not a socket"
-        );
+        let path = dir.join("adir");
+        std::fs::create_dir(&path).unwrap();
+        assert!(open_listener(&path, None).is_err(), "directory was not refused");
+        assert!(std::path::Path::new(&path).is_dir(), "directory was removed");
+    }
+
+    /// One case per row of the existing-path table in
+    /// spec/listener-design.md; the case names match the Quint runs.
+    #[test]
+    fn test_prepare_socket_path() {
+        // path_absent_binds
+        {
+            let dir = TempDir::new();
+            let path = dir.join("absent.sock");
+            assert!(prepare_socket_path(&path).is_ok());
+        }
+
+        // path_stale_replaced
+        {
+            let dir = TempDir::new();
+            let path = dir.join("stale.sock");
+            seed_stale_socket(&path);
+            let result = prepare_socket_path(&path);
+            assert!(result.is_ok(), "prepare_socket_path(stale) = {:?}", result.err());
+            assert!(std::fs::symlink_metadata(&path).is_err(), "stale socket still present");
+        }
+
+        // path_live_refused
+        {
+            let dir = TempDir::new();
+            let path = dir.join("live.sock");
+            let live = StdUnixListener::bind(&path).unwrap();
+            let before = inode(&path);
+
+            let err = prepare_socket_path(&path).expect_err("live socket was not refused");
+            assert_eq!(err.to_string(), format!("{} is in use by another process", path));
+            assert_eq!(inode(&path), before, "live socket was replaced");
+
+            // Scoped so `live` outlives the dial: the accept may take the
+            // probe's queued connection, and a thread owning the listener
+            // would then close it before the dial below.
+            std::thread::scope(|s| {
+                let accepted = s.spawn(|| live.accept().map(drop));
+                std::os::unix::net::UnixStream::connect(&path).expect("live listener no longer reachable");
+                accepted.join().unwrap().expect("live listener no longer accepts");
+            });
+        }
+
+        // path_connect_error_refused: connect(2) needs write permission on the
+        // socket, so a 0000 socket yields EACCES. It is neither live nor
+        // provably stale, so it is left alone.
+        if is_root() {
+            eprintln!("skipping path_connect_error_refused: root ignores socket permissions");
+        } else {
+            let dir = TempDir::new();
+            let path = dir.join("eacces.sock");
+            seed_stale_socket(&path);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let err = prepare_socket_path(&path).expect_err("0000 socket was not refused");
+            let want = format!("refusing to remove {}", path);
+            assert!(err.to_string().starts_with(&want), "error = {:?}, want prefix {:?}", err.to_string(), want);
+            assert!(std::fs::symlink_metadata(&path).is_ok(), "socket was removed");
+        }
+
+        // path_not_socket_refused
+        {
+            let dir = TempDir::new();
+            let path = dir.join("file.txt");
+            std::fs::write(&path, b"data").unwrap();
+            let err = prepare_socket_path(&path).expect_err("regular file was not refused");
+            let want = format!("refusing to remove {}: not a socket", path);
+            assert!(err.to_string().starts_with(&want), "error = {:?}, want prefix {:?}", err.to_string(), want);
+            assert_eq!(std::fs::read(&path).unwrap(), b"data", "regular file was modified");
+        }
+    }
+
+    /// Covers the Quint run second_instance_lock_refused.
+    #[test]
+    fn test_acquire_instance_lock() {
+        let _guard = fork_guard();
+        let dir = TempDir::new();
+        let path = dir.join("lock.sock");
+        let lock_path = format!("{}.lock", path);
+
+        let first = acquire_instance_lock(&path).expect("first acquire_instance_lock");
+
+        let err = acquire_instance_lock(&path).expect_err("second acquisition succeeded");
         assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"important data",
-            "the file must be left untouched"
+            err.to_string(),
+            format!("{} is in use by another instance (lock {} held)", path, lock_path)
         );
 
-        std::fs::remove_file(&path).ok();
+        let mode = std::fs::symlink_metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "lock file mode = {:o}, want 0600", mode);
+
+        drop(first);
+        assert!(
+            std::fs::symlink_metadata(&lock_path).is_ok(),
+            "lock file removed on drop, want it kept"
+        );
+
+        acquire_instance_lock(&path).expect("acquire_instance_lock after drop");
+    }
+
+    /// A symlink planted at <path>.lock must not be followed: O_CREAT through
+    /// it would create or lock a file of the attacker's choosing.
+    #[test]
+    fn test_acquire_instance_lock_refuses_symlink() {
+        let dir = TempDir::new();
+        let path = dir.join("sym.sock");
+        let target = dir.join("target");
+        std::os::unix::fs::symlink(&target, format!("{}.lock", path)).unwrap();
+
+        let err = acquire_instance_lock(&path).expect_err("lock through a symlink succeeded");
+        assert!(
+            err.to_string().contains(&format!("{}.lock", path)),
+            "error = {:?}, want it to name {}.lock",
+            err.to_string(),
+            path
+        );
+        assert!(std::fs::symlink_metadata(&target).is_err(), "symlink target was created");
+    }
+
+    #[test]
+    fn test_acquire_instance_lock_unreadable() {
+        if is_root() {
+            eprintln!("skipping: root ignores file permissions");
+            return;
+        }
+        let dir = TempDir::new();
+        let path = dir.join("unreadable.sock");
+        let lock_path = format!("{}.lock", path);
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = acquire_instance_lock(&path).expect_err("lock on a 0000 file succeeded");
+        assert!(
+            err.to_string().contains(&lock_path),
+            "error = {:?}, want it to name {}",
+            err.to_string(),
+            lock_path
+        );
+    }
+
+    #[test]
+    fn test_open_listener_concurrent() {
+        const RACERS: usize = 8;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = TempDir::new();
+
+        for i in 0..50 {
+            let path = dir.join(&format!("c{}.sock", i));
+            let barrier = Arc::new(std::sync::Barrier::new(RACERS));
+            let racers: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let (path, barrier, handle) = (path.clone(), barrier.clone(), rt.handle().clone());
+                    std::thread::spawn(move || {
+                        // tokio's UnixListener registers with the runtime's reactor.
+                        let _enter = handle.enter();
+                        barrier.wait();
+                        open_listener(&path, None)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+
+            let want = format!("{} is in use by another instance (lock {}.lock held)", path, path);
+            let mut winner = None;
+            for result in results {
+                match result {
+                    Ok(pair) => {
+                        assert!(winner.is_none(), "iteration {}: more than one open_listener succeeded", i);
+                        winner = Some(pair);
+                    }
+                    Err(e) => assert_eq!(e.to_string(), want, "iteration {}: loser error", i),
+                }
+            }
+            let (listener, lock) = winner.unwrap_or_else(|| panic!("iteration {}: no open_listener succeeded", i));
+
+            let _client = std::os::unix::net::UnixStream::connect(&path)
+                .unwrap_or_else(|e| panic!("iteration {}: dialing winner: {}", i, e));
+            rt.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap_or_else(|_| panic!("iteration {}: winner did not accept within 5s", i))
+                    .unwrap_or_else(|e| panic!("iteration {}: winner accept: {}", i, e));
+            });
+
+            drop(listener);
+            drop(lock);
+        }
+    }
+
+    /// Kills and reaps the forked child even if an assertion fails first.
+    struct ChildGuard(libc::pid_t);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                // SAFETY: self.0 is our own unreaped child.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+    }
+
+    /// Covers the Quint run crash_releases_lock: the kernel drops the flock on
+    /// any exit, so a killed instance never leaves a stale lock behind.
+    #[test]
+    fn test_lock_released_on_sigkill() {
+        let dir = TempDir::new();
+        let path = dir.join("kill.sock");
+        let lock_path = std::ffi::CString::new(format!("{}.lock", path)).unwrap();
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds has room for the two descriptors pipe(2) writes.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe: {}", io::Error::last_os_error());
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // SAFETY: sysconf(3) has no preconditions.
+        let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }.clamp(256, 65536) as libc::c_int;
+
+        let fork_lock = fork_guard();
+        // SAFETY: the child calls only async-signal-safe functions (close,
+        // open, flock, write, pause, _exit) on memory prepared before fork,
+        // and never returns into the test harness.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                // Drop every inherited fd but the pipe, so the child cannot
+                // hold another test's lock or listener open.
+                for fd in 3..max_fd {
+                    if fd != write_fd {
+                        libc::close(fd);
+                    }
+                }
+                let fd = libc::open(
+                    lock_path.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0o600 as libc::c_uint,
+                );
+                let ok = fd >= 0 && libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0;
+                let byte: u8 = if ok { b'r' } else { b'e' };
+                libc::write(write_fd, &byte as *const u8 as *const libc::c_void, 1);
+                if !ok {
+                    libc::_exit(1);
+                }
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        assert!(pid > 0, "fork: {}", io::Error::last_os_error());
+        let mut child = ChildGuard(pid);
+        // SAFETY: write_fd is ours and open.
+        unsafe { libc::close(write_fd) };
+
+        let mut pfd = libc::pollfd { fd: read_fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: pfd is a valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+        let mut byte = 0u8;
+        // SAFETY: byte is a valid 1-byte buffer.
+        let n = if ready == 1 { unsafe { libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) } } else { 0 };
+        unsafe { libc::close(read_fd) };
+        drop(fork_lock);
+        assert_eq!(ready, 1, "child did not report ready within 10s");
+        assert_eq!((n, byte), (1, b'r'), "child failed to take the lock");
+
+        assert!(acquire_instance_lock(&path).is_err(), "acquired the lock while the child held it");
+
+        // SAFETY: pid is our unreaped child.
+        unsafe {
+            assert_eq!(libc::kill(pid, libc::SIGKILL), 0, "kill: {}", io::Error::last_os_error());
+            assert_eq!(libc::waitpid(pid, std::ptr::null_mut(), 0), pid, "waitpid");
+        }
+        child.0 = 0;
+
+        acquire_instance_lock(&path).expect("acquire_instance_lock after SIGKILL");
     }
 
     #[test]
@@ -790,19 +1189,17 @@ mod tests {
                 return;
             }
         }
-        let dir = std::env::temp_dir().join(format!("dsp-{}", rand::random::<u32>()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = TempDir::new();
         // BSD semantics (macOS) give a new file its directory's group, which
         // is gid 0 under /tmp, and chown to the current group is always
         // allowed. Give the directory our own group so the socket does not
         // start out in gid 0.
         let egid = unsafe { libc::getegid() };
-        std::os::unix::fs::chown(&dir, None, Some(egid)).unwrap();
+        std::os::unix::fs::chown(&dir.0, None, Some(egid)).unwrap();
         let path = dir.join("eperm.sock");
 
-        let result = bind_unix_listener(path.to_str().unwrap(), Some(0));
-        std::fs::remove_dir_all(&dir).ok();
-        let err = result.err().expect("bind_unix_listener(path, Some(0)) as non-root succeeded, want EPERM");
+        let result = bind_unix_listener(&path, Some(0));
+        let err = result.expect_err("bind_unix_listener(path, Some(0)) as non-root succeeded, want EPERM");
         let want = "the proxy's user must be a member of it";
         assert!(err.to_string().contains(want), "error = {:?}, want it to contain {:?}", err.to_string(), want);
     }
