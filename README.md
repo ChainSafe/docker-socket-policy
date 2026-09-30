@@ -291,7 +291,10 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > lock on any exit, including `SIGKILL`, so a crash never leaves a stale lock.
 > The `.lock` file stays next to the socket after shutdown. **Do not delete
 > it**, especially while the proxy is running: deleting it lets a second
-> instance take the socket.
+> instance take the socket. A `.lock` left by another uid (for example an
+> earlier run as root on a persistent volume) makes startup fail with
+> `opening lock …: permission denied`, exit 1; delete that lock file only when
+> no instance is running.
 >
 > *TypeScript exception:* Node has no `flock`, so the TypeScript
 > implementation takes no lock and relies on the live-socket check alone. If
@@ -299,7 +302,11 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > milliseconds, both can see the old socket as stale. The second one then
 > removes the first one's new socket and binds its own, and the first keeps
 > running but nothing can reach it. An instance that starts after another is
-> already listening is still refused. This gap is tracked in
+> already listening is still refused. Node also unlinks its socket path on
+> close, so stopping the orphaned instance (the obvious remedy) deletes the
+> surviving instance's live socket; restart the survivor afterwards. The same
+> holds when a Go or Rust instance is the orphan in a race with TypeScript.
+> This gap is tracked in
 > [#46](https://github.com/ChainSafe/docker-socket-policy/issues/46).
 >
 > **What the socket does not give you is per-service isolation.** The proxy
@@ -318,7 +325,8 @@ The proxy always creates its own socket. systemd socket activation
 create. Run it as a plain service:
 
 ```bash
-sudo useradd --system --no-create-home --user-group docker-socket-policy
+sudo groupadd --system docker-socket-policy   # skip if it already exists
+sudo useradd --system --no-create-home -g docker-socket-policy docker-socket-policy
 sudo usermod -aG docker-socket-policy alice   # grant a caller access
 ```
 
