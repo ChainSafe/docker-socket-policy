@@ -1,9 +1,10 @@
 import type { Server } from "node:http";
 import { chmodSync, chownSync } from "node:fs";
-import { BIND_UMASK } from "./flags.js";
+import { BIND_UMASK, SOCKET_MODE } from "./flags.js";
 
 /**
- * Binds `server` to a Unix socket path with an explicit mode and group.
+ * Binds `server` to a Unix socket path with mode SOCKET_MODE and an optional
+ * group.
  *
  * Extracted from index.ts so it can be tested: the mode of the listening
  * socket is invisible to the integration suite, which only observes HTTP
@@ -22,7 +23,6 @@ import { BIND_UMASK } from "./flags.js";
 export function listenOnSocket(
   server: Server,
   path: string,
-  mode: number,
   gid?: number,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -45,7 +45,7 @@ export function listenOnSocket(
         if (gid !== undefined) {
           chownSync(path, -1, gid);
         }
-        chmodSync(path, mode);
+        chmodSync(path, SOCKET_MODE);
       } catch (err) {
         reject(err);
         return;

@@ -23,21 +23,15 @@ describe("listenOnSocket", () => {
   // Regression test for #40: the mode used to be whatever the umask left
   // behind, which is 0755 by default. connect(2) requires write permission, so
   // the documented group grant silently did not work.
-  it("applies the requested mode", async () => {
-    for (const mode of [0o660, 0o600, 0o640]) {
-      const { path, cleanup } = tempSocket();
-      const server = createServer(() => {});
-      await listenOnSocket(server, path, mode);
+  it("applies mode 0660", async () => {
+    const { path, cleanup } = tempSocket();
+    const server = createServer(() => {});
+    await listenOnSocket(server, path);
 
-      assert.equal(
-        modeOf(path),
-        mode,
-        `socket mode was ${modeOf(path).toString(8)}, want ${mode.toString(8)}`,
-      );
+    assert.equal(modeOf(path), 0o660, `socket mode was ${modeOf(path).toString(8)}, want 660`);
 
-      await new Promise((r) => server.close(r));
-      cleanup();
-    }
+    await new Promise((r) => server.close(r));
+    cleanup();
   });
 
   // The ambient umask must not influence the result: that was the whole bug.
@@ -46,7 +40,7 @@ describe("listenOnSocket", () => {
     const { path, cleanup } = tempSocket();
     const server = createServer(() => {});
     try {
-      await listenOnSocket(server, path, 0o660);
+      await listenOnSocket(server, path);
     } finally {
       process.umask(previous);
     }
@@ -70,7 +64,7 @@ describe("listenOnSocket", () => {
     const { path, cleanup } = tempSocket();
     const before = process.umask();
     const server = createServer(() => {});
-    await listenOnSocket(server, path, 0o660);
+    await listenOnSocket(server, path);
 
     assert.equal(process.umask(), before, "umask was not restored after bind");
 
@@ -83,7 +77,7 @@ describe("listenOnSocket", () => {
     const server = createServer(() => {});
 
     await assert.rejects(
-      () => listenOnSocket(server, "/nonexistent-dir-xyz/s.sock", 0o660),
+      () => listenOnSocket(server, "/nonexistent-dir-xyz/s.sock"),
       /ENOENT|EACCES/,
     );
     assert.equal(process.umask(), before, "umask was not restored after a failed bind");
@@ -92,7 +86,7 @@ describe("listenOnSocket", () => {
   it("is actually connectable at the mode it sets", async () => {
     const { path, cleanup } = tempSocket();
     const server = createServer((_req, res) => res.end("ok"));
-    await listenOnSocket(server, path, 0o660);
+    await listenOnSocket(server, path);
 
     const { connect } = await import("node:net");
     const reply = await new Promise<string>((resolve, reject) => {

@@ -9,26 +9,18 @@ import { Transport } from "./transport.js";
 import { createShutdown } from "./shutdown.js";
 import { listenOnSocket } from "./listen.js";
 import {
+  BOOL_FLAGS,
   getFlag,
   hasFlag,
   parseListenSocket,
-  parseSocketMode,
   parseSocketPath,
   resolveGroup,
+  SOCKET_MODE,
   validateFlags,
+  VALUE_FLAGS,
 } from "./flags.js";
 
 const args = process.argv.slice(2);
-
-const VALUE_FLAGS = [
-  "--listen-socket",
-  "--docker-host",
-  "--config-dir",
-  "--log-file",
-  "--listen-socket-mode",
-  "--listen-socket-group",
-];
-const BOOL_FLAGS = ["--readonly"];
 
 const flagError = validateFlags(args, VALUE_FLAGS, BOOL_FLAGS);
 if (flagError) {
@@ -48,13 +40,6 @@ if (listenTarget.kind === "error") {
   console.error(listenTarget.message);
   process.exit(2);
 }
-const parsedMode = parseSocketMode(getFlag(args, "--listen-socket-mode", "0660"));
-if ("error" in parsedMode) {
-  console.error(parsedMode.error);
-  process.exit(2);
-}
-const socketMode = parsedMode.mode;
-
 const groupFlag = getFlag(args, "--listen-socket-group", "");
 let socketGid: number | undefined;
 if (groupFlag !== "") {
@@ -104,53 +89,33 @@ server.once("listening", () => {
   server.on("error", (err) => console.error(`server error: ${err.message}`));
 });
 
-if (listenTarget.kind === "fd") {
-  // systemd socket activation: the socket is already bound and listening,
-  // so we adopt the fd rather than binding a path ourselves.
-  const fd = listenTarget.fd;
-  server.listen({ fd }, () => {
-    // Node hands back whatever the fd actually is. A unit with
-    // ListenStream=127.0.0.1:2375 yields a TCP server, which would silently
-    // reinstate the TCP listener this proxy does not have. address() returns
-    // a string for a Unix socket and an object for TCP.
-    if (typeof server.address() !== "string") {
-      console.error(
-        `fd ${fd} is not a Unix socket: set ListenStream to a filesystem path ` +
-          `in the .socket unit`,
-      );
-      process.exit(1);
-    }
-    console.log(`listening on socket-activated fd ${fd}`);
-  });
-} else {
-  // Remove a stale socket left by a previous run, but only a socket: blindly
-  // unlinking would let a mistyped path silently delete an operator's file.
-  const path = listenTarget.path;
-  try {
-    if (!lstatSync(path).isSocket()) {
-      console.error(`refusing to remove ${path}: not a socket`);
-      process.exit(1);
-    }
-    unlinkSync(path);
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code !== "ENOENT") {
-      console.error(`failed to remove stale socket ${path}: ${e.message}`);
-      process.exit(1);
-    }
+// Remove a stale socket left by a previous run, but only a socket: blindly
+// unlinking would let a mistyped path silently delete an operator's file.
+const path = listenTarget.path;
+try {
+  if (!lstatSync(path).isSocket()) {
+    console.error(`refusing to remove ${path}: not a socket`);
+    process.exit(1);
   }
-  listenOnSocket(server, path, socketMode, socketGid).then(
-    () => {
-      console.log(
-        `listening on unix socket ${path} (mode ${socketMode.toString(8).padStart(4, "0")})`,
-      );
-    },
-    (err: NodeJS.ErrnoException) => {
-      console.error(`failed to listen on ${path}: ${err.message}`);
-      process.exit(1);
-    },
-  );
+  unlinkSync(path);
+} catch (err) {
+  const e = err as NodeJS.ErrnoException;
+  if (e.code !== "ENOENT") {
+    console.error(`failed to remove stale socket ${path}: ${e.message}`);
+    process.exit(1);
+  }
 }
+listenOnSocket(server, path, socketGid).then(
+  () => {
+    console.log(
+      `listening on unix socket ${path} (mode ${SOCKET_MODE.toString(8).padStart(4, "0")})`,
+    );
+  },
+  (err: NodeJS.ErrnoException) => {
+    console.error(`failed to listen on ${path}: ${err.message}`);
+    process.exit(1);
+  },
+);
 
 const shutdown = createShutdown(server);
 

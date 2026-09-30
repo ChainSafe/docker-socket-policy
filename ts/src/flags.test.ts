@@ -4,13 +4,14 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BOOL_FLAGS,
   getFlag,
   hasFlag,
   parseListenSocket,
-  parseSocketMode,
   parseSocketPath,
   resolveGroup,
   validateFlags,
+  VALUE_FLAGS,
 } from "./flags.js";
 
 describe("flags", () => {
@@ -111,6 +112,15 @@ describe("flags", () => {
       // it matches Go's flag package, and the point is that it is not an error.
       assert.equal(check(["--config-dir", "--readonly"]), null);
     });
+
+    // The socket mode is fixed. A deployment still passing the flag must fail
+    // at startup rather than silently get a different mode than it asked for.
+    it("rejects --listen-socket-mode, which this proxy no longer has", () => {
+      assert.match(
+        validateFlags(["--listen-socket-mode=0660"], VALUE_FLAGS, BOOL_FLAGS) ?? "",
+        /unrecognised flag: --listen-socket-mode/,
+      );
+    });
   });
 
   describe("parseListenSocket", () => {
@@ -121,15 +131,12 @@ describe("flags", () => {
       });
     });
 
-    it("accepts fd://3 for systemd socket activation", () => {
-      assert.deepEqual(parseListenSocket("fd://3"), { kind: "fd", fd: 3 });
-    });
-
-    it("rejects socket activation on any fd other than 3", () => {
-      for (const input of ["fd://4", "fd://0", "fd://", "fd://3x", "fd://abc"]) {
+    // Socket activation was removed; fd:// is just another scheme now.
+    it("rejects fd:// addresses, including fd://3", () => {
+      for (const input of ["fd://3", "fd://4", "fd://0", "fd://", "fd://abc"]) {
         const result = parseListenSocket(input);
         assert.ok(result.kind === "error", `expected ${input} to be rejected`);
-        assert.match(result.message, /only supports fd:\/\/3/);
+        assert.match(result.message, /only supports Unix socket paths/);
       }
     });
 
@@ -192,43 +199,6 @@ describe("flags", () => {
     it("rejects empty values", () => {
       assert.match(parseSocketPath("") ?? "", /must not be empty/);
     });
-  });
-});
-
-describe("parseSocketMode", () => {
-  it("accepts octal modes with and without a leading zero", () => {
-    for (const [input, want] of [
-      ["0660", 0o660],
-      ["660", 0o660],
-      ["0600", 0o600],
-      ["0640", 0o640],
-    ] as const) {
-      const got = parseSocketMode(input);
-      assert.deepEqual(got, { mode: want }, `${input} should parse`);
-    }
-  });
-
-  // connect(2) needs write permission, so o+w means every local uid can
-  // connect. There is deliberately no opt-out for this.
-  it("rejects world-writable modes", () => {
-    for (const input of ["0666", "0777", "0602"]) {
-      const got = parseSocketMode(input);
-      assert.ok("error" in got, `${input} should be rejected`);
-      assert.match(got.error, /world-writable/);
-    }
-  });
-
-  it("rejects malformed and out-of-range modes", () => {
-    for (const [input, want] of [
-      ["", /must not be empty/],
-      ["0x1ff", /not an octal mode/],
-      ["668", /not an octal mode/],
-      ["1777", /within 0777/],
-    ] as const) {
-      const got = parseSocketMode(input);
-      assert.ok("error" in got, `${input} should be rejected`);
-      assert.match(got.error, want);
-    }
   });
 });
 

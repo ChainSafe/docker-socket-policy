@@ -21,6 +21,16 @@ export function hasFlag(args: string[], name: string): boolean {
   return args.includes(name) || args.some((a) => a.startsWith(prefix));
 }
 
+// The flags the proxy accepts, for validateFlags.
+export const VALUE_FLAGS = [
+  "--listen-socket",
+  "--docker-host",
+  "--config-dir",
+  "--log-file",
+  "--listen-socket-group",
+];
+export const BOOL_FLAGS = ["--readonly"];
+
 // Rejects anything not recognised. Go's flag package and Rust's clap both exit
 // non-zero on an unrecognised argument; without this the hand-rolled parser
 // above would silently ignore one. That matters most for flags this proxy
@@ -56,32 +66,18 @@ export function validateFlags(
   return null;
 }
 
-// Raw fd systemd passes for the first socket under socket activation
-// (sd_listen_fds convention: fds start at 3).
-export const SYSTEMD_SOCKET_FD = 3;
-
 // Where the proxy should listen. The proxy listens on a Unix socket only:
 // filesystem ownership on that socket is the access-control boundary, and a
 // TCP listener would carry no peer identity at all.
 export type ListenTarget =
-  | { kind: "fd"; fd: number }
   | { kind: "path"; path: string }
   | { kind: "error"; message: string };
 
-// Parses --listen-socket. "fd://3" selects systemd socket activation (the
-// socket is already bound; we adopt the fd). Any other value is a filesystem
-// path. Mirrors bindUnixListener in Go and bind_unix_listener in Rust.
+// Parses --listen-socket, which must be an absolute filesystem path. Mirrors
+// validateListenSocket in Go and validate_listen_socket in Rust.
 export function parseListenSocket(input: string): ListenTarget {
-  if (input === `fd://${SYSTEMD_SOCKET_FD}`) {
-    return { kind: "fd", fd: SYSTEMD_SOCKET_FD };
-  }
-  if (input.startsWith("fd://")) {
-    return {
-      kind: "error",
-      message: `--listen-socket only supports fd://${SYSTEMD_SOCKET_FD} for socket activation, got: ${input}`,
-    };
-  }
   if (
+    input.startsWith("fd://") ||
     input.startsWith("tcp://") ||
     input.startsWith("http://") ||
     input.startsWith("https://") ||
@@ -112,42 +108,16 @@ export function parseListenSocket(input: string): ListenTarget {
   return { kind: "path", path: input };
 }
 
-// Mode applied to the listening socket when --listen-socket-mode is omitted.
-// connect(2) on an AF_UNIX socket requires write permission, so 0o660 is what
-// actually grants the owning group access.
-export const DEFAULT_LISTEN_SOCKET_MODE = 0o660;
+// Mode applied to the listening socket. connect(2) on an AF_UNIX socket
+// requires write permission, so 0o660 is what actually grants the owning group
+// access.
+export const SOCKET_MODE = 0o660;
 
 // Set around bind(2) so the socket is created at 0600 and is never briefly
 // reachable by group or world. bind() applies 0777 & ~umask, and
 // 0777 & ~0177 === 0600. Correcting with chmod afterwards would leave a window
 // in which the socket is already listening at the ambient mode.
 export const BIND_UMASK = 0o177;
-
-export type SocketMode = { mode: number } | { error: string };
-
-// Parses an octal mode and rejects anything world-writable. A world-writable
-// socket is connectable by every local uid, which removes the boundary
-// entirely, so there is deliberately no opt-out.
-export function parseSocketMode(input: string): SocketMode {
-  if (input.length === 0) {
-    return { error: "--listen-socket-mode must not be empty" };
-  }
-  if (!/^[0-7]+$/.test(input)) {
-    return { error: `--listen-socket-mode ${JSON.stringify(input)}: not an octal mode` };
-  }
-  const mode = parseInt(input, 8);
-  if (mode > 0o777) {
-    return { error: `--listen-socket-mode ${JSON.stringify(input)}: must be within 0777` };
-  }
-  if (mode & 0o002) {
-    return {
-      error:
-        `--listen-socket-mode ${JSON.stringify(input)} is world-writable: every local user ` +
-        `could connect to the proxy, which disables the access-control boundary`,
-    };
-  }
-  return { mode };
-}
 
 export type GroupId = { gid: number } | { error: string };
 
