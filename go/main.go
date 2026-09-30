@@ -27,7 +27,7 @@ var Version = "dev"
 
 func main() {
 	listenSocket := flag.String("listen-socket", "/var/run/docker-socket-policy.sock",
-		"Unix socket to listen on (or fd://3 for systemd socket activation)")
+		"Unix socket path to listen on")
 	dockerHost := flag.String("docker-host", "/var/run/docker.sock",
 		"Docker daemon socket path")
 	configDir := flag.String("config-dir", "/etc/docker-socket-policy/services",
@@ -36,10 +36,8 @@ func main() {
 		"Audit log file (JSON)")
 	readonly := flag.Bool("readonly", false,
 		"Enable read-only mode (deny all POST/PUT/DELETE)")
-	listenSocketMode := flag.String("listen-socket-mode", "0660",
-		"Octal mode for the listening socket (ignored for fd://3)")
 	listenSocketGroup := flag.String("listen-socket-group", "",
-		"Group name or gid to own the listening socket (ignored for fd://3)")
+		"Group name or gid to own the listening socket")
 	flag.Parse()
 
 	if err := validateListenSocket(*listenSocket); err != nil {
@@ -47,11 +45,6 @@ func main() {
 		os.Exit(2)
 	}
 	if err := validateDockerHost(*dockerHost); err != nil {
-		slog.Error(err.Error())
-		os.Exit(2)
-	}
-	socketMode, err := parseSocketMode(*listenSocketMode)
-	if err != nil {
 		slog.Error(err.Error())
 		os.Exit(2)
 	}
@@ -83,7 +76,7 @@ func main() {
 	transport := proxy.NewTransport(*dockerHost)
 	handler := proxy.NewHandler(router, chain, auditLog, transport)
 
-	listener, err := unixListener(*listenSocket, socketMode, socketGID)
+	listener, err := unixListener(*listenSocket, socketGID)
 	if err != nil {
 		slog.Error("failed to start listener", "addr", *listenSocket, "error", err)
 		os.Exit(1)
@@ -101,10 +94,6 @@ func main() {
 	slog.Info("shutdown complete")
 }
 
-// systemdSocketFD is the first fd systemd passes under socket activation
-// (sd_listen_fds convention: fds start at 3).
-const systemdSocketFD = 3
-
 // validateListenSocket rejects --listen-socket values that would not produce a
 // filesystem-visible Unix socket. Without this, several of them bind something
 // surprising rather than failing: "tcp://0.0.0.0:2375" becomes a file named
@@ -115,12 +104,8 @@ func validateListenSocket(addr string) error {
 	switch {
 	case addr == "":
 		return errors.New("--listen-socket must not be empty")
-	case addr == fmt.Sprintf("fd://%d", systemdSocketFD):
-		return nil
-	case strings.HasPrefix(addr, "fd://"):
-		return fmt.Errorf("--listen-socket only supports fd://%d for socket activation, got: %s",
-			systemdSocketFD, addr)
-	case strings.HasPrefix(addr, "tcp://"),
+	case strings.HasPrefix(addr, "fd://"),
+		strings.HasPrefix(addr, "tcp://"),
 		strings.HasPrefix(addr, "http://"),
 		strings.HasPrefix(addr, "https://"),
 		strings.HasPrefix(addr, "unix://"):
@@ -149,31 +134,10 @@ func validateDockerHost(addr string) error {
 	return nil
 }
 
-// listenerFromFile adopts an already-bound socket, as passed by systemd.
-//
-// Split out from unixListener so the type check can be exercised in tests
-// against an arbitrary fd rather than only against the real fd 3, mirroring
-// Rust's unix_listener_from_raw_fd.
-func listenerFromFile(f *os.File) (net.Listener, error) {
-	l, err := net.FileListener(f)
-	if err != nil {
-		return nil, err
-	}
-	// net.FileListener returns whatever the fd actually is. A unit with
-	// ListenStream=127.0.0.1:2375 hands back a TCP socket, and serving it
-	// would silently reinstate the TCP listener this proxy does not have.
-	if _, ok := l.(*net.UnixListener); !ok {
-		l.Close()
-		return nil, fmt.Errorf("fd %d is a %T, not a Unix socket: set ListenStream to a "+
-			"filesystem path in the .socket unit", systemdSocketFD, l)
-	}
-	return l, nil
-}
-
-// defaultListenSocketMode is the mode applied to the listening socket when
-// --listen-socket-mode is not given. connect(2) on an AF_UNIX socket requires
-// write permission, so 0660 is what actually grants the owning group access.
-const defaultListenSocketMode = 0o660
+// socketMode is the mode applied to the listening socket. connect(2) on an
+// AF_UNIX socket requires write permission, so 0660 is what actually grants the
+// owning group access.
+const socketMode os.FileMode = 0o660
 
 // bindUmask is set around bind(2) so the socket is created at 0600 and is never
 // briefly reachable by group or world. bind() applies 0777 &^ umask, and
@@ -204,27 +168,6 @@ func resolveGroup(group string) (int, error) {
 	return gid, nil
 }
 
-// parseSocketMode accepts an octal mode and rejects anything world-writable.
-// A world-writable socket is connectable by every local uid, which removes the
-// boundary entirely, so there is deliberately no opt-out.
-func parseSocketMode(s string) (os.FileMode, error) {
-	if s == "" {
-		return 0, fmt.Errorf("--listen-socket-mode must not be empty")
-	}
-	m, err := strconv.ParseUint(s, 8, 32)
-	if err != nil {
-		return 0, fmt.Errorf("--listen-socket-mode %q: not an octal mode", s)
-	}
-	if m > 0o777 {
-		return 0, fmt.Errorf("--listen-socket-mode %q: must be within 0777", s)
-	}
-	if m&0o002 != 0 {
-		return 0, fmt.Errorf("--listen-socket-mode %q is world-writable: every local user "+
-			"could connect to the proxy, which disables the access-control boundary", s)
-	}
-	return os.FileMode(m), nil
-}
-
 // unixListener binds the proxy's only listening socket. Listening is Unix-socket
 // only by design: filesystem ownership on the socket is the access-control
 // boundary, and a TCP listener would have none.
@@ -233,13 +176,7 @@ func parseSocketMode(s string) (os.FileMode, error) {
 // Left to the umask the socket is 0755 by default — connect(2) needs write, so
 // the documented "add the caller to the socket's group" grant does not work —
 // and 0777 under umask 0, which lets any local uid drive the Docker API.
-func unixListener(addr string, mode os.FileMode, gid int) (net.Listener, error) {
-	if addr == fmt.Sprintf("fd://%d", systemdSocketFD) {
-		// Under socket activation systemd owns the socket and applies its own
-		// SocketMode/SocketGroup. Re-chmod'ing it here would fight the unit.
-		return listenerFromFile(os.NewFile(systemdSocketFD, "socket"))
-	}
-
+func unixListener(addr string, gid int) (net.Listener, error) {
 	// Remove a stale socket from a previous run, but only a socket: os.Remove
 	// also unlinks regular files and rmdir's empty directories, so ignoring its
 	// error would let a mistyped path silently delete an operator's data.
@@ -263,7 +200,7 @@ func unixListener(addr string, mode os.FileMode, gid int) (net.Listener, error) 
 		return nil, err
 	}
 
-	// Widen from 0600 to the configured mode only after ownership is right,
+	// Widen from 0600 to socketMode only after ownership is right,
 	// so the socket is never group-reachable by the wrong group.
 	if gid >= 0 {
 		if err := os.Chown(addr, -1, gid); err != nil {
@@ -271,7 +208,7 @@ func unixListener(addr string, mode os.FileMode, gid int) (net.Listener, error) 
 			return nil, fmt.Errorf("setting group on %s: %w", addr, err)
 		}
 	}
-	if err := os.Chmod(addr, mode); err != nil {
+	if err := os.Chmod(addr, socketMode); err != nil {
 		l.Close()
 		return nil, fmt.Errorf("setting mode on %s: %w", addr, err)
 	}

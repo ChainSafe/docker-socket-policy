@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -21,11 +22,12 @@ func TestValidateListenSocket(t *testing.T) {
 		wantErr string // substring; empty means the value must be accepted
 	}{
 		{"absolute path", "/var/run/docker-socket-policy.sock", ""},
-		{"systemd activation", "fd://3", ""},
 		{"empty", "", "must not be empty"},
-		{"other fd", "fd://4", "only supports fd://3"},
-		{"fd zero", "fd://0", "only supports fd://3"},
-		{"fd garbage", "fd://abc", "only supports fd://3"},
+		// Socket activation was removed; fd:// is just another scheme now.
+		{"fd 3", "fd://3", "only supports Unix socket paths"},
+		{"other fd", "fd://4", "only supports Unix socket paths"},
+		{"fd zero", "fd://0", "only supports Unix socket paths"},
+		{"fd garbage", "fd://abc", "only supports Unix socket paths"},
 		// The flag this proxy deliberately no longer has. Someone migrating
 		// from --listen-tcp is likely to carry the value across.
 		{"tcp scheme", "tcp://0.0.0.0:2375", "only supports Unix socket paths"},
@@ -58,6 +60,25 @@ func TestValidateListenSocket(t *testing.T) {
 				t.Fatalf("validateListenSocket(%q) = %q, want it to contain %q", tt.addr, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestListenSocketModeFlagRemoved guards against the flag creeping back: the
+// socket mode is fixed, and a deployment still passing the flag must fail at
+// startup rather than silently get a different mode than it asked for.
+func TestListenSocketModeFlagRemoved(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "docker-socket-policy")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+
+	out, err := exec.Command(bin, "--listen-socket-mode=0660").CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("running with --listen-socket-mode: err = %v, want exit status 2\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "flag provided but not defined") {
+		t.Fatalf("output = %q, want it to contain %q", out, "flag provided but not defined")
 	}
 }
 
@@ -110,7 +131,7 @@ func shortTempDir(t *testing.T) string {
 func TestUnixListenerBindsFreshPath(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "fresh.sock")
 
-	l, err := unixListener(path, defaultListenSocketMode, -1)
+	l, err := unixListener(path, -1)
 	if err != nil {
 		t.Fatalf("unixListener(%q) = %v, want nil", path, err)
 	}
@@ -142,7 +163,7 @@ func TestUnixListenerReplacesStaleSocket(t *testing.T) {
 	}
 	_ = stale
 
-	l, err := unixListener(path, defaultListenSocketMode, -1)
+	l, err := unixListener(path, -1)
 	if err != nil {
 		t.Fatalf("unixListener over stale socket = %v, want nil", err)
 	}
@@ -158,7 +179,7 @@ func TestUnixListenerRefusesToDeleteNonSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := unixListener(path, defaultListenSocketMode, -1); err == nil {
+		if _, err := unixListener(path, -1); err == nil {
 			t.Fatal("unixListener over a regular file = nil, want error")
 		} else if !strings.Contains(err.Error(), "not a socket") {
 			t.Fatalf("error = %q, want it to mention 'not a socket'", err)
@@ -177,68 +198,13 @@ func TestUnixListenerRefusesToDeleteNonSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := unixListener(path, defaultListenSocketMode, -1); err == nil {
+		if _, err := unixListener(path, -1); err == nil {
 			t.Fatal("unixListener over a directory = nil, want error")
 		}
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("directory was removed: %v", err)
 		}
 	})
-}
-
-// TestListenerFromFileRejectsTCPSocket is the regression guard for the hole
-// that motivated validating socket activation at all: net.FileListener returns
-// whatever the fd actually is, so a .socket unit with
-// ListenStream=127.0.0.1:2375 would otherwise reinstate a TCP listener while
-// the proxy logged "listening network=unix".
-func TestListenerFromFileRejectsTCPSocket(t *testing.T) {
-	tcp, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("creating TCP listener: %v", err)
-	}
-	defer tcp.Close()
-
-	f, err := tcp.(*net.TCPListener).File()
-	if err != nil {
-		t.Fatalf("extracting TCP fd: %v", err)
-	}
-	defer f.Close()
-
-	l, err := listenerFromFile(f)
-	if err == nil {
-		l.Close()
-		t.Fatal("listenerFromFile accepted a TCP socket, want an error")
-	}
-	if !strings.Contains(err.Error(), "not a Unix socket") {
-		t.Fatalf("error = %q, want it to mention 'not a Unix socket'", err)
-	}
-}
-
-// TestListenerFromFileAcceptsUnixSocket is the positive half: genuine socket
-// activation must still work.
-func TestListenerFromFileAcceptsUnixSocket(t *testing.T) {
-	path := filepath.Join(shortTempDir(t), "activated.sock")
-	unix, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("creating Unix listener: %v", err)
-	}
-	defer unix.Close()
-
-	f, err := unix.(*net.UnixListener).File()
-	if err != nil {
-		t.Fatalf("extracting Unix fd: %v", err)
-	}
-	defer f.Close()
-
-	l, err := listenerFromFile(f)
-	if err != nil {
-		t.Fatalf("listenerFromFile on a Unix socket = %v, want nil", err)
-	}
-	defer l.Close()
-
-	if _, ok := l.(*net.UnixListener); !ok {
-		t.Fatalf("listenerFromFile returned %T, want *net.UnixListener", l)
-	}
 }
 
 // unixClient returns an HTTP client that talks to a Unix socket.
@@ -260,7 +226,7 @@ func unixClient(path string) *http.Client {
 // suites assert HTTP status codes and cannot observe process lifecycle.
 func TestServeReturnsPromptlyWhenIdle(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "idle.sock")
-	l, err := unixListener(path, defaultListenSocketMode, -1)
+	l, err := unixListener(path, -1)
 	if err != nil {
 		t.Fatalf("unixListener: %v", err)
 	}
@@ -283,7 +249,7 @@ func TestServeReturnsPromptlyWhenIdle(t *testing.T) {
 // signal arrives must be allowed to finish.
 func TestServeWaitsForInFlightRequest(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "inflight.sock")
-	l, err := unixListener(path, defaultListenSocketMode, -1)
+	l, err := unixListener(path, -1)
 	if err != nil {
 		t.Fatalf("unixListener: %v", err)
 	}
@@ -342,7 +308,7 @@ func TestServeWaitsForInFlightRequest(t *testing.T) {
 // closed, not merely ignored: a connection attempt after shutdown must fail.
 func TestServeStopsAcceptingAfterShutdown(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "closed.sock")
-	l, err := unixListener(path, defaultListenSocketMode, -1)
+	l, err := unixListener(path, -1)
 	if err != nil {
 		t.Fatalf("unixListener: %v", err)
 	}
@@ -357,70 +323,24 @@ func TestServeStopsAcceptingAfterShutdown(t *testing.T) {
 	}
 }
 
-func TestParseSocketMode(t *testing.T) {
-	tests := []struct {
-		name    string
-		in      string
-		want    os.FileMode
-		wantErr string
-	}{
-		{"default", "0660", 0o660, ""},
-		{"no leading zero", "660", 0o660, ""},
-		{"owner only", "0600", 0o600, ""},
-		{"group read only", "0640", 0o640, ""},
-		{"empty", "", 0, "must not be empty"},
-		{"not octal", "0x1ff", 0, "not an octal mode"},
-		{"decimal 8 is invalid octal", "668", 0, "not an octal mode"},
-		{"too wide", "1777", 0, "within 0777"},
-		// connect(2) needs write, so o+w means every local uid can connect.
-		{"world writable", "0666", 0, "world-writable"},
-		{"world writable 0777", "0777", 0, "world-writable"},
-		{"world writable 0602", "0602", 0, "world-writable"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseSocketMode(tt.in)
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Fatalf("parseSocketMode(%q) = %v, want nil", tt.in, err)
-				}
-				if got != tt.want {
-					t.Fatalf("parseSocketMode(%q) = %o, want %o", tt.in, got, tt.want)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("parseSocketMode(%q) = nil error, want %q", tt.in, tt.wantErr)
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("parseSocketMode(%q) error = %q, want it to contain %q", tt.in, err, tt.wantErr)
-			}
-		})
-	}
-}
-
 // TestUnixListenerAppliesMode is the regression test for #40: the mode used to
 // be whatever the umask left behind, which is 0755 by default. connect(2)
 // requires write permission, so the group grant the README documents silently
 // did not work, and under umask 0 the socket was 0777 to every local uid.
 func TestUnixListenerAppliesMode(t *testing.T) {
-	for _, mode := range []os.FileMode{0o660, 0o600, 0o640} {
-		t.Run(fmt.Sprintf("%o", mode), func(t *testing.T) {
-			path := filepath.Join(shortTempDir(t), "mode.sock")
-			l, err := unixListener(path, mode, -1)
-			if err != nil {
-				t.Fatalf("unixListener: %v", err)
-			}
-			defer l.Close()
+	path := filepath.Join(shortTempDir(t), "mode.sock")
+	l, err := unixListener(path, -1)
+	if err != nil {
+		t.Fatalf("unixListener: %v", err)
+	}
+	defer l.Close()
 
-			info, err := os.Lstat(path)
-			if err != nil {
-				t.Fatalf("stat: %v", err)
-			}
-			if got := info.Mode().Perm(); got != mode {
-				t.Fatalf("socket mode = %o, want %o", got, mode)
-			}
-		})
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o660 {
+		t.Fatalf("socket mode = %o, want 0660", got)
 	}
 }
 
@@ -431,7 +351,7 @@ func TestUnixListenerIgnoresAmbientUmask(t *testing.T) {
 	defer syscall.Umask(old)
 
 	path := filepath.Join(shortTempDir(t), "umask.sock")
-	l, err := unixListener(path, 0o660, -1)
+	l, err := unixListener(path, -1)
 	if err != nil {
 		t.Fatalf("unixListener: %v", err)
 	}
