@@ -1,5 +1,4 @@
 import { createServer } from "node:http";
-import { lstatSync, unlinkSync } from "node:fs";
 import { AuditLogger } from "./audit.js";
 import { Chain } from "./middleware.js";
 import { Manager } from "./policy.js";
@@ -7,7 +6,7 @@ import { Router } from "./proxy.js";
 import { Handler } from "./handler.js";
 import { Transport } from "./transport.js";
 import { createShutdown } from "./shutdown.js";
-import { listenOnSocket } from "./listen.js";
+import { openListener } from "./listen.js";
 import {
   BOOL_FLAGS,
   getFlag,
@@ -15,6 +14,7 @@ import {
   parseListenSocket,
   parseSocketPath,
   resolveGroup,
+  selectSocketGroup,
   SOCKET_MODE,
   validateFlags,
   VALUE_FLAGS,
@@ -40,16 +40,19 @@ if (listenTarget.kind === "error") {
   console.error(listenTarget.message);
   process.exit(2);
 }
-const groupFlag = getFlag(args, "--listen-socket-group", "");
-let socketGid: number | undefined;
-if (groupFlag !== "") {
-  const resolved = resolveGroup(groupFlag);
-  if ("error" in resolved) {
-    console.error(resolved.error);
-    process.exit(2);
-  }
-  socketGid = resolved.gid;
+const groupSelection = selectSocketGroup(
+  hasFlag(args, "--listen-socket-group") ? getFlag(args, "--listen-socket-group", "") : undefined,
+  resolveGroup,
+  process.getegid!(),
+);
+if ("error" in groupSelection) {
+  console.error(groupSelection.error);
+  process.exit(2);
 }
+if (groupSelection.warning) {
+  console.warn(groupSelection.warning);
+}
+const socketGid = groupSelection.gid;
 
 const configDir = getFlag(args, "--config-dir", "/etc/docker-socket-policy/services");
 const logFile = getFlag(args, "--log-file", "/var/log/docker-socket-policy.log");
@@ -89,23 +92,8 @@ server.once("listening", () => {
   server.on("error", (err) => console.error(`server error: ${err.message}`));
 });
 
-// Remove a stale socket left by a previous run, but only a socket: blindly
-// unlinking would let a mistyped path silently delete an operator's file.
 const path = listenTarget.path;
-try {
-  if (!lstatSync(path).isSocket()) {
-    console.error(`refusing to remove ${path}: not a socket`);
-    process.exit(1);
-  }
-  unlinkSync(path);
-} catch (err) {
-  const e = err as NodeJS.ErrnoException;
-  if (e.code !== "ENOENT") {
-    console.error(`failed to remove stale socket ${path}: ${e.message}`);
-    process.exit(1);
-  }
-}
-listenOnSocket(server, path, socketGid).then(
+openListener(server, path, socketGid).then(
   () => {
     console.log(
       `listening on unix socket ${path} (mode ${SOCKET_MODE.toString(8).padStart(4, "0")})`,

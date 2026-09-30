@@ -121,6 +121,35 @@ export const BIND_UMASK = 0o177;
 
 export type GroupId = { gid: number } | { error: string };
 
+// The group the socket is given when --listen-socket-group is not passed.
+export const DEFAULT_SOCKET_GROUP = "docker-socket-policy";
+
+// Picks the socket's group the way dockerd does
+// (moby/daemon/listeners/listeners_linux.go). An undefined flag means the flag
+// was not passed: the default group is used if it exists, and otherwise the
+// proxy falls back to its own group with a warning. An explicit group that
+// does not resolve is an error. An explicit "" selects the proxy's own group.
+export function selectSocketGroup(
+  flag: string | undefined,
+  lookup: (name: string) => GroupId,
+  egid: number,
+): { gid: number; warning?: string } | { error: string } {
+  if (flag === undefined) {
+    const found = lookup(DEFAULT_SOCKET_GROUP);
+    if ("error" in found) {
+      return {
+        gid: egid,
+        warning: `group ${DEFAULT_SOCKET_GROUP} not found, using the proxy's own group ${egid}`,
+      };
+    }
+    return { gid: found.gid };
+  }
+  if (flag === "") {
+    return { gid: egid };
+  }
+  return lookup(flag);
+}
+
 // Maps --listen-socket-group to a gid. A numeric value is used as-is so a
 // deployment without the group defined can still be configured.
 //

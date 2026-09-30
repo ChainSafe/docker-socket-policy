@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BOOL_FLAGS,
+  DEFAULT_SOCKET_GROUP,
   getFlag,
+  type GroupId,
+  selectSocketGroup,
   hasFlag,
   parseListenSocket,
   parseSocketPath,
@@ -236,5 +239,72 @@ describe("resolveGroup", () => {
     const got = resolveGroup("docker", "/nonexistent-group-file");
     assert.ok("error" in got);
     assert.match(got.error, /cannot read/);
+  });
+});
+
+// One case per row of the group-selection table in spec/listener-design.md;
+// the test names match the Quint runs.
+describe("selectSocketGroup", () => {
+  const egid = 65532;
+  const known =
+    (groups: Record<string, number>) =>
+    (name: string): GroupId =>
+      name in groups
+        ? { gid: groups[name] }
+        : { error: `--listen-socket-group ${JSON.stringify(name)}: unknown group` };
+  const both = known({ "docker-socket-policy": 2001, ops: 3001 });
+
+  it("groupDefaultPresent: flag absent, default group exists", () => {
+    assert.deepEqual(selectSocketGroup(undefined, both, egid), { gid: 2001 });
+  });
+
+  it("groupDefaultMissingWarns: flag absent, default group missing", () => {
+    assert.deepEqual(selectSocketGroup(undefined, known({}), egid), {
+      gid: egid,
+      warning: "group docker-socket-policy not found, using the proxy's own group 65532",
+    });
+  });
+
+  it("groupExplicitPresent: explicit group exists", () => {
+    assert.deepEqual(selectSocketGroup("ops", both, egid), { gid: 3001 });
+  });
+
+  it("groupExplicitMissingFails: explicit group missing", () => {
+    const got = selectSocketGroup("nope", both, egid);
+    assert.ok("error" in got, `want an error, got ${JSON.stringify(got)}`);
+  });
+
+  it("groupEmptyUsesOwn: explicit empty uses the proxy's own group", () => {
+    assert.deepEqual(selectSocketGroup("", both, egid), { gid: egid });
+  });
+
+  it("uses the default group name", () => {
+    assert.equal(DEFAULT_SOCKET_GROUP, "docker-socket-policy");
+  });
+});
+
+// An explicit empty value means "the proxy's own group" and must not be
+// confused with the flag being absent, which means the default group. This is
+// the expression index.ts uses.
+describe("--listen-socket-group empty vs absent", () => {
+  const groupFlag = (args: string[]) =>
+    hasFlag(args, "--listen-socket-group")
+      ? getFlag(args, "--listen-socket-group", "")
+      : undefined;
+
+  it("absent", () => {
+    assert.equal(groupFlag([]), undefined);
+  });
+
+  it("equals empty", () => {
+    assert.equal(groupFlag(["--listen-socket-group="]), "");
+  });
+
+  it("separate empty", () => {
+    assert.equal(groupFlag(["--listen-socket-group", ""]), "");
+  });
+
+  it("named", () => {
+    assert.equal(groupFlag(["--listen-socket-group=ops"]), "ops");
   });
 });
