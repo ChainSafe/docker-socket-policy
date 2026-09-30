@@ -93,6 +93,7 @@ ci-verify:
 
 release-verify:
 	$(MAKE) typecheck
+	$(MAKE) test-spec
 	$(MAKE) verify BACKEND=rust
 	$(MAKE) test-all
 	$(MAKE) test-integration
