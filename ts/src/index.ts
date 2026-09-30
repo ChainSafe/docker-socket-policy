@@ -1,5 +1,4 @@
 import { createServer } from "node:http";
-import { lstatSync, unlinkSync } from "node:fs";
 import { AuditLogger } from "./audit.js";
 import { Chain } from "./middleware.js";
 import { Manager } from "./policy.js";
@@ -7,28 +6,21 @@ import { Router } from "./proxy.js";
 import { Handler } from "./handler.js";
 import { Transport } from "./transport.js";
 import { createShutdown } from "./shutdown.js";
-import { listenOnSocket } from "./listen.js";
+import { openListener } from "./listen.js";
 import {
+  BOOL_FLAGS,
   getFlag,
   hasFlag,
   parseListenSocket,
-  parseSocketMode,
   parseSocketPath,
   resolveGroup,
+  selectSocketGroup,
+  SOCKET_MODE,
   validateFlags,
+  VALUE_FLAGS,
 } from "./flags.js";
 
 const args = process.argv.slice(2);
-
-const VALUE_FLAGS = [
-  "--listen-socket",
-  "--docker-host",
-  "--config-dir",
-  "--log-file",
-  "--listen-socket-mode",
-  "--listen-socket-group",
-];
-const BOOL_FLAGS = ["--readonly"];
 
 const flagError = validateFlags(args, VALUE_FLAGS, BOOL_FLAGS);
 if (flagError) {
@@ -48,23 +40,19 @@ if (listenTarget.kind === "error") {
   console.error(listenTarget.message);
   process.exit(2);
 }
-const parsedMode = parseSocketMode(getFlag(args, "--listen-socket-mode", "0660"));
-if ("error" in parsedMode) {
-  console.error(parsedMode.error);
+const groupSelection = selectSocketGroup(
+  hasFlag(args, "--listen-socket-group") ? getFlag(args, "--listen-socket-group", "") : undefined,
+  resolveGroup,
+  process.getegid!(),
+);
+if ("error" in groupSelection) {
+  console.error(groupSelection.error);
   process.exit(2);
 }
-const socketMode = parsedMode.mode;
-
-const groupFlag = getFlag(args, "--listen-socket-group", "");
-let socketGid: number | undefined;
-if (groupFlag !== "") {
-  const resolved = resolveGroup(groupFlag);
-  if ("error" in resolved) {
-    console.error(resolved.error);
-    process.exit(2);
-  }
-  socketGid = resolved.gid;
+if (groupSelection.warning) {
+  console.warn(groupSelection.warning);
 }
+const socketGid = groupSelection.gid;
 
 const configDir = getFlag(args, "--config-dir", "/etc/docker-socket-policy/services");
 const logFile = getFlag(args, "--log-file", "/var/log/docker-socket-policy.log");
@@ -104,53 +92,18 @@ server.once("listening", () => {
   server.on("error", (err) => console.error(`server error: ${err.message}`));
 });
 
-if (listenTarget.kind === "fd") {
-  // systemd socket activation: the socket is already bound and listening,
-  // so we adopt the fd rather than binding a path ourselves.
-  const fd = listenTarget.fd;
-  server.listen({ fd }, () => {
-    // Node hands back whatever the fd actually is. A unit with
-    // ListenStream=127.0.0.1:2375 yields a TCP server, which would silently
-    // reinstate the TCP listener this proxy does not have. address() returns
-    // a string for a Unix socket and an object for TCP.
-    if (typeof server.address() !== "string") {
-      console.error(
-        `fd ${fd} is not a Unix socket: set ListenStream to a filesystem path ` +
-          `in the .socket unit`,
-      );
-      process.exit(1);
-    }
-    console.log(`listening on socket-activated fd ${fd}`);
-  });
-} else {
-  // Remove a stale socket left by a previous run, but only a socket: blindly
-  // unlinking would let a mistyped path silently delete an operator's file.
-  const path = listenTarget.path;
-  try {
-    if (!lstatSync(path).isSocket()) {
-      console.error(`refusing to remove ${path}: not a socket`);
-      process.exit(1);
-    }
-    unlinkSync(path);
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code !== "ENOENT") {
-      console.error(`failed to remove stale socket ${path}: ${e.message}`);
-      process.exit(1);
-    }
-  }
-  listenOnSocket(server, path, socketMode, socketGid).then(
-    () => {
-      console.log(
-        `listening on unix socket ${path} (mode ${socketMode.toString(8).padStart(4, "0")})`,
-      );
-    },
-    (err: NodeJS.ErrnoException) => {
-      console.error(`failed to listen on ${path}: ${err.message}`);
-      process.exit(1);
-    },
-  );
-}
+const path = listenTarget.path;
+openListener(server, path, socketGid).then(
+  () => {
+    console.log(
+      `listening on unix socket ${path} (mode ${SOCKET_MODE.toString(8).padStart(4, "0")})`,
+    );
+  },
+  (err: NodeJS.ErrnoException) => {
+    console.error(`failed to listen on ${path}: ${err.message}`);
+    process.exit(1);
+  },
+);
 
 const shutdown = createShutdown(server);
 

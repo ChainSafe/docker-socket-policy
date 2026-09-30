@@ -123,17 +123,22 @@ make validate
 ### Run
 
 ```bash
-./docker-socket-policy \
+sudo groupadd --system docker-socket-policy
+sudo usermod -aG docker-socket-policy alice
+
+sudo ./docker-socket-policy \
   --listen-socket=/var/run/docker-socket-policy.sock \
-  --listen-socket-group=builders \
   --docker-host=/var/run/docker.sock \
   --config-dir=./config \
   --log-file=/tmp/docker-socket-policy.log
 ```
 
-The socket is created `0660` owned by `--listen-socket-group`, so members of
-that group can connect and nobody else can. Omit the flag and only the proxy's
-own user can reach it.
+Like `docker.sock`, the socket is always created `0660` and owned by the
+`docker-socket-policy` group, so members of that group can connect and nobody
+else can. Grant or revoke access with group membership alone. If the group
+does not exist, the proxy warns and uses its own group instead. See the
+Unix socket security boundary note under [CLI flags](#cli-flags) for the
+details.
 
 ### Configure a Service
 
@@ -217,13 +222,12 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--listen-socket` | `/var/run/docker-socket-policy.sock` | Unix socket to listen on (or `fd://3` for systemd) |
+| `--listen-socket` | `/var/run/docker-socket-policy.sock` | Unix socket path to listen on (absolute filesystem path only) |
 | `--docker-host` | `/var/run/docker.sock` | Docker daemon socket path (Unix socket only) |
 | `--config-dir` | `/etc/docker-socket-policy/services` | Policy config directory |
 | `--log-file` | `/var/log/docker-socket-policy.log` | Audit log path |
 | `--readonly` | `false` | Enable read-only mode |
-| `--listen-socket-mode` | `0660` | Octal mode for the listening socket (ignored for `fd://3`) |
-| `--listen-socket-group` | *(none)* | Group name or gid owning the listening socket (ignored for `fd://3`) |
+| `--listen-socket-group` | `docker-socket-policy` | Group owning the socket (default `docker-socket-policy`; `""` = the proxy's own group) |
 
 > **Unix socket security boundary**: the proxy listens on a Unix socket only,
 > in all three implementations. Access control is the file permissions and Unix
@@ -235,25 +239,76 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > Docker daemon over Unix sockets exclusively and reject `tcp://` and `http://`
 > schemes for `--docker-host`.
 >
-> To grant access, set `--listen-socket-group` to a group, place the caller's
-> container user in that group, and bind-mount the socket in; to revoke it,
-> remove the group membership. If the proxy cannot reach the daemon socket
-> because of its own group permissions, requests surface as `403`.
+> The socket works like `docker.sock`. It is always `0660`, whatever the
+> ambient umask, and there is no flag to change the mode. `connect(2)` on a
+> Unix socket needs **write** permission, so any other mode either locks the
+> group out or opens the socket to every local uid. The group is chosen the way
+> dockerd chooses the `docker` group:
 >
-> The socket is created at `--listen-socket-mode` (default `0660`) regardless of
-> the ambient umask. This matters: `bind(2)` applies `0777 & ~umask`, so left to
-> a default umask the socket would be `0755`, and `connect(2)` on a Unix socket
-> requires **write** permission — the group grant above would silently not work.
-> Under `umask 0` it would be `0777`, reachable by every local uid. A
-> world-writable mode is rejected at startup and there is no opt-out.
+> | `--listen-socket-group` | Group exists | Socket group |
+> |---|---|---|
+> | not passed | yes | `docker-socket-policy` |
+> | not passed | no | the proxy's own group, with the warning `group docker-socket-policy not found, using the proxy's own group <gid>` |
+> | `=name` | yes | that group |
+> | `=name` | no | none: startup fails, exit 2 |
+> | `=gid` | — | that gid, used as-is (no lookup). Digits only, `0-4294967294`; a larger value fails with exit 2 |
+> | `=""` | — | the proxy's own group, no warning |
 >
-> Without `--listen-socket-group` the socket is `0660` owned by the proxy's own
-> user and group, so only that user can connect. The group is what makes the
-> mode useful.
+> To grant access, create the group once and add callers to it:
 >
-> Under `fd://3` the socket belongs to systemd: use `SocketMode=` and
-> `SocketGroup=` in the `.socket` unit instead, as in the example below. Both
-> flags are ignored in that mode.
+> ```bash
+> groupadd --system docker-socket-policy
+> usermod -aG docker-socket-policy alice
+> ```
+>
+> For a container caller, give its user that group (`group_add:`) and
+> bind-mount the socket in. To revoke access, remove the group membership. If
+> the proxy cannot reach the daemon socket because of its own group
+> permissions, requests surface as `403`.
+>
+> To give the socket a group other than its own, a non-root proxy must be a
+> member of that group (`SupplementaryGroups=` / `group_add:`). Otherwise
+> startup fails with exit 1 and the message `cannot give <path> to group <gid>:
+> the proxy's user must be a member of it`. The proxy does not fall back to
+> another group, because a group that exists was chosen on purpose.
+>
+> The socket is bound at `0600`, then given its group, and only then widened
+> to `0660`. It is never reachable by the wrong group, even for a moment.
+>
+> **One instance per socket path.** At startup the proxy handles what it finds
+> at the path as follows:
+>
+> - A stale socket (`connect(2)` is refused) is removed and replaced.
+> - A live socket is refused with `<path> is in use by another process`, exit 1.
+>   The proxy leaves that socket untouched.
+> - A socket that fails `connect(2)` in any other way (for example `EACCES`)
+>   is refused, and the proxy does not remove it.
+> - Anything that is not a socket is refused, and the proxy does not remove it.
+>
+> The Go and Rust implementations also take an exclusive `flock` on
+> `<path>.lock` (mode `0600`) before they touch the socket. They hold it for
+> the life of the process. A second instance fails with `<path> is in use by
+> another instance (lock <path>.lock held)`, exit 1. The kernel releases the
+> lock on any exit, including `SIGKILL`, so a crash never leaves a stale lock.
+> The `.lock` file stays next to the socket after shutdown. **Do not delete
+> it**, especially while the proxy is running: deleting it lets a second
+> instance take the socket. A `.lock` left by another uid (for example an
+> earlier run as root on a persistent volume) makes startup fail with
+> `opening lock …` and a permission-denied error, exit 1; delete that lock file only when
+> no instance is running.
+>
+> *TypeScript exception:* Node has no `flock`, so the TypeScript
+> implementation takes no lock and relies on the live-socket check alone. If
+> two TypeScript instances start on the same path within the same few
+> milliseconds, both can see the old socket as stale. The second one then
+> removes the first one's new socket and binds its own, and the first keeps
+> running but nothing can reach it. An instance that starts after another is
+> already listening is still refused. Node also unlinks its socket path on
+> close, so stopping the orphaned instance (the obvious remedy) deletes the
+> surviving instance's live socket; restart the survivor afterwards. The same
+> holds when a Go or Rust instance is the orphan in a race with TypeScript.
+> This gap is tracked in
+> [#46](https://github.com/ChainSafe/docker-socket-policy/issues/46).
 >
 > **What the socket does not give you is per-service isolation.** The proxy
 > performs no caller authentication: it selects a policy from the `Image` field
@@ -264,32 +319,51 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > services from one another, run a proxy instance per service, each with its own
 > socket and a `--config-dir` containing only that service's policy.
 
-### Systemd Socket Activation
+### systemd Service
 
-**`docker-socket-policy.socket`**:
-```ini
-[Socket]
-ListenStream=/var/run/docker-socket-policy.sock
-SocketMode=0660
-SocketGroup=builders
+The proxy always creates its own socket. systemd socket activation
+(`fd://`) is not supported, so the proxy never listens on a socket it did not
+create. Run it as a plain service:
+
+```bash
+sudo groupadd --system docker-socket-policy   # skip if it already exists
+sudo useradd --system --no-create-home -g docker-socket-policy docker-socket-policy
+sudo usermod -aG docker-socket-policy alice   # grant a caller access
 ```
 
 **`docker-socket-policy.service`**:
 ```ini
 [Service]
 ExecStart=/usr/local/bin/docker-socket-policy \
-  --listen-socket=fd://3 \
+  --listen-socket=/run/docker-socket-policy/docker-socket-policy.sock \
   --docker-host=/var/run/docker.sock \
   --config-dir=/etc/docker-socket-policy/services \
-  --log-file=/var/log/docker-socket-policy.log
+  --log-file=/var/log/docker-socket-policy/audit.log
 User=docker-socket-policy
+Group=docker-socket-policy
+# Reach the Docker daemon socket.
+SupplementaryGroups=docker
+# A non-root proxy cannot create files in /var/run; systemd creates this
+# directory for it, owned by User=/Group=.
+RuntimeDirectory=docker-socket-policy
+RuntimeDirectoryMode=0755
+LogsDirectory=docker-socket-policy
 Restart=on-failure
 NoNewPrivileges=true
 ```
 
+`Group=docker-socket-policy` makes that group the proxy's own group, so it
+can give the socket to it. `docker-socket-policy.sock.lock` is created next
+to the socket in the same directory. Callers then use
+`DOCKER_HOST=unix:///run/docker-socket-policy/docker-socket-policy.sock`.
+
+To use a different group, pass `--listen-socket-group=<name>` and add that
+group to `SupplementaryGroups=`. Otherwise startup fails with the
+"must be a member of it" error.
+
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition.
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants.
 
 The CI pipeline runs verification on every push and PR. A violation blocks the build.
 
@@ -297,6 +371,7 @@ The CI pipeline runs verification on every push and PR. A violation blocks the b
 make typecheck            # Quint type-check (proves type safety)
 make verify               # Random-simulation verification (default evaluator)
 make verify BACKEND=rust  # Same, using the faster Rust backend
+make test-spec            # Quint `run` tests for listener.qnt (one per design-table row)
 make validate             # All checks: typecheck + verify + go vet + go test
 ```
 

@@ -3,6 +3,8 @@
 # Tests that the proxy correctly handles group-restricted Docker sockets.
 # proxy-granted runs with GID 2001 (in dockertest group) → should work
 # proxy-denied runs with GID 3001 (not in dockertest group) → should fail with 403
+# proxy-default-group runs with GID 65532 plus supplementary 2001, which the
+# mounted /etc/group names docker-socket-policy → socket gets the default group
 
 set -e
 
@@ -13,6 +15,7 @@ FAIL=0
 # of the URL is ignored when curl is given --unix-socket, but must still parse.
 GRANTED_SOCK="${PROXY_GRANTED_SOCK:-/sock/granted.sock}"
 DENIED_SOCK="${PROXY_DENIED_SOCK:-/sock/denied.sock}"
+DEFAULT_SOCK="${PROXY_DEFAULT_SOCK:-/sock/default.sock}"
 URL="http://localhost"
 
 # busybox wget cannot speak to a Unix socket, so the helpers below need curl.
@@ -113,6 +116,30 @@ if [ $i -eq 15 ]; then
   fi
   exit 1
 fi
+
+# proxy-default-group has group access to docker.sock like proxy-granted, so
+# it answers 200 once ready.
+echo "Waiting for proxy-default-group at $DEFAULT_SOCK..."
+i=0
+while [ $i -lt 30 ]; do
+  S=$(get_status "$DEFAULT_SOCK" "$URL/_ping")
+  if [ "$S" = "200" ]; then
+    echo "proxy-default-group ready."
+    break
+  fi
+  printf "."
+  sleep 1
+  i=$((i + 1))
+done
+if [ $i -eq 30 ]; then
+  echo ""
+  if [ ! -S "$DEFAULT_SOCK" ]; then
+    echo "ERROR: proxy-default-group never created $DEFAULT_SOCK — it failed to bind"
+  else
+    echo "ERROR: proxy-default-group is listening but not answering after 30s"
+  fi
+  exit 1
+fi
 echo ""
 
 # ─── Listening socket permissions ─────────────────────
@@ -127,7 +154,7 @@ MODE=$(stat -c '%a' "$GRANTED_SOCK" 2>/dev/null || echo "?")
 check "granted.sock mode is 660, not the umask default" "660" "$MODE"
 
 GROUP=$(stat -c '%g' "$GRANTED_SOCK" 2>/dev/null || echo "?")
-check "granted.sock is owned by --listen-socket-group 2001" "2001" "$GROUP"
+check "granted.sock is owned by the proxy's own group 2001 (default group absent)" "2001" "$GROUP"
 
 # The specific failure mode that removes the boundary entirely.
 case "$MODE" in
@@ -143,6 +170,15 @@ esac
 
 MODE=$(stat -c '%a' "$DENIED_SOCK" 2>/dev/null || echo "?")
 check "denied.sock mode is 660" "660" "$MODE"
+
+# proxy-default-group runs with primary gid 65532 but has docker-socket-policy
+# (2001) in its mounted /etc/group and its supplementary groups, so the
+# dockerd-style default applies instead of the egid fallback.
+MODE=$(stat -c '%a' "$DEFAULT_SOCK" 2>/dev/null || echo "?")
+check "default.sock mode is 660" "660" "$MODE"
+
+GROUP=$(stat -c '%g' "$DEFAULT_SOCK" 2>/dev/null || echo "?")
+check "default.sock owned by docker-socket-policy (2001)" "2001" "$GROUP"
 
 echo ""
 
@@ -168,6 +204,14 @@ else
   echo "  FAIL: create container (expected 201|404, got $S)"
   FAIL=$((FAIL+1))
 fi
+
+# ─── proxy-default-group: should work ─────────────────
+
+echo ""
+echo "--- proxy-default-group (GID 65532, supplementary 2001) ---"
+
+S=$(get_status "$DEFAULT_SOCK" "$URL/_ping")
+check "GET /_ping -> 200" "200" "$S"
 
 # ─── proxy-denied: should return 403 ──────────────────
 

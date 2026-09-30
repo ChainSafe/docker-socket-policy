@@ -4,13 +4,17 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BOOL_FLAGS,
+  DEFAULT_SOCKET_GROUP,
   getFlag,
+  type GroupId,
+  selectSocketGroup,
   hasFlag,
   parseListenSocket,
-  parseSocketMode,
   parseSocketPath,
   resolveGroup,
   validateFlags,
+  VALUE_FLAGS,
 } from "./flags.js";
 
 describe("flags", () => {
@@ -111,6 +115,15 @@ describe("flags", () => {
       // it matches Go's flag package, and the point is that it is not an error.
       assert.equal(check(["--config-dir", "--readonly"]), null);
     });
+
+    // The socket mode is fixed. A deployment still passing the flag must fail
+    // at startup rather than silently get a different mode than it asked for.
+    it("rejects --listen-socket-mode, which this proxy no longer has", () => {
+      assert.match(
+        validateFlags(["--listen-socket-mode=0660"], VALUE_FLAGS, BOOL_FLAGS) ?? "",
+        /unrecognised flag: --listen-socket-mode/,
+      );
+    });
   });
 
   describe("parseListenSocket", () => {
@@ -121,15 +134,12 @@ describe("flags", () => {
       });
     });
 
-    it("accepts fd://3 for systemd socket activation", () => {
-      assert.deepEqual(parseListenSocket("fd://3"), { kind: "fd", fd: 3 });
-    });
-
-    it("rejects socket activation on any fd other than 3", () => {
-      for (const input of ["fd://4", "fd://0", "fd://", "fd://3x", "fd://abc"]) {
+    // Socket activation was removed; fd:// is just another scheme now.
+    it("rejects fd:// addresses, including fd://3", () => {
+      for (const input of ["fd://3", "fd://4", "fd://0", "fd://", "fd://abc"]) {
         const result = parseListenSocket(input);
         assert.ok(result.kind === "error", `expected ${input} to be rejected`);
-        assert.match(result.message, /only supports fd:\/\/3/);
+        assert.match(result.message, /only supports Unix socket paths/);
       }
     });
 
@@ -195,43 +205,6 @@ describe("flags", () => {
   });
 });
 
-describe("parseSocketMode", () => {
-  it("accepts octal modes with and without a leading zero", () => {
-    for (const [input, want] of [
-      ["0660", 0o660],
-      ["660", 0o660],
-      ["0600", 0o600],
-      ["0640", 0o640],
-    ] as const) {
-      const got = parseSocketMode(input);
-      assert.deepEqual(got, { mode: want }, `${input} should parse`);
-    }
-  });
-
-  // connect(2) needs write permission, so o+w means every local uid can
-  // connect. There is deliberately no opt-out for this.
-  it("rejects world-writable modes", () => {
-    for (const input of ["0666", "0777", "0602"]) {
-      const got = parseSocketMode(input);
-      assert.ok("error" in got, `${input} should be rejected`);
-      assert.match(got.error, /world-writable/);
-    }
-  });
-
-  it("rejects malformed and out-of-range modes", () => {
-    for (const [input, want] of [
-      ["", /must not be empty/],
-      ["0x1ff", /not an octal mode/],
-      ["668", /not an octal mode/],
-      ["1777", /within 0777/],
-    ] as const) {
-      const got = parseSocketMode(input);
-      assert.ok("error" in got, `${input} should be rejected`);
-      assert.match(got.error, want);
-    }
-  });
-});
-
 describe("resolveGroup", () => {
   function groupFile(contents: string): string {
     const p = join(mkdtempSync(join(tmpdir(), "grp-")), "group");
@@ -266,5 +239,91 @@ describe("resolveGroup", () => {
     const got = resolveGroup("docker", "/nonexistent-group-file");
     assert.ok("error" in got);
     assert.match(got.error, /cannot read/);
+  });
+});
+
+describe("resolveGroup rejects out-of-range gid", () => {
+  // 4294967295 is chown's "don't change" sentinel; larger values do not fit
+  // a gid_t at all.
+  it("accepts 4294967294 and rejects anything above it", () => {
+    assert.deepEqual(resolveGroup("4294967294", "/nonexistent"), { gid: 4294967294 });
+    for (const v of ["4294967295", "4294967296", "12345678901234567890"]) {
+      assert.deepEqual(resolveGroup(v, "/nonexistent"), {
+        error: `--listen-socket-group ${JSON.stringify(v)}: gid out of range (0-4294967294)`,
+      });
+    }
+    // Only a digit string is numeric; a sign makes it a (nonexistent) name.
+    const f = join(mkdtempSync(join(tmpdir(), "grp-")), "group");
+    writeFileSync(f, "root:x:0:\n");
+    for (const v of ["+4294967296", "+5"]) {
+      assert.ok("error" in resolveGroup(v, f), `resolveGroup(${JSON.stringify(v)}) should fail`);
+    }
+  });
+});
+
+// One case per row of the group-selection table in spec/listener-design.md;
+// the test names match the Quint runs.
+describe("selectSocketGroup", () => {
+  const egid = 65532;
+  const known =
+    (groups: Record<string, number>) =>
+    (name: string): GroupId =>
+      name in groups
+        ? { gid: groups[name] }
+        : { error: `--listen-socket-group ${JSON.stringify(name)}: unknown group` };
+  const both = known({ "docker-socket-policy": 2001, ops: 3001 });
+
+  it("groupDefaultPresent: flag absent, default group exists", () => {
+    assert.deepEqual(selectSocketGroup(undefined, both, egid), { gid: 2001 });
+  });
+
+  it("groupDefaultMissingWarns: flag absent, default group missing", () => {
+    assert.deepEqual(selectSocketGroup(undefined, known({}), egid), {
+      gid: egid,
+      warning: "group docker-socket-policy not found, using the proxy's own group 65532",
+    });
+  });
+
+  it("groupExplicitPresent: explicit group exists", () => {
+    assert.deepEqual(selectSocketGroup("ops", both, egid), { gid: 3001 });
+  });
+
+  it("groupExplicitMissingFails: explicit group missing", () => {
+    const got = selectSocketGroup("nope", both, egid);
+    assert.ok("error" in got, `want an error, got ${JSON.stringify(got)}`);
+  });
+
+  it("groupEmptyUsesOwn: explicit empty uses the proxy's own group", () => {
+    assert.deepEqual(selectSocketGroup("", both, egid), { gid: egid });
+  });
+
+  it("uses the default group name", () => {
+    assert.equal(DEFAULT_SOCKET_GROUP, "docker-socket-policy");
+  });
+});
+
+// An explicit empty value means "the proxy's own group" and must not be
+// confused with the flag being absent, which means the default group. This is
+// the expression index.ts uses.
+describe("--listen-socket-group empty vs absent", () => {
+  const groupFlag = (args: string[]) =>
+    hasFlag(args, "--listen-socket-group")
+      ? getFlag(args, "--listen-socket-group", "")
+      : undefined;
+
+  it("absent", () => {
+    assert.equal(groupFlag([]), undefined);
+  });
+
+  it("equals empty", () => {
+    assert.equal(groupFlag(["--listen-socket-group="]), "");
+  });
+
+  it("separate empty", () => {
+    assert.equal(groupFlag(["--listen-socket-group", ""]), "");
+  });
+
+  it("named", () => {
+    assert.equal(groupFlag(["--listen-socket-group=ops"]), "ops");
   });
 });

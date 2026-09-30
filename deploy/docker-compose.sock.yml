@@ -59,10 +59,28 @@ services:
     command:
       - --docker-host=/sock/docker.sock
       - --listen-socket=/sock/granted.sock
-      # Exercises the #40 flags: the socket must come out 0660 owned by this
-      # group regardless of the image's umask.
-      - --listen-socket-mode=0660
-      - --listen-socket-group=2001
+      - --config-dir=/etc/docker-socket-policy/services
+      - --log-file=/tmp/docker-socket-policy.log
+
+  proxy-default-group:
+    build:
+      context: ../${IMPL:-go}
+      dockerfile: Dockerfile
+    # Primary GID 65532, with 2001 only as a supplementary group. The mounted
+    # /etc/group names 2001 docker-socket-policy, so the socket must come out
+    # owned by that default group rather than by the proxy's egid.
+    user: 65532:65532
+    group_add: ["2001"]
+    depends_on:
+      sock-perms:
+        condition: service_healthy
+    volumes:
+      - ./config:/etc/docker-socket-policy/services:ro
+      - ./config/group:/etc/group:ro
+      - sock-data:/sock
+    command:
+      - --docker-host=/sock/docker.sock
+      - --listen-socket=/sock/default.sock
       - --config-dir=/etc/docker-socket-policy/services
       - --log-file=/tmp/docker-socket-policy.log
 
@@ -81,8 +99,6 @@ services:
     command:
       - --docker-host=/sock/docker.sock
       - --listen-socket=/sock/denied.sock
-      - --listen-socket-mode=0660
-      - --listen-socket-group=3001
       - --config-dir=/etc/docker-socket-policy/services
       - --log-file=/tmp/docker-socket-policy.log
 
@@ -93,9 +109,11 @@ services:
     depends_on:
       - proxy-granted
       - proxy-denied
+      - proxy-default-group
     environment:
       PROXY_GRANTED_SOCK: /sock/granted.sock
       PROXY_DENIED_SOCK: /sock/denied.sock
+      PROXY_DEFAULT_SOCK: /sock/default.sock
     volumes:
       - ./test-sock.sh:/test-sock.sh:ro
       - sock-data:/sock

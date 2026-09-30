@@ -18,8 +18,10 @@ deploy/ — Docker Compose + integration tests
 - `make build-go` / `make test-go` / `make lint-go` — Go only
 - `make build-rs` / `make test-rs` / `make lint-rs` — Rust only
 - `make build-ts` / `make test-ts` / `make lint-ts` — TypeScript only
-- `make verify` — Quint spec simulation
+- `make verify` — Quint spec simulation (request handling + listener)
+- `make test-spec` — Quint `run` tests for `spec/listener.qnt`
 - `make test-integration` — Docker Compose integration tests
+- `make test-integration-sock` — listening-socket integration tests (`IMPL=rs|ts` for the others)
 
 ## Architecture (same across all 3 languages)
 - `policy/` — Policy types + Manager (loads YAML from config dir)
@@ -35,16 +37,17 @@ deploy/ — Docker Compose + integration tests
 - Zero external deps where possible (Go: yaml.v3, Rust: tokio/hyper/serde/clap, TS: yaml)
 
 ## Test Coverage
-- Go: 74 unit tests (policy: 10, middleware: 29, proxy: 31, audit: 4)
-- Rust: 112 unit tests (policy: 15, middleware: 50, proxy: 37, handler: 4, audit: 4, transport: 2)
-- TypeScript: 108 unit tests (policy: 10, middleware: 37, proxy: 26, transport: 5, handler: 6, flags: 16, audit: 4)
-- 26 integration tests via deploy/test.sh + docker-compose
+- Go: 97 unit tests (main/listener: 23, policy: 10, middleware: 29, proxy: 31, audit: 4)
+- Rust: 135 unit tests (main/listener: 23, policy: 15, middleware: 50, proxy: 37, handler: 4, audit: 4, transport: 2)
+- TypeScript: 154 unit tests, 1 skipped (flags: 44, listen: 13 incl. 1 skipped concurrency test (#46), middleware: 41, proxy: 26, policy: 10, handler: 6, shutdown: 5, transport: 5, audit: 4)
+- Integration, per implementation: 27 tests via deploy/test.sh and 15 socket tests via deploy/test-sock.sh (docker-compose)
+- Quint: `make test-spec` runs the `spec/listener.qnt` `run` tests
 
 ## Test Conventions
 - Go: stdlib `testing` package, `go test ./...`
 - Rust: `#[cfg(test)]` inline modules, `cargo test`
 - TypeScript: `node:test` framework, `npm run build && node --test dist/*.test.js`
-- Integration: `make test-integration` (26 test cases via Docker Compose)
+- Integration: `make test-integration` (27 test cases) and `make test-integration-sock` (15 socket cases) via Docker Compose
 
 ## Contribution Workflow
 
