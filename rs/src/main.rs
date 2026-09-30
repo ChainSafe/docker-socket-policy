@@ -15,20 +15,19 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixListener as StdUnixListener;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 
-/// Raw fd systemd passes for the first socket under socket activation
-/// (`sd_listen_fds` convention: fds start at 3).
-const SYSTEMD_SOCKET_FD: RawFd = 3;
+/// Mode applied to the listening socket. connect(2) on an AF_UNIX socket
+/// requires write permission, so 0660 is what actually grants the owning group
+/// access.
+const SOCKET_MODE: u32 = 0o660;
 
 /// Pause after a failed `accept` before retrying, so persistent errors
-/// (fd exhaustion, non-listening fd) don't spin the loop at 100% CPU.
+/// (e.g. fd exhaustion) don't spin the loop at 100% CPU.
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Set around bind(2) so the socket is created at 0600 and is never briefly
@@ -60,11 +59,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     readonly: bool,
 
-    /// Octal mode for the listening socket (ignored for fd://3).
-    #[arg(long, default_value = "0660")]
-    listen_socket_mode: String,
-
-    /// Group name or gid to own the listening socket (ignored for fd://3).
+    /// Group name or gid to own the listening socket.
     #[arg(long)]
     listen_socket_group: Option<String>,
 }
@@ -85,13 +80,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!("{}", msg);
         std::process::exit(2);
     }
-    let socket_mode = match parse_socket_mode(&cli.listen_socket_mode) {
-        Ok(m) => m,
-        Err(msg) => {
-            tracing::error!("{}", msg);
-            std::process::exit(2);
-        }
-    };
     let socket_gid = match cli.listen_socket_group.as_deref().map(resolve_group).transpose() {
         Ok(g) => g,
         Err(msg) => {
@@ -144,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind before spawning so a bind failure is fatal: the Unix socket is the
     // process's only listener, so a running-but-unbound proxy is never useful.
-    let listener = bind_unix_listener(&cli.listen_socket, socket_mode, socket_gid).map_err(|e| {
+    let listener = bind_unix_listener(&cli.listen_socket, socket_gid).map_err(|e| {
         tracing::error!("failed to bind unix socket {}: {}", cli.listen_socket, e);
         e
     })?;
@@ -168,17 +156,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// ownership on the socket are the access-control boundary, and a TCP listener
 /// would have neither.
 ///
-/// `fd://3` selects systemd socket activation (the socket is already bound
-/// and listening; we just adopt the fd). Any other value is treated as a
-/// filesystem path: a stale socket left over from a previous run is removed
-/// before binding, matching the Go implementation.
-fn bind_unix_listener(addr: &str, mode: u32, gid: Option<u32>) -> io::Result<tokio::net::UnixListener> {
-    if addr == "fd://3" {
-        // Under socket activation systemd owns the socket and applies its own
-        // SocketMode/SocketGroup; re-chmod'ing here would fight the unit.
-        return unix_listener_from_raw_fd(SYSTEMD_SOCKET_FD);
-    }
-
+/// A stale socket left over from a previous run is removed before binding,
+/// matching the Go implementation.
+fn bind_unix_listener(addr: &str, gid: Option<u32>) -> io::Result<tokio::net::UnixListener> {
     // Remove a stale socket, but only a socket: blindly removing would let a
     // mistyped path silently delete an operator's file, so anything that is
     // not a socket is an error rather than something to clear out of the way.
@@ -205,14 +185,14 @@ fn bind_unix_listener(addr: &str, mode: u32, gid: Option<u32>) -> io::Result<tok
     unsafe { libc::umask(previous) };
     let listener = listener?;
 
-    // Widen from 0600 to the configured mode only once ownership is correct,
+    // Widen from 0600 to SOCKET_MODE only once ownership is correct,
     // so the socket is never reachable by the wrong group.
     if let Some(gid) = gid {
         std::os::unix::fs::chown(addr, None, Some(gid)).map_err(|e| {
             io::Error::new(e.kind(), format!("setting group on {}: {}", addr, e))
         })?;
     }
-    std::fs::set_permissions(addr, std::fs::Permissions::from_mode(mode))
+    std::fs::set_permissions(addr, std::fs::Permissions::from_mode(SOCKET_MODE))
         .map_err(|e| io::Error::new(e.kind(), format!("setting mode on {}: {}", addr, e)))?;
 
     Ok(listener)
@@ -256,44 +236,14 @@ fn resolve_group(group: &str) -> Result<u32, String> {
     Ok(grp.gr_gid)
 }
 
-/// Parses an octal mode and rejects anything world-writable. connect(2) on an
-/// AF_UNIX socket requires write permission, so a world-writable socket is
-/// reachable by every local uid — there is deliberately no opt-out.
-fn parse_socket_mode(s: &str) -> Result<u32, String> {
-    if s.is_empty() {
-        return Err("--listen-socket-mode must not be empty".to_string());
-    }
-    let mode = u32::from_str_radix(s, 8)
-        .map_err(|_| format!("--listen-socket-mode {:?}: not an octal mode", s))?;
-    if mode > 0o777 {
-        return Err(format!("--listen-socket-mode {:?}: must be within 0777", s));
-    }
-    if mode & 0o002 != 0 {
-        return Err(format!(
-            "--listen-socket-mode {:?} is world-writable: every local user could connect \
-             to the proxy, which disables the access-control boundary",
-            s
-        ));
-    }
-    Ok(mode)
-}
-
 /// Rejects `--listen-socket` values that would not produce a filesystem-visible
 /// Unix socket. Several of them otherwise bind something surprising rather than
 /// failing: `tcp://0.0.0.0:2375` becomes a file named `tcp:/0.0.0.0:2375`.
 /// Mirrors `validateListenSocket` in Go and `parseListenSocket` in TypeScript.
 fn validate_listen_socket(addr: &str) -> Result<(), String> {
-    let activation = format!("fd://{}", SYSTEMD_SOCKET_FD);
     if addr.is_empty() {
         Err("--listen-socket must not be empty".to_string())
-    } else if addr == activation {
-        Ok(())
-    } else if addr.starts_with("fd://") {
-        Err(format!(
-            "--listen-socket only supports {} for socket activation, got: {}",
-            activation, addr
-        ))
-    } else if ["tcp://", "http://", "https://", "unix://"]
+    } else if ["fd://", "tcp://", "http://", "https://", "unix://"]
         .iter()
         .any(|s| addr.starts_with(s))
     {
@@ -333,39 +283,6 @@ fn validate_docker_host(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Wraps an existing raw fd as a Tokio `UnixListener`.
-///
-/// Split out from [`bind_unix_listener`] so the fd-adoption mechanics
-/// (set non-blocking, hand to Tokio) can be exercised in tests against an
-/// arbitrary fd, instead of only against the real systemd fd 3.
-fn unix_listener_from_raw_fd(fd: RawFd) -> io::Result<tokio::net::UnixListener> {
-    // SAFETY: `from_raw_fd` requires that we take exclusive ownership of the
-    // fd, which we do — nothing else in this process uses fd 3. The fd itself
-    // comes from user input (`--listen-socket=fd://3`) and may not actually
-    // be a listening AF_UNIX socket; that is not a soundness issue, as misuse
-    // surfaces as an `io::Error` from the syscalls below (or from `accept`),
-    // never as undefined behavior.
-    let std_listener = unsafe { StdUnixListener::from_raw_fd(fd) };
-
-    // Confirm the fd really is an AF_UNIX socket rather than relying on a later
-    // accept to fail. A unit with ListenStream=127.0.0.1:2375 hands us a TCP
-    // socket, and treating it as a Unix socket would either serve plain TCP or
-    // wedge the accept loop warning at every retry.
-    std_listener.local_addr().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "fd {} is not a Unix socket ({}): set ListenStream to a filesystem path \
-                 in the .socket unit",
-                fd, e
-            ),
-        )
-    })?;
-
-    std_listener.set_nonblocking(true)?;
-    tokio::net::UnixListener::from_std(std_listener)
-}
-
 fn spawn_unix_listener(
     handler: Arc<handler::Handler>,
     listener: tokio::net::UnixListener,
@@ -398,8 +315,7 @@ fn spawn_unix_listener(
                         }
                         Err(e) => {
                             // Back off briefly: persistent accept errors
-                            // (e.g. EMFILE, or a bad fd under socket
-                            // activation) would otherwise busy-loop.
+                            // (e.g. EMFILE) would otherwise busy-loop.
                             tracing::warn!("accept error on unix socket: {}", e);
                             tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                         }
@@ -437,13 +353,7 @@ fn spawn_unix_listener(
 /// unlink the path when dropped, so without this a clean exit leaves the socket
 /// file behind. It is recovered on the next start (`bind_unix_listener` clears
 /// a stale socket), but the three implementations should behave the same.
-///
-/// Under socket activation the socket belongs to systemd, which will hand the
-/// same fd to the next start — unlinking it there would break the socket unit.
 fn unlink_listen_socket(addr: &str) {
-    if addr == format!("fd://{}", SYSTEMD_SOCKET_FD) {
-        return;
-    }
     match std::fs::remove_file(addr) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -487,7 +397,7 @@ async fn serve_connection<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::net::UnixListener as StdUnixListener;
 
     fn unique_socket_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("dsp-test-{}.sock", rand::random::<u64>()))
@@ -502,7 +412,7 @@ mod tests {
         drop(stale);
         assert!(path.exists(), "precondition: stale socket should still be on disk");
 
-        let result = bind_unix_listener(path.to_str().unwrap(), 0o660, None);
+        let result = bind_unix_listener(path.to_str().unwrap(), None);
         assert!(
             result.is_ok(),
             "expected stale socket to be removed and bind to succeed: {:?}",
@@ -518,7 +428,7 @@ mod tests {
         let path = unique_socket_path();
         std::fs::write(&path, b"important data").unwrap();
 
-        let result = bind_unix_listener(path.to_str().unwrap(), 0o660, None);
+        let result = bind_unix_listener(path.to_str().unwrap(), None);
         assert!(result.is_err(), "expected a regular file to be refused, not deleted");
         assert!(
             result.unwrap_err().to_string().contains("not a socket"),
@@ -536,16 +446,16 @@ mod tests {
     #[test]
     fn test_validate_listen_socket() {
         // Accepted.
-        for addr in ["/var/run/docker-socket-policy.sock", "fd://3"] {
-            assert!(validate_listen_socket(addr).is_ok(), "{} should be accepted", addr);
-        }
+        assert!(validate_listen_socket("/var/run/docker-socket-policy.sock").is_ok());
 
         // Rejected, with the reason that should be reported.
         let cases = [
             ("", "must not be empty"),
-            ("fd://4", "only supports fd://3"),
-            ("fd://0", "only supports fd://3"),
-            ("fd://abc", "only supports fd://3"),
+            // Socket activation was removed; fd:// is just another scheme now.
+            ("fd://3", "only supports Unix socket paths"),
+            ("fd://4", "only supports Unix socket paths"),
+            ("fd://0", "only supports Unix socket paths"),
+            ("fd://abc", "only supports Unix socket paths"),
             ("tcp://0.0.0.0:2375", "only supports Unix socket paths"),
             ("http://0.0.0.0:2375", "only supports Unix socket paths"),
             ("https://0.0.0.0:2375", "only supports Unix socket paths"),
@@ -563,6 +473,16 @@ mod tests {
                 .expect_err(&format!("{:?} should be rejected", addr));
             assert!(err.contains(want), "error for {:?} was {:?}, want it to contain {:?}", addr, err, want);
         }
+    }
+
+    /// The socket mode is fixed. A deployment still passing the flag must fail
+    /// at startup rather than silently get a different mode than it asked for.
+    #[test]
+    fn test_listen_socket_mode_flag_removed() {
+        let err = Cli::try_parse_from(["x", "--listen-socket-mode=0660"])
+            .err()
+            .expect("--listen-socket-mode should be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -587,40 +507,11 @@ mod tests {
     async fn test_bind_unix_listener_binds_fresh_path() {
         let path = unique_socket_path();
 
-        let result = bind_unix_listener(path.to_str().unwrap(), 0o660, None);
+        let result = bind_unix_listener(path.to_str().unwrap(), None);
         assert!(result.is_ok(), "expected bind to a fresh path to succeed: {:?}", result.err());
         assert!(path.exists(), "expected socket file to be created");
 
         std::fs::remove_file(&path).ok();
-    }
-
-    #[tokio::test]
-    async fn test_unix_listener_from_raw_fd_wraps_existing_socket() {
-        let path = unique_socket_path();
-        let std_listener = StdUnixListener::bind(&path).unwrap();
-        let fd = std_listener.into_raw_fd();
-
-        let result = unix_listener_from_raw_fd(fd);
-        assert!(result.is_ok(), "expected wrapping an existing listening fd to succeed: {:?}", result.err());
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    /// Regression guard for socket activation handing back the wrong socket
-    /// family: a unit with ListenStream=127.0.0.1:2375 would otherwise wedge
-    /// the accept loop instead of failing, while the process looked healthy.
-    #[tokio::test]
-    async fn test_unix_listener_from_raw_fd_rejects_tcp_socket() {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let fd = tcp.into_raw_fd();
-
-        let err = unix_listener_from_raw_fd(fd)
-            .expect_err("expected a TCP socket at the activation fd to be rejected");
-        assert!(
-            err.to_string().contains("not a Unix socket"),
-            "error should explain the fd is not a Unix socket, got: {}",
-            err
-        );
     }
 
     /// Transport that stalls before replying, so a request can be held
@@ -676,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn test_listener_shuts_down_promptly_when_idle() {
         let path = unique_socket_path();
-        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
+        let listener = bind_unix_listener(path.to_str().unwrap(), None).unwrap();
         let (tx, rx) = broadcast::channel::<()>(1);
 
         let handle = spawn_unix_listener(
@@ -702,7 +593,7 @@ mod tests {
     #[tokio::test]
     async fn test_listener_drains_in_flight_request() {
         let path = unique_socket_path();
-        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
+        let listener = bind_unix_listener(path.to_str().unwrap(), None).unwrap();
         let (tx, rx) = broadcast::channel::<()>(1);
 
         let handle = spawn_unix_listener(
@@ -738,43 +629,20 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn test_parse_socket_mode() {
-        for (input, want) in [("0660", 0o660), ("660", 0o660), ("0600", 0o600), ("0640", 0o640)] {
-            assert_eq!(parse_socket_mode(input), Ok(want), "{} should parse", input);
-        }
-        for (input, want) in [
-            ("", "must not be empty"),
-            ("0x1ff", "not an octal mode"),
-            ("668", "not an octal mode"),
-            ("1777", "within 0777"),
-            // connect(2) needs write, so o+w means every local uid can connect.
-            ("0666", "world-writable"),
-            ("0777", "world-writable"),
-            ("0602", "world-writable"),
-        ] {
-            let err = parse_socket_mode(input)
-                .expect_err(&format!("{:?} should be rejected", input));
-            assert!(err.contains(want), "error for {:?} was {:?}", input, err);
-        }
-    }
-
     /// Regression test for #40: the mode used to be whatever the umask left
     /// behind, which is 0755 by default. connect(2) requires write permission,
     /// so the documented group grant silently did not work, and under umask 0
     /// the socket was 0777 to every local uid.
     #[tokio::test]
     async fn test_bind_applies_socket_mode() {
-        for mode in [0o660_u32, 0o600, 0o640] {
-            let path = unique_socket_path();
-            let listener = bind_unix_listener(path.to_str().unwrap(), mode, None).unwrap();
+        let path = unique_socket_path();
+        let listener = bind_unix_listener(path.to_str().unwrap(), None).unwrap();
 
-            let got = std::fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(got, mode, "socket mode was {:o}, want {:o}", got, mode);
+        let got = std::fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(got, 0o660, "socket mode was {:o}, want 0660", got);
 
-            drop(listener);
-            std::fs::remove_file(&path).ok();
-        }
+        drop(listener);
+        std::fs::remove_file(&path).ok();
     }
 
     /// The ambient umask must not influence the result: that was the bug.
@@ -783,7 +651,7 @@ mod tests {
         // SAFETY: umask(2) cannot fail. Restored below.
         let previous = unsafe { libc::umask(0) };
         let path = unique_socket_path();
-        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
+        let listener = bind_unix_listener(path.to_str().unwrap(), None).unwrap();
         // SAFETY: as above.
         unsafe { libc::umask(previous) };
 
@@ -812,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn test_listener_unlinks_socket_on_shutdown() {
         let path = unique_socket_path();
-        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
+        let listener = bind_unix_listener(path.to_str().unwrap(), None).unwrap();
         let (tx, rx) = broadcast::channel::<()>(1);
 
         let handle = spawn_unix_listener(
@@ -837,26 +705,12 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Socket activation is the exception: the socket belongs to systemd and
-    /// must survive the process, or the unit cannot hand it to the next start.
-    #[test]
-    fn test_unlink_listen_socket_spares_socket_activation() {
-        let path = unique_socket_path();
-        std::fs::write(&path, b"stand-in for a systemd-owned socket").unwrap();
-
-        unlink_listen_socket(&format!("fd://{}", SYSTEMD_SOCKET_FD));
-        assert!(path.exists(), "precondition check only");
-
-        unlink_listen_socket(path.to_str().unwrap());
-        assert!(!path.exists(), "a path-based socket should be removed");
-    }
-
     /// An idle keep-alive connection must not hold shutdown open until the
     /// timeout: the connection is told to close, not merely left alone.
     #[tokio::test]
     async fn test_listener_releases_idle_keepalive_connection() {
         let path = unique_socket_path();
-        let listener = bind_unix_listener(path.to_str().unwrap(), 0o660, None).unwrap();
+        let listener = bind_unix_listener(path.to_str().unwrap(), None).unwrap();
         let (tx, rx) = broadcast::channel::<()>(1);
 
         let handle = spawn_unix_listener(
