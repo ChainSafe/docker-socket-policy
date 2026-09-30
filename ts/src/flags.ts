@@ -150,6 +150,8 @@ export function selectSocketGroup(
   return lookup(flag);
 }
 
+const MAX_SOCKET_GID = 4294967294;
+
 // Maps --listen-socket-group to a gid. A numeric value is used as-is so a
 // deployment without the group defined can still be configured.
 //
@@ -159,6 +161,13 @@ export function selectSocketGroup(
 // os/user.LookupGroup and Rust uses getgrnam_r, both of which do consult NSS.
 export function resolveGroup(input: string, groupFile = "/etc/group"): GroupId {
   if (/^\d+$/.test(input)) {
+    // 4294967295 is chown's "don't change" sentinel. BigInt keeps a long
+    // digit string exact, where parseInt would round it.
+    if (BigInt(input) > BigInt(MAX_SOCKET_GID)) {
+      return {
+        error: `--listen-socket-group ${JSON.stringify(input)}: gid out of range (0-${MAX_SOCKET_GID})`,
+      };
+    }
     return { gid: parseInt(input, 10) };
   }
   let contents: string;

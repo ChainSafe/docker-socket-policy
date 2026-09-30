@@ -733,6 +733,21 @@ func TestResolveGroup(t *testing.T) {
 	}
 }
 
+func TestResolveGroupRejectsOutOfRangeGid(t *testing.T) {
+	// 4294967295 is chown's "don't change" sentinel and larger values would
+	// be truncated to their low 32 bits (4294967296 -> 0, root).
+	if gid, err := resolveGroup("4294967294"); err != nil || gid != 4294967294 {
+		t.Fatalf("resolveGroup(\"4294967294\") = %d, %v; want 4294967294, nil", gid, err)
+	}
+	for _, v := range []string{"4294967295", "4294967296", "12345678901234567890"} {
+		_, err := resolveGroup(v)
+		want := fmt.Sprintf("--listen-socket-group %q: gid out of range (0-4294967294)", v)
+		if err == nil || err.Error() != want {
+			t.Fatalf("resolveGroup(%q) error = %v, want %q", v, err, want)
+		}
+	}
+}
+
 // TestSelectSocketGroup has one case per row of the group-selection table in
 // spec/listener-design.md; the subtest names match the Quint runs.
 func TestSelectSocketGroup(t *testing.T) {

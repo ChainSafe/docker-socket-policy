@@ -242,6 +242,19 @@ describe("resolveGroup", () => {
   });
 });
 
+describe("resolveGroup rejects out-of-range gid", () => {
+  // 4294967295 is chown's "don't change" sentinel; larger values do not fit
+  // a gid_t at all.
+  it("accepts 4294967294 and rejects anything above it", () => {
+    assert.deepEqual(resolveGroup("4294967294", "/nonexistent"), { gid: 4294967294 });
+    for (const v of ["4294967295", "4294967296", "12345678901234567890"]) {
+      assert.deepEqual(resolveGroup(v, "/nonexistent"), {
+        error: `--listen-socket-group ${JSON.stringify(v)}: gid out of range (0-4294967294)`,
+      });
+    }
+  });
+});
+
 // One case per row of the group-selection table in spec/listener-design.md;
 // the test names match the Quint runs.
 describe("selectSocketGroup", () => {

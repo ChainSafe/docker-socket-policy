@@ -329,11 +329,20 @@ fn select_socket_group(
     }
 }
 
+const MAX_SOCKET_GID: u32 = u32::MAX - 1;
+
 /// Maps `--listen-socket-group` to a gid. A numeric value is used as-is so a
 /// deployment without the group in /etc/group (or NSS) can still be configured.
 fn resolve_group(group: &str) -> Result<u32, String> {
-    if let Ok(gid) = group.parse::<u32>() {
-        return Ok(gid);
+    if !group.is_empty() && group.bytes().all(|b| b.is_ascii_digit()) {
+        // u32::MAX is chown's "don't change" sentinel.
+        return match group.parse::<u32>() {
+            Ok(gid) if gid <= MAX_SOCKET_GID => Ok(gid),
+            _ => Err(format!(
+                "--listen-socket-group {:?}: gid out of range (0-{})",
+                group, MAX_SOCKET_GID
+            )),
+        };
     }
     let name = std::ffi::CString::new(group)
         .map_err(|_| format!("--listen-socket-group {:?}: contains a NUL byte", group))?;
@@ -1119,6 +1128,19 @@ mod tests {
         let root_group = if cfg!(target_os = "macos") { "wheel" } else { "root" };
         if let Ok(gid) = resolve_group(root_group) {
             assert_eq!(gid, 0, "{} should be gid 0", root_group);
+        }
+    }
+
+    #[test]
+    fn test_resolve_group_rejects_out_of_range_gid() {
+        // 4294967295 is chown's "don't change" sentinel; larger values do not
+        // fit a gid_t at all.
+        assert_eq!(resolve_group("4294967294"), Ok(4294967294));
+        for v in ["4294967295", "4294967296", "12345678901234567890"] {
+            assert_eq!(
+                resolve_group(v),
+                Err(format!("--listen-socket-group {:?}: gid out of range (0-4294967294)", v))
+            );
         }
     }
 

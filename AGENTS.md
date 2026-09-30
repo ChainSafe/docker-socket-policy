@@ -37,9 +37,9 @@ deploy/ — Docker Compose + integration tests
 - Zero external deps where possible (Go: yaml.v3, Rust: tokio/hyper/serde/clap, TS: yaml)
 
 ## Test Coverage
-- Go: 96 unit tests (main/listener: 22, policy: 10, middleware: 29, proxy: 31, audit: 4)
-- Rust: 134 unit tests (main/listener: 22, policy: 15, middleware: 50, proxy: 37, handler: 4, audit: 4, transport: 2)
-- TypeScript: 153 unit tests, 1 skipped (flags: 43, listen: 13 incl. 1 skipped concurrency test (#46), middleware: 41, proxy: 26, policy: 10, handler: 6, shutdown: 5, transport: 5, audit: 4)
+- Go: 97 unit tests (main/listener: 23, policy: 10, middleware: 29, proxy: 31, audit: 4)
+- Rust: 135 unit tests (main/listener: 23, policy: 15, middleware: 50, proxy: 37, handler: 4, audit: 4, transport: 2)
+- TypeScript: 154 unit tests, 1 skipped (flags: 44, listen: 13 incl. 1 skipped concurrency test (#46), middleware: 41, proxy: 26, policy: 10, handler: 6, shutdown: 5, transport: 5, audit: 4)
 - Integration, per implementation: 27 tests via deploy/test.sh and 15 socket tests via deploy/test-sock.sh (docker-compose)
 - Quint: `make test-spec` runs the `spec/listener.qnt` `run` tests
 

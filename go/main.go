@@ -203,6 +203,15 @@ func selectSocketGroup(flagValue *string, lookup func(string) (int, error), egid
 // resolveGroup maps a group name or gid to a gid. A numeric value is used
 // as-is so deployments without the group in /etc/group (or NSS) still work.
 func resolveGroup(group string) (int, error) {
+	if isAllDigits(group) {
+		// 4294967295 is chown's "don't change" sentinel, and chown keeps only
+		// the low 32 bits of anything larger (4294967296 would become root).
+		gid, err := strconv.ParseUint(group, 10, 32)
+		if err != nil || gid > maxSocketGid {
+			return -1, fmt.Errorf("--listen-socket-group %q: gid out of range (0-%d)", group, maxSocketGid)
+		}
+		return int(gid), nil
+	}
 	if gid, err := strconv.Atoi(group); err == nil {
 		if gid < 0 {
 			return -1, fmt.Errorf("--listen-socket-group %q: negative gid", group)
@@ -218,6 +227,20 @@ func resolveGroup(group string) (int, error) {
 		return -1, fmt.Errorf("--listen-socket-group %q: gid %q is not numeric", group, g.Gid)
 	}
 	return gid, nil
+}
+
+const maxSocketGid = 4294967294
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // openListener takes the single-instance lock, clears the socket path and
