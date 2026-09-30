@@ -136,8 +136,9 @@ sudo ./docker-socket-policy \
 Like `docker.sock`, the socket is always created `0660` and owned by the
 `docker-socket-policy` group, so members of that group can connect and nobody
 else can. Grant or revoke access with group membership alone. If the group
-does not exist, the proxy warns and uses its own group instead. See
-[Unix socket security boundary](#cli-flags) for the details.
+does not exist, the proxy warns and uses its own group instead. See the
+Unix socket security boundary note under [CLI flags](#cli-flags) for the
+details.
 
 ### Configure a Service
 

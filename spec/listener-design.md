@@ -47,12 +47,16 @@ Default group name: `docker-socket-policy`.
 |---|---|---|
 | not passed | yes | socket group = `docker-socket-policy` |
 | not passed | no | warn `group docker-socket-policy not found, using the proxy's own group <gid>`; socket group = process egid; start |
-| `=name` or `=gid` | yes | socket group = that group |
-| `=name` or `=gid` | no | error, exit 2 |
+| `=name` | yes | socket group = that group |
+| `=name` | no | error, exit 2 |
+| `=gid` | — | socket group = that gid, used as-is (no lookup). Digits only, `0-4294967294`; a larger value fails with exit 2 |
 | `=""` | — | socket group = process egid, no warning |
 
 Resolution is unchanged from #40: Go `os/user.LookupGroup` / numeric,
 Rust `getgrnam_r` / numeric, TypeScript parses `/etc/group` / numeric.
+Only digits-only strings count as numeric; anything else (`+5`, `-5`) goes
+to name lookup, except that Go rejects `-` followed by digits with a
+"negative gid" error.
 
 The warning is emitted on every container start where the group does not
 exist, exactly as dockerd does. Accepted as the cost of parity.
@@ -170,7 +174,6 @@ This is a deliberate departure from the equal-peers rule, recorded in:
 - `README.md`: flag table, security note, replace "Systemd Socket
   Activation" with a plain `.service` using `Group=` /
   `SupplementaryGroups=` and the `groupadd` / `usermod -aG` workflow
-- `.opencode/memory/project.md`
 - `spec/listener.qnt` (new), `spec/README.md`, `Makefile`,
   `.github/workflows/ci.yml`
 
