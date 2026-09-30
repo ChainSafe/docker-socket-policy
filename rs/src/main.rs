@@ -26,6 +26,10 @@ use tracing_subscriber::EnvFilter;
 /// access.
 const SOCKET_MODE: u32 = 0o660;
 
+/// Group given the socket when `--listen-socket-group` is not passed, as
+/// dockerd does with `docker`.
+const DEFAULT_SOCKET_GROUP: &str = "docker-socket-policy";
+
 /// Pause after a failed `accept` before retrying, so persistent errors
 /// (e.g. fd exhaustion) don't spin the loop at 100% CPU.
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
@@ -59,7 +63,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     readonly: bool,
 
-    /// Group name or gid to own the listening socket.
+    /// Group owning the socket (default docker-socket-policy; "" = the proxy's own group)
     #[arg(long)]
     listen_socket_group: Option<String>,
 }
@@ -80,8 +84,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!("{}", msg);
         std::process::exit(2);
     }
-    let socket_gid = match cli.listen_socket_group.as_deref().map(resolve_group).transpose() {
-        Ok(g) => g,
+    // SAFETY: getegid(2) cannot fail.
+    let egid = unsafe { libc::getegid() };
+    let socket_gid = match select_socket_group(cli.listen_socket_group.as_deref(), resolve_group, egid) {
+        Ok((gid, warning)) => {
+            if let Some(warning) = warning {
+                tracing::warn!("{}", warning);
+            }
+            gid
+        }
         Err(msg) => {
             tracing::error!("{}", msg);
             std::process::exit(2);
@@ -132,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind before spawning so a bind failure is fatal: the Unix socket is the
     // process's only listener, so a running-but-unbound proxy is never useful.
-    let listener = bind_unix_listener(&cli.listen_socket, socket_gid).map_err(|e| {
+    let listener = bind_unix_listener(&cli.listen_socket, Some(socket_gid)).map_err(|e| {
         tracing::error!("failed to bind unix socket {}: {}", cli.listen_socket, e);
         e
     })?;
@@ -189,13 +200,50 @@ fn bind_unix_listener(addr: &str, gid: Option<u32>) -> io::Result<tokio::net::Un
     // so the socket is never reachable by the wrong group.
     if let Some(gid) = gid {
         std::os::unix::fs::chown(addr, None, Some(gid)).map_err(|e| {
-            io::Error::new(e.kind(), format!("setting group on {}: {}", addr, e))
+            if e.raw_os_error() == Some(libc::EPERM) {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot give {} to group {}: the proxy's user must be a member of it \
+                         (SupplementaryGroups= / group_add:)",
+                        addr, gid
+                    ),
+                )
+            } else {
+                io::Error::new(e.kind(), format!("setting group on {}: {}", addr, e))
+            }
         })?;
     }
     std::fs::set_permissions(addr, std::fs::Permissions::from_mode(SOCKET_MODE))
         .map_err(|e| io::Error::new(e.kind(), format!("setting mode on {}: {}", addr, e)))?;
 
     Ok(listener)
+}
+
+/// Picks the socket's group the way dockerd does
+/// (moby/daemon/listeners/listeners_linux.go). `None` means the flag was not
+/// passed: the default group is used if it exists, and otherwise the proxy
+/// falls back to its own group with a warning. An explicit group that does not
+/// resolve is an error. An explicit `""` selects the proxy's own group.
+fn select_socket_group(
+    flag: Option<&str>,
+    lookup: impl Fn(&str) -> Result<u32, String>,
+    egid: u32,
+) -> Result<(u32, Option<String>), String> {
+    match flag {
+        None => match lookup(DEFAULT_SOCKET_GROUP) {
+            Ok(gid) => Ok((gid, None)),
+            Err(_) => Ok((
+                egid,
+                Some(format!(
+                    "group {} not found, using the proxy's own group {}",
+                    DEFAULT_SOCKET_GROUP, egid
+                )),
+            )),
+        },
+        Some("") => Ok((egid, None)),
+        Some(group) => lookup(group).map(|gid| (gid, None)),
+    }
 }
 
 /// Maps `--listen-socket-group` to a gid. A numeric value is used as-is so a
@@ -673,6 +721,90 @@ mod tests {
         if let Ok(gid) = resolve_group(root_group) {
             assert_eq!(gid, 0, "{} should be gid 0", root_group);
         }
+    }
+
+    /// Mirrors the Quint group_* actions and Go's TestSelectSocketGroup.
+    #[test]
+    fn test_select_socket_group() {
+        const EGID: u32 = 65532;
+        let known = |name: &str| -> Result<u32, String> {
+            match name {
+                "docker-socket-policy" => Ok(2001),
+                "ops" => Ok(3001),
+                _ => Err(format!("--listen-socket-group {:?}: unknown group", name)),
+            }
+        };
+        let none = |name: &str| -> Result<u32, String> {
+            Err(format!("--listen-socket-group {:?}: unknown group", name))
+        };
+
+        // group_default_present
+        assert_eq!(select_socket_group(None, known, EGID), Ok((2001, None)));
+        // group_default_missing_warns
+        assert_eq!(
+            select_socket_group(None, none, EGID),
+            Ok((
+                EGID,
+                Some("group docker-socket-policy not found, using the proxy's own group 65532".to_string())
+            ))
+        );
+        // group_explicit_present
+        assert_eq!(select_socket_group(Some("ops"), known, EGID), Ok((3001, None)));
+        // group_explicit_missing_fails
+        assert!(select_socket_group(Some("nope"), known, EGID).is_err());
+        // group_empty_uses_own
+        assert_eq!(select_socket_group(Some(""), known, EGID), Ok((EGID, None)));
+    }
+
+    /// An absent flag selects the default group; an explicit empty value
+    /// selects the proxy's own. The two must stay distinguishable.
+    #[test]
+    fn test_group_flag_empty_vs_absent() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["x"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).unwrap().listen_socket_group
+        };
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["--listen-socket-group="]), Some(String::new()));
+        assert_eq!(parse(&["--listen-socket-group", ""]), Some(String::new()));
+    }
+
+    /// A non-root proxy that is not a member of the selected group cannot
+    /// chown the socket to it. The error must say what to fix.
+    #[tokio::test]
+    async fn test_bind_chown_eperm_names_group() {
+        // SAFETY: geteuid/getegid cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root can chown to any group");
+            return;
+        }
+        // SAFETY: a zero-length query returns the group count; the second
+        // call fills a buffer of exactly that size.
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if n > 0 {
+            let mut groups = vec![0 as libc::gid_t; n as usize];
+            let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+            if n > 0 && groups[..n as usize].contains(&0) {
+                eprintln!("skipping: process is a member of gid 0, so chown to it succeeds");
+                return;
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("dsp-{}", rand::random::<u32>()));
+        std::fs::create_dir(&dir).unwrap();
+        // BSD semantics (macOS) give a new file its directory's group, which
+        // is gid 0 under /tmp, and chown to the current group is always
+        // allowed. Give the directory our own group so the socket does not
+        // start out in gid 0.
+        let egid = unsafe { libc::getegid() };
+        std::os::unix::fs::chown(&dir, None, Some(egid)).unwrap();
+        let path = dir.join("eperm.sock");
+
+        let result = bind_unix_listener(path.to_str().unwrap(), Some(0));
+        std::fs::remove_dir_all(&dir).ok();
+        let err = result.err().expect("bind_unix_listener(path, Some(0)) as non-root succeeded, want EPERM");
+        let want = "the proxy's user must be a member of it";
+        assert!(err.to_string().contains(want), "error = {:?}, want it to contain {:?}", err.to_string(), want);
     }
 
     /// A clean shutdown must not leave the socket file on disk, matching Go
