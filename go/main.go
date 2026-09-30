@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -82,7 +83,7 @@ func main() {
 	transport := proxy.NewTransport(*dockerHost)
 	handler := proxy.NewHandler(router, chain, auditLog, transport)
 
-	listener, err := unixListener(*listenSocket, socketGID)
+	listener, lock, err := openListener(*listenSocket, socketGID)
 	if err != nil {
 		slog.Error("failed to start listener", "addr", *listenSocket, "error", err)
 		os.Exit(1)
@@ -97,7 +98,13 @@ func main() {
 	// stall every shutdown for the full timeout: docker stop allows 10s before
 	// SIGKILL, so the proxy would never shut down gracefully at all.
 	<-done
+	// Release the lock only once the socket is closed and unlinked, so the
+	// next instance never finds our socket still in place.
+	lock.Close()
 	slog.Info("shutdown complete")
+	// *os.File closes its fd from a finalizer once unreachable, which would
+	// drop the flock early; keep lock reachable until main returns.
+	runtime.KeepAlive(lock)
 }
 
 // validateListenSocket rejects --listen-socket values that would not produce a
@@ -213,6 +220,93 @@ func resolveGroup(group string) (int, error) {
 	return gid, nil
 }
 
+// openListener takes the single-instance lock, clears the socket path and
+// binds it. The returned lock must be held, and kept reachable, for the life
+// of the process: dropping it would let a second instance take the path.
+func openListener(addr string, gid int) (net.Listener, *os.File, error) {
+	lock, err := acquireInstanceLock(addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := prepareSocketPath(addr); err != nil {
+		lock.Close()
+		return nil, nil, err
+	}
+	l, err := unixListener(addr, gid)
+	if err != nil {
+		lock.Close()
+		return nil, nil, err
+	}
+	return l, lock, nil
+}
+
+// acquireInstanceLock takes an exclusive flock on <socketPath>.lock, which
+// replaces dockerd's pidfile. The kernel drops the lock on any exit, including
+// SIGKILL, so it never goes stale, and it needs no PID check, so it also works
+// across PID namespaces. The file is never truncated or unlinked: unlinking a
+// lock file reopens the race it exists to close. O_NOFOLLOW stops a symlink
+// planted at the lock path from redirecting O_CREAT elsewhere.
+func acquireInstanceLock(socketPath string) (*os.File, error) {
+	lockPath := socketPath + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("opening lock %s: %w", lockPath, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%s is in use by another instance (lock %s held)", socketPath, lockPath)
+		}
+		return nil, fmt.Errorf("locking %s: %w", lockPath, err)
+	}
+	return f, nil
+}
+
+// probeTimeout bounds the connect(2) that tells a live socket from a stale one.
+const probeTimeout = time.Second
+
+// prepareSocketPath clears the socket path for bind, following the
+// existing-path table in spec/listener-design.md. Only a socket that refuses
+// connections is removed. A live one belongs to another process, possibly an
+// instance that takes no lock (TypeScript, or v0.2.21 and earlier), and
+// replacing it would cut that process off silently. Anything that is not a
+// socket is refused: os.Remove also unlinks regular files and rmdir's empty
+// directories, so a mistyped path would silently delete an operator's data.
+func prepareSocketPath(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking %s: %w", path, err)
+	}
+	if info.Mode()&fs.ModeSocket == 0 {
+		return fmt.Errorf("refusing to remove %s: not a socket (mode %s)", path, info.Mode())
+	}
+
+	conn, err := net.DialTimeout("unix", path, probeTimeout)
+	if err == nil {
+		conn.Close()
+		return fmt.Errorf("%s is in use by another process", path)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Errorf("%s is in use by another process", path)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			return fmt.Errorf("refusing to remove %s: connect: %w", path, errno)
+		}
+		return fmt.Errorf("refusing to remove %s: %w", path, err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("removing stale socket %s: %w", path, err)
+	}
+	return nil
+}
+
 // unixListener binds the proxy's only listening socket. Listening is Unix-socket
 // only by design: filesystem ownership on the socket is the access-control
 // boundary, and a TCP listener would have none.
@@ -224,21 +318,9 @@ func resolveGroup(group string) (int, error) {
 //
 // main always passes the gid chosen by selectSocketGroup; a negative gid skips
 // the chown and exists only for tests.
+//
+// The path must already be clear; openListener runs prepareSocketPath first.
 func unixListener(addr string, gid int) (net.Listener, error) {
-	// Remove a stale socket from a previous run, but only a socket: os.Remove
-	// also unlinks regular files and rmdir's empty directories, so ignoring its
-	// error would let a mistyped path silently delete an operator's data.
-	if info, err := os.Lstat(addr); err == nil {
-		if info.Mode()&fs.ModeSocket == 0 {
-			return nil, fmt.Errorf("refusing to remove %s: not a socket (mode %s)", addr, info.Mode())
-		}
-		if err := os.Remove(addr); err != nil {
-			return nil, fmt.Errorf("removing stale socket %s: %w", addr, err)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("checking %s: %w", addr, err)
-	}
-
 	// umask is process-global and not thread-safe. This runs during startup,
 	// before any request handling, so nothing else is creating files.
 	old := syscall.Umask(bindUmask)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -11,7 +12,9 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -149,30 +152,371 @@ func TestUnixListenerBindsFreshPath(t *testing.T) {
 	}
 }
 
-func TestUnixListenerReplacesStaleSocket(t *testing.T) {
-	path := filepath.Join(shortTempDir(t), "stale.sock")
-
-	// Leave a real socket behind, as an unclean shutdown would.
-	first, err := net.Listen("unix", path)
+// seedStaleSocket leaves a socket file at path with nothing listening on it,
+// as an unclean shutdown would: connect(2) to it is refused.
+func seedStaleSocket(t *testing.T, path string) {
+	t.Helper()
+	l, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("seeding stale socket: %v", err)
 	}
-	first.Close()
-	// net.Listen's listener unlinks on Close, so recreate the stale entry.
-	stale, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("re-seeding stale socket: %v", err)
-	}
-	_ = stale
-
-	l, err := unixListener(path, -1)
-	if err != nil {
-		t.Fatalf("unixListener over stale socket = %v, want nil", err)
-	}
-	l.Close()
+	ul := l.(*net.UnixListener)
+	ul.SetUnlinkOnClose(false)
+	ul.Close()
 }
 
-func TestUnixListenerRefusesToDeleteNonSocket(t *testing.T) {
+func inode(t *testing.T, path string) uint64 {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return uint64(info.Sys().(*syscall.Stat_t).Ino)
+}
+
+func TestOpenListenerReplacesStaleSocket(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "stale.sock")
+	seedStaleSocket(t, path)
+
+	l, lock, err := openListener(path, -1)
+	if err != nil {
+		t.Fatalf("openListener over stale socket = %v, want nil", err)
+	}
+	l.Close()
+	lock.Close()
+}
+
+// TestPrepareSocketPath has one case per row of the existing-path table in
+// spec/listener-design.md; the subtest names match the Quint runs.
+func TestPrepareSocketPath(t *testing.T) {
+	t.Run("pathAbsentBinds", func(t *testing.T) {
+		path := filepath.Join(shortTempDir(t), "absent.sock")
+		if err := prepareSocketPath(path); err != nil {
+			t.Fatalf("prepareSocketPath(absent) = %v, want nil", err)
+		}
+	})
+
+	t.Run("pathStaleReplaced", func(t *testing.T) {
+		path := filepath.Join(shortTempDir(t), "stale.sock")
+		seedStaleSocket(t, path)
+		if err := prepareSocketPath(path); err != nil {
+			t.Fatalf("prepareSocketPath(stale) = %v, want nil", err)
+		}
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale socket still present after prepare: %v", err)
+		}
+	})
+
+	t.Run("pathLiveRefused", func(t *testing.T) {
+		path := filepath.Join(shortTempDir(t), "live.sock")
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatalf("binding live socket: %v", err)
+		}
+		defer l.Close()
+		before := inode(t, path)
+
+		err = prepareSocketPath(path)
+		if want := path + " is in use by another process"; err == nil || err.Error() != want {
+			t.Fatalf("prepareSocketPath(live) = %v, want %q", err, want)
+		}
+		if after := inode(t, path); after != before {
+			t.Fatalf("live socket inode changed %d -> %d: it was replaced", before, after)
+		}
+
+		accepted := make(chan error, 1)
+		go func() {
+			c, err := l.Accept()
+			if err == nil {
+				c.Close()
+			}
+			accepted <- err
+		}()
+		c, err := net.Dial("unix", path)
+		if err != nil {
+			t.Fatalf("live listener no longer reachable: %v", err)
+		}
+		c.Close()
+		if err := <-accepted; err != nil {
+			t.Fatalf("live listener no longer accepts: %v", err)
+		}
+	})
+
+	// connect(2) needs write permission on the socket, so a 0000 socket
+	// yields EACCES: neither live nor provably stale, so it is left alone.
+	t.Run("pathConnectErrorRefused", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root ignores socket permissions")
+		}
+		path := filepath.Join(shortTempDir(t), "eacces.sock")
+		seedStaleSocket(t, path)
+		if err := os.Chmod(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		err := prepareSocketPath(path)
+		if want := "refusing to remove " + path + ": connect: permission denied"; err == nil || err.Error() != want {
+			t.Fatalf("prepareSocketPath(0000 socket) = %v, want %q", err, want)
+		}
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("socket was removed: %v", err)
+		}
+	})
+
+	t.Run("pathNotSocketRefused", func(t *testing.T) {
+		path := filepath.Join(shortTempDir(t), "file.txt")
+		if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := prepareSocketPath(path)
+		if want := "refusing to remove " + path + ": not a socket"; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("prepareSocketPath(regular file) = %v, want prefix %q", err, want)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("regular file was removed: %v", err)
+		}
+	})
+}
+
+// TestAcquireInstanceLock covers the Quint run secondInstanceLockRefused.
+func TestAcquireInstanceLock(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "lock.sock")
+
+	first, err := acquireInstanceLock(path)
+	if err != nil {
+		t.Fatalf("first acquireInstanceLock = %v, want nil", err)
+	}
+
+	_, err = acquireInstanceLock(path)
+	want := path + " is in use by another instance (lock " + path + ".lock held)"
+	if err == nil || err.Error() != want {
+		t.Fatalf("second acquireInstanceLock = %v, want %q", err, want)
+	}
+
+	info, err := os.Lstat(path + ".lock")
+	if err != nil {
+		t.Fatalf("stat lock file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("lock file mode = %o, want 0600", got)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatalf("closing first lock: %v", err)
+	}
+	if _, err := os.Lstat(path + ".lock"); err != nil {
+		t.Fatalf("lock file removed on Close, want it kept: %v", err)
+	}
+
+	second, err := acquireInstanceLock(path)
+	if err != nil {
+		t.Fatalf("acquireInstanceLock after Close = %v, want nil", err)
+	}
+	second.Close()
+}
+
+// A symlink planted at <path>.lock must not be followed: O_CREAT through it
+// would create or lock a file of the attacker's choosing.
+func TestAcquireInstanceLockRefusesSymlink(t *testing.T) {
+	dir := shortTempDir(t)
+	path := filepath.Join(dir, "sym.sock")
+	target := filepath.Join(dir, "target")
+	if err := os.Symlink(target, path+".lock"); err != nil {
+		t.Fatal(err)
+	}
+
+	if f, err := acquireInstanceLock(path); err == nil {
+		f.Close()
+		t.Fatal("acquireInstanceLock through a symlink = nil, want error")
+	} else if !strings.Contains(err.Error(), path+".lock") {
+		t.Fatalf("error = %q, want it to name %s.lock", err, path)
+	}
+	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("symlink target was created: %v", err)
+	}
+}
+
+func TestAcquireInstanceLockUnreadable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	path := filepath.Join(shortTempDir(t), "unreadable.sock")
+	if err := os.WriteFile(path+".lock", nil, 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	if f, err := acquireInstanceLock(path); err == nil {
+		f.Close()
+		t.Fatal("acquireInstanceLock on a 0000 lock file = nil, want error")
+	} else if !strings.Contains(err.Error(), path+".lock") {
+		t.Fatalf("error = %q, want it to name %s.lock", err, path)
+	}
+}
+
+// *os.File has a finalizer that closes the fd, which would drop the flock.
+// The lock must hold for as long as main keeps its reference.
+func TestInstanceLockSurvivesGC(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "gc.sock")
+	lock, err := acquireInstanceLock(path)
+	if err != nil {
+		t.Fatalf("acquireInstanceLock = %v", err)
+	}
+
+	runtime.GC()
+	runtime.GC()
+
+	if f, err := acquireInstanceLock(path); err == nil {
+		f.Close()
+		t.Fatal("lock was released by GC while still referenced")
+	}
+	lock.Close()
+	runtime.KeepAlive(lock)
+}
+
+func TestOpenListenerConcurrent(t *testing.T) {
+	dir := shortTempDir(t)
+	const racers = 8
+
+	type result struct {
+		l    net.Listener
+		lock *os.File
+		err  error
+	}
+
+	for i := 0; i < 50; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("c%d.sock", i))
+		start := make(chan struct{})
+		results := make(chan result, racers)
+		var wg sync.WaitGroup
+		for j := 0; j < racers; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				l, lock, err := openListener(path, -1)
+				results <- result{l, lock, err}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+
+		var winner *result
+		for r := range results {
+			if r.err == nil {
+				if winner != nil {
+					t.Fatalf("iteration %d: more than one openListener succeeded", i)
+				}
+				r := r
+				winner = &r
+				continue
+			}
+			if !strings.Contains(r.err.Error(), "is in use by another") {
+				t.Fatalf("iteration %d: loser error = %q, want an in-use error", i, r.err)
+			}
+		}
+		if winner == nil {
+			t.Fatalf("iteration %d: no openListener succeeded", i)
+		}
+
+		accepted := make(chan error, 1)
+		go func() {
+			c, err := winner.l.Accept()
+			if err == nil {
+				c.Close()
+			}
+			accepted <- err
+		}()
+		c, err := net.Dial("unix", path)
+		if err != nil {
+			t.Fatalf("iteration %d: dialing winner: %v", i, err)
+		}
+		c.Close()
+		if err := <-accepted; err != nil {
+			t.Fatalf("iteration %d: winner did not accept: %v", i, err)
+		}
+
+		winner.l.Close()
+		winner.lock.Close()
+	}
+}
+
+const holdLockEnv = "DSP_TEST_HOLD_LOCK"
+
+// TestHelperHoldLock is not a test on its own: TestLockReleasedOnSIGKILL
+// re-executes the test binary to run it as a child that holds the lock.
+func TestHelperHoldLock(t *testing.T) {
+	path := os.Getenv(holdLockEnv)
+	if path == "" {
+		t.Skip("helper process for TestLockReleasedOnSIGKILL")
+	}
+	lock, err := acquireInstanceLock(path)
+	if err != nil {
+		fmt.Println("error:", err)
+		os.Exit(1)
+	}
+	defer runtime.KeepAlive(lock)
+	fmt.Println("ready")
+	select {}
+}
+
+// TestLockReleasedOnSIGKILL covers the Quint run crashReleasesLock: the
+// kernel drops the flock on any exit, so a killed instance never leaves a
+// stale lock behind.
+func TestLockReleasedOnSIGKILL(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "kill.sock")
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperHoldLock$")
+	cmd.Env = append(os.Environ(), holdLockEnv+"="+path)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	ready := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "ready" {
+				ready <- nil
+				return
+			}
+		}
+		ready <- fmt.Errorf("child exited before holding the lock: %v", scanner.Err())
+	}()
+	select {
+	case err := <-ready:
+		if err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		cmd.Process.Kill()
+		cmd.Wait()
+		t.Fatal("child did not report ready within 10s")
+	}
+
+	if f, err := acquireInstanceLock(path); err == nil {
+		f.Close()
+		t.Fatal("acquired the lock while the child held it")
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	cmd.Wait()
+
+	lock, err := acquireInstanceLock(path)
+	if err != nil {
+		t.Fatalf("acquireInstanceLock after SIGKILL = %v, want nil", err)
+	}
+	lock.Close()
+}
+
+func TestOpenListenerRefusesToDeleteNonSocket(t *testing.T) {
 	// A mistyped --listen-socket must not silently destroy data. os.Remove
 	// would happily unlink a regular file and rmdir an empty directory.
 	t.Run("regular file", func(t *testing.T) {
@@ -181,8 +525,8 @@ func TestUnixListenerRefusesToDeleteNonSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := unixListener(path, -1); err == nil {
-			t.Fatal("unixListener over a regular file = nil, want error")
+		if _, _, err := openListener(path, -1); err == nil {
+			t.Fatal("openListener over a regular file = nil, want error")
 		} else if !strings.Contains(err.Error(), "not a socket") {
 			t.Fatalf("error = %q, want it to mention 'not a socket'", err)
 		}
@@ -200,8 +544,8 @@ func TestUnixListenerRefusesToDeleteNonSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := unixListener(path, -1); err == nil {
-			t.Fatal("unixListener over a directory = nil, want error")
+		if _, _, err := openListener(path, -1); err == nil {
+			t.Fatal("openListener over a directory = nil, want error")
 		}
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("directory was removed: %v", err)
