@@ -248,8 +248,9 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > |---|---|---|
 > | not passed | yes | `docker-socket-policy` |
 > | not passed | no | the proxy's own group, with the warning `group docker-socket-policy not found, using the proxy's own group <gid>` |
-> | `=name` or `=gid` | yes | that group |
-> | `=name` or `=gid` | no | none: startup fails, exit 2 |
+> | `=name` | yes | that group |
+> | `=name` | no | none: startup fails, exit 2 |
+> | `=gid` | — | that gid, used as-is (no lookup) |
 > | `=""` | — | the proxy's own group, no warning |
 >
 > To grant access, create the group once and add callers to it:
