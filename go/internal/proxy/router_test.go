@@ -293,3 +293,65 @@ func TestRouterDenyPostOnReadOnly(t *testing.T) {
 		t.Fatalf("expected ActionDeny for POST on non-lifecycle path, got %v", result.Action)
 	}
 }
+
+// TestRouterReservedPathSegments is the cross-language parity guard for #24.
+//
+// /containers/<x> is ambiguous: <x> is usually a container name, but Docker
+// also has reserved endpoints at that position (/containers/json to list,
+// /containers/create to create). Treating a reserved word as a container name
+// sends the request down the lifecycle path, where an unknown container is
+// allowed through — so DELETE /containers/json was allowed in Go while Rust
+// and TypeScript denied it.
+//
+// GET stays allowed either way: it reaches the GET/HEAD passthrough instead.
+func TestRouterReservedPathSegments(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m)
+
+	tests := []struct {
+		method string
+		path   string
+		want   Action
+	}{
+		// Reserved: must not be mistaken for a container to remove.
+		{"DELETE", "/containers/json", ActionDeny},
+		{"DELETE", "/containers/create", ActionDeny},
+		// Listing and inspecting stay allowed via the GET/HEAD passthrough.
+		{"GET", "/containers/json", ActionAllow},
+		// A real container name is still routed as a container.
+		{"DELETE", "/containers/mycontainer", ActionAllow},
+		{"GET", "/containers/mycontainer", ActionAllow},
+		// The reserved word as a *sub*-resource is a normal inspect.
+		{"GET", "/containers/mycontainer/json", ActionAllow},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, nil)
+			if got.Action != tt.want {
+				t.Fatalf("Route(%s, %s) = %v, want %v (deny msg: %q)",
+					tt.method, tt.path, got.Action, tt.want, got.DenyMsg)
+			}
+		})
+	}
+}
+
+func TestExtractContainerNameSkipsReservedSegments(t *testing.T) {
+	for _, reserved := range []string{"create", "json", "exec"} {
+		if got := extractContainerName("/containers/" + reserved); got != "" {
+			t.Errorf("extractContainerName(/containers/%s) = %q, want \"\"", reserved, got)
+		}
+	}
+	if got := extractContainerName("/containers/mycontainer"); got != "mycontainer" {
+		t.Errorf("extractContainerName(/containers/mycontainer) = %q, want \"mycontainer\"", got)
+	}
+	// Reserved words are only reserved in the name position.
+	if got := extractContainerName("/containers/mycontainer/json"); got != "mycontainer" {
+		t.Errorf("extractContainerName(/containers/mycontainer/json) = %q, want \"mycontainer\"", got)
+	}
+}
