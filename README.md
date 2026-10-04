@@ -5,11 +5,11 @@
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-A validating Docker API proxy that enforces **per-service policies** through a middleware pipeline. Designed for granting safe, audited Docker access to external contributors, CI/CD pipelines, and automated tooling — without giving them direct Docker daemon access.
+A validating Docker API proxy that enforces **per-service container policies** through a middleware pipeline. Designed for granting safe, audited Docker access to external contributors, CI/CD pipelines, and automated tooling — without giving them direct Docker daemon access.
 
 Key features:
 
-- **Policy-driven**: Per-service YAML policies control images, volumes, flags, and env vars
+- **Policy-driven**: Per-service YAML policies, selected by image name, control images, volumes, flags, and env vars. The listening socket is the trust boundary: every caller of a socket can use every policy behind it (see [Trust model](#trust-model))
 - **Middleware pipeline**: 6 validation gates + 1 config mutator chain
 - **Default-deny router**: Only explicitly allowed endpoints pass through
 - **Formally verified**: [Quint](https://quint-lang.org/) specification with 9 security invariants
@@ -310,14 +310,9 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 > This gap is tracked in
 > [#46](https://github.com/ChainSafe/docker-socket-policy/issues/46).
 >
-> **What the socket does not give you is per-service isolation.** The proxy
-> performs no caller authentication: it selects a policy from the `Image` field
-> of the request body, not from the identity of the connection. Every caller of
-> one socket therefore shares one trust domain, and can act under any policy in
-> that proxy's `--config-dir` by naming that policy's image. Treat the socket as
-> a boundary around the whole proxy, not around a single service. To isolate
-> services from one another, run a proxy instance per service, each with its own
-> socket and a `--config-dir` containing only that service's policy.
+> Group membership decides who can use the proxy, not which policy they get.
+> Every caller of one socket can use every policy loaded behind it; see
+> [Trust model](#trust-model) for what that means and how to separate callers.
 
 ### systemd Service
 
@@ -360,6 +355,81 @@ to the socket in the same directory. Callers then use
 To use a different group, pass `--listen-socket-group=<name>` and add that
 group to `SupplementaryGroups=`. Otherwise startup fails with the
 "must be a member of it" error.
+
+## Trust model
+
+**The listening socket is the trust boundary.** The proxy does not identify
+callers. Anyone who can `connect(2)` to the socket, which means any member of
+its group, can create containers under **every** policy loaded from that
+proxy's `--config-dir`.
+
+A policy is a per-service *template*, chosen by the `Image` of the request. It
+fixes what a container from that image may look like: volumes, network mode,
+env file, user, CLI flags. A policy says nothing about *who* may ask for it. A
+caller who names `chainsafe/lodestar` gets the policy for that image, whichever
+service the caller belongs to. This is intended, not a gap: callers on a
+shared socket are all the same caller as far as the kernel can tell (for
+example, several developers sharing one account), so no proxy-side check could
+tell them apart.
+
+That gives two supported layouts:
+
+- **One trust domain, many services.** Put every policy the callers may use in
+  one `--config-dir` behind one socket. The callers' privileges are the union
+  of those policies. This is the normal layout when everyone with access is
+  equally trusted, such as one team, or one shared account used by several
+  developers.
+- **Several trust domains on one host.** Run one proxy instance per domain,
+  each with its own socket, its own group and a `--config-dir` holding only
+  that domain's policies. Membership in one socket's group grants nothing on
+  another: the kernel refuses the connection (`EACCES`) before the proxy reads
+  a byte. This is the same model as `docker.sock`.
+
+A systemd template unit runs one instance per domain. Create one group per
+domain and put each domain's policies in `/etc/docker-socket-policy/<domain>/`:
+
+```bash
+sudo groupadd --system dsp-teama
+sudo groupadd --system dsp-teamb
+sudo usermod -aG dsp-teama alice   # alice can use team A's policies only
+```
+
+**`docker-socket-policy@.service`**:
+```ini
+[Service]
+ExecStart=/usr/local/bin/docker-socket-policy \
+  --listen-socket=/run/docker-socket-policy-%i/docker-socket-policy.sock \
+  --listen-socket-group=dsp-%i \
+  --docker-host=/var/run/docker.sock \
+  --config-dir=/etc/docker-socket-policy/%i \
+  --log-file=/var/log/docker-socket-policy/%i.log
+User=docker-socket-policy
+Group=dsp-%i
+SupplementaryGroups=docker
+RuntimeDirectory=docker-socket-policy-%i
+RuntimeDirectoryMode=0755
+LogsDirectory=docker-socket-policy
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now docker-socket-policy@teama docker-socket-policy@teamb
+```
+
+`Group=dsp-%i` makes each domain's group the instance's own group, so the
+instance can give its socket to that group. Team A's callers use
+`DOCKER_HOST=unix:///run/docker-socket-policy-teama/docker-socket-policy.sock`.
+Putting that line in the shared account's shell profile means nobody has to
+switch sockets by hand.
+
+The proxy does not authenticate individual people, and its audit log records
+requests and decisions, not who sent them. If several developers share one
+account, tell them apart at login (for example by SSH key, in the SSH log),
+not at the socket.
 
 ## Formal Verification
 
