@@ -478,6 +478,35 @@ mod tests {
         );
     }
 
+    /// Cross-language parity guard for #48. An empty segment in the name
+    /// position (/containers/, /containers//start) is not a container name.
+    /// Treating it as one routes the request down the lifecycle path, where an
+    /// unknown container is allowed through. Rows mirror the emptyName* runs
+    /// in spec/router.qnt.
+    #[test]
+    fn test_route_empty_container_name() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let cases = [
+            // emptyNameDeleteDeniedTest
+            ("DELETE", "/containers/", Action::Deny),
+            // emptyNameStartDeniedTest
+            ("POST", "/containers//start", Action::Deny),
+            // emptyNameGetAllowedTest
+            ("GET", "/containers/", Action::Allow),
+        ];
+        for (method, path, want) in cases {
+            let got = router.route(method, path, None);
+            assert_eq!(got.action, want, "route({} {})", method, path);
+        }
+    }
+
+    #[test]
+    fn test_extract_container_name_skips_empty_segment() {
+        for path in ["/containers/", "/containers//start"] {
+            assert_eq!(extract_container_name(path), None, "{} has no container name", path);
+        }
+    }
+
     #[test]
     fn test_route_image_pull() {
         let router = Router::new(make_manager(vec!["alpine"]));

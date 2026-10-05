@@ -199,4 +199,23 @@ describe("Router", () => {
       assert.equal(r.action, want, `route(${method} ${path})`);
     }
   });
+
+  // Cross-language parity guard for #48. An empty segment in the name position
+  // (/containers/, /containers//start) is not a container name. Treating it as
+  // one routes the request down the lifecycle path, where an unknown container
+  // is allowed through. Rows mirror the emptyName* runs in spec/router.qnt.
+  it("does not treat an empty path segment as a container name", () => {
+    const cases: [string, string, Action][] = [
+      // emptyNameDeleteDeniedTest
+      ["DELETE", "/containers/", Action.Deny],
+      // emptyNameStartDeniedTest
+      ["POST", "/containers//start", Action.Deny],
+      // emptyNameGetAllowedTest
+      ["GET", "/containers/", Action.Allow],
+    ];
+    for (const [method, path, want] of cases) {
+      const r = router.route(method, path);
+      assert.equal(r.action, want, `route(${method} ${path})`);
+    }
+  });
 });

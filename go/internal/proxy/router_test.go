@@ -355,3 +355,50 @@ func TestExtractContainerNameSkipsReservedSegments(t *testing.T) {
 		t.Errorf("extractContainerName(/containers/mycontainer/json) = %q, want \"mycontainer\"", got)
 	}
 }
+
+// TestRouteEmptyContainerName is the cross-language parity guard for #48.
+//
+// An empty segment in the name position (/containers/, /containers//start) is
+// not a container name. Treating it as one routes the request down the
+// lifecycle path, where an unknown container is allowed through — Rust did
+// exactly that. Rows mirror the emptyName* runs in spec/router.qnt.
+func TestRouteEmptyContainerName(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m)
+
+	tests := []struct {
+		method string
+		path   string
+		want   Action
+	}{
+		// emptyNameDeleteDeniedTest
+		{"DELETE", "/containers/", ActionDeny},
+		// emptyNameStartDeniedTest
+		{"POST", "/containers//start", ActionDeny},
+		// emptyNameGetAllowedTest
+		{"GET", "/containers/", ActionAllow},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, nil)
+			if got.Action != tt.want {
+				t.Fatalf("Route(%s, %s) = %v, want %v (deny msg: %q)",
+					tt.method, tt.path, got.Action, tt.want, got.DenyMsg)
+			}
+		})
+	}
+}
+
+func TestExtractContainerNameSkipsEmptySegment(t *testing.T) {
+	for _, path := range []string{"/containers/", "/containers//start"} {
+		if got := extractContainerName(path); got != "" {
+			t.Errorf("extractContainerName(%s) = %q, want \"\"", path, got)
+		}
+	}
+}
