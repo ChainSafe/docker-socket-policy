@@ -4,6 +4,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 QUINT ?= $(shell command -v quint 2>/dev/null || echo node $$HOME/.hermes/node/lib/node_modules/@informalsystems/quint/dist/src/cli.js)
 SPEC ?= spec/docker_socket_policy.qnt
 LISTENER_SPEC ?= spec/listener.qnt
+ROUTER_SPEC := spec/router.qnt
 BACKEND ?=
 
 .PHONY: build clean test lint verify typecheck test-spec validate ci-verify release-verify
@@ -67,6 +68,7 @@ clean:
 typecheck:
 	$(QUINT) typecheck $(SPEC)
 	$(QUINT) typecheck $(LISTENER_SPEC)
+	$(QUINT) typecheck $(ROUTER_SPEC)
 
 verify:
 	if [ -n "$(BACKEND)" ]; then \
@@ -80,6 +82,8 @@ verify:
 test-spec:
 	$(QUINT) test $(LISTENER_SPEC) --main=listener_locked
 	$(QUINT) test $(LISTENER_SPEC) --main=listener_unlocked
+	$(QUINT) test $(ROUTER_SPEC) --main=router
+	$(QUINT) test $(ROUTER_SPEC) --main=router_pre48
 
 verify-ts:
 	$(QUINT) run $(SPEC) --max-steps=50 --invariants allInvariants --backend typescript
