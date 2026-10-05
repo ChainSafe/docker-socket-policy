@@ -209,7 +209,8 @@ fn strip_api_version(path: &str) -> &str {
 fn extract_container_name(path: &str) -> Option<&str> {
     let path = path.strip_prefix('/').unwrap_or(path);
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() >= 2 && parts[0] == "containers" && parts[1] != "create" && parts[1] != "json" && parts[1] != "exec" {
+    // An empty segment is not a name, mirroring Go/TS (#48).
+    if parts.len() >= 2 && parts[0] == "containers" && !parts[1].is_empty() && parts[1] != "create" && parts[1] != "json" && parts[1] != "exec" {
         Some(parts[1])
     } else {
         None
