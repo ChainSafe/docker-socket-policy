@@ -363,7 +363,7 @@ group to `SupplementaryGroups=`. Otherwise startup fails with the
 
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models only container-name extraction in the router's container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)).
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models container-name extraction and the router's container-lifecycle routing branch only, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)).
 
 The CI pipeline runs verification on every push and PR. A violation blocks the build.
 
