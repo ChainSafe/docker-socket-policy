@@ -320,14 +320,20 @@ allowed_image_prefixes:
 		want   Action
 	}{
 		// Reserved: must not be mistaken for a container to remove.
+		// reservedJsonDeleteDeniedTest
 		{"DELETE", "/containers/json", ActionDeny},
+		// reservedCreateDeleteDeniedTest
 		{"DELETE", "/containers/create", ActionDeny},
+		// reservedExecDeleteDeniedTest: denied by the exec check, before the lifecycle branch.
+		{"DELETE", "/containers/exec", ActionDeny},
 		// Listing and inspecting stay allowed via the GET/HEAD passthrough.
 		{"GET", "/containers/json", ActionAllow},
 		// A real container name is still routed as a container.
+		// realNameDeleteAllowedTest
 		{"DELETE", "/containers/mycontainer", ActionAllow},
 		{"GET", "/containers/mycontainer", ActionAllow},
 		// The reserved word as a *sub*-resource is a normal inspect.
+		// reservedInSubpathAllowedTest
 		{"GET", "/containers/mycontainer/json", ActionAllow},
 	}
 	for _, tt := range tests {

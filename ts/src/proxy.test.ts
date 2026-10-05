@@ -184,14 +184,20 @@ describe("Router", () => {
   it("does not treat reserved path segments as container names", () => {
     const cases: [string, string, Action][] = [
       // Reserved: must not be mistaken for a container to remove.
+      // reservedJsonDeleteDeniedTest
       ["DELETE", "/containers/json", Action.Deny],
+      // reservedCreateDeleteDeniedTest
       ["DELETE", "/containers/create", Action.Deny],
+      // reservedExecDeleteDeniedTest: denied by the exec check, before the lifecycle branch.
+      ["DELETE", "/containers/exec", Action.Deny],
       // Listing stays allowed, via the GET/HEAD passthrough.
       ["GET", "/containers/json", Action.Allow],
       // A real container name is still routed as a container.
+      // realNameDeleteAllowedTest
       ["DELETE", "/containers/mycontainer", Action.Allow],
       ["GET", "/containers/mycontainer", Action.Allow],
       // Reserved words are only reserved in the name position.
+      // reservedInSubpathAllowedTest
       ["GET", "/containers/mycontainer/json", Action.Allow],
     ];
     for (const [method, path, want] of cases) {
