@@ -9,7 +9,7 @@ This directory contains a [Quint](https://quint-lang.org/) formal specification 
 | `docker_socket_policy.qnt` | Request-handling spec: policy types, state machine, endpoint routing table, 9 invariants (6 P0 / 3 P1), 6 attack scenario simulations |
 | `listener.qnt` | Listening-socket startup: flag/group selection, existing-path checks, single-instance lock, 6 invariants, one `run` test per design-table row. Instances `listener_locked` (Go, Rust) and `listener_unlocked` (TypeScript) |
 | `listener-design.md` | Design of the listening socket (dockerd parity) that `listener.qnt` models |
-| `router.qnt` | Router path parsing: container-name extraction and the container-lifecycle branch, one `run` test per table row. Instances `router` (Go, TypeScript, Rust after #48) and `router_pre48` (Rust before #48) |
+| `router.qnt` | Container-name extraction and the container-lifecycle branch of the router only, not the full router. One `run` test per table row. Instances `router` (the extraction rule of Go, TypeScript, and Rust after #48) and `router_pre48` (Rust's rule before #48) |
 
 ## How to Run
 
@@ -96,7 +96,7 @@ A path is a list of segments, so `/containers/` is `["containers", ""]` and `/co
 | `realNameDeleteAllowed` | `DELETE /containers/mycontainer` | allow (unknown container) | both |
 | `reservedInSubpathAllowed` | `GET /containers/mycontainer/json` | allow | both |
 
-The Go, Rust and TypeScript router tests carry the same row names in comments. `router_pre48` runs `pre48UnsoundTest`, which asserts that the property fails and that both `emptyName*Denied` requests are allowed as an unknown container ([#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)).
+Each implementation's router tests use the same row names in comments (added with the #48 fix). `router_pre48` runs `pre48UnsoundTest`, which asserts that the property fails and that both `emptyName*Denied` requests are allowed as an unknown container ([#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)).
 
 ### Modeling Notes
 
@@ -106,7 +106,13 @@ Two invariants are structurally tautological within the Quint model — they can
 - **`routingTableComplete`** — checks that `endpointsTable` (a fixed constant) contains a fixed list of literals declared in the same file. It documents the intended routing table but doesn't cross-check it against any of the three Router implementations; that comparison has to be done manually (or via `quint-analyzer`) against `go/internal/proxy/router.go`, `rs/src/proxy.rs`, and `ts/src/proxy.ts`.
 
 - **`listener.qnt` checks the design, not the code.** Nothing in the model is derived from the Go, Rust or TypeScript sources. Conformance rests on each implementation's unit and integration tests, which carry the same names as the Quint `run`s (`groupDefaultPresent`, `pathStaleReplaced`, …) so every design-table row can be traced across all four. `raceWithoutLockTest` (in `listener_unlocked`) is the formal record of the TypeScript gap: Node has no `flock`, so two TypeScript instances starting together can orphan one another's socket ([#46](https://github.com/ChainSafe/docker-socket-policy/issues/46)).
-- **`lifecycleOnlyTargetsRealNames` is close to a tautology.** `route` only allows by name when `hasContainerName` holds, and `hasContainerName` is nearly the property itself. It is not vacuous: on `router_pre48`, where an empty segment counts as a name, the property fails, and `pre48UnsoundTest` asserts that. Most of the evidence comes from the table rows, because the language tests share their names. `router.qnt` models only the lifecycle branch. The earlier exec, build and commit denials and `POST /containers/create` are left out, so it says nothing about paths that those checks catch first.
+- **`lifecycleOnlyTargetsRealNames` is close to a tautology.** `route` only allows by name when `hasContainerName` holds, and `hasContainerName` is nearly the property itself. It is not vacuous: on `router_pre48`, where an empty segment counts as a name, the property fails, and `pre48UnsoundTest` asserts that. Most of the evidence comes from the table rows, whose names the language router tests reuse (added with the #48 fix).
+- **`router.qnt` is not the full router.** `route` models only the container-lifecycle branch. It leaves out the checks that the routers run before that branch, such as the exec, build and commit denials and `POST /containers/create`. For paths that those checks catch, the model can return a different outcome from the implementations:
+  - `DELETE /containers/mycontainer/exec` is `allowUnknown` in the model, but the exec check in all three implementations denies it.
+  - `POST /containers/create` is `deny` in the model, but in reality it routes to container create.
+
+  Only the property and the table rows are claims about the code. `reservedExecDeleteDenied` (`DELETE /containers/exec`) is decided in all three implementations by the exec check, not by the reserved set. Its language tests would therefore not catch `exec` being dropped from the reserved set.
+- **HEAD is outside the model.** `METHODS` is `GET`, `POST`, `DELETE`. The real lifecycle branches agree on those three methods only. For `HEAD /containers/x`, Go and TypeScript fall through to the GET/HEAD passthrough and allow it. Rust denies it in the lifecycle branch.
 - **Listener fault bias.** `step` crashes an instance on 1 in 10 draws instead of half of all steps, so random runs actually interleave live instances. Every crash stays reachable from every phase, so the reachable state space is unchanged.
 
 ### Attack Scenarios Prevented by Invariants

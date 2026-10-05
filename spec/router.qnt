@@ -3,8 +3,12 @@
 // How the router extracts a container name from a request path, and how
 // the container-lifecycle branch routes on it (#48). Mirrors
 // `extract_container_name` and the lifecycle branch of `Router::route` in
-// rs/src/proxy.rs; Go (`extractContainerName`) and TypeScript
-// (`extractContainerName`) share the lifecycle branch.
+// rs/src/proxy.rs. This is not the full router: checks that run before the
+// lifecycle branch (exec, build, commit, POST /containers/create) are left
+// out. Go (`extractContainerName`) and TypeScript (`extractContainerName`)
+// have the same lifecycle branch for GET, POST and DELETE. HEAD differs:
+// Go and TypeScript allow it through the passthrough, Rust denies it. HEAD
+// is outside METHODS.
 //
 // A path is a list of segments: `DELETE /containers/` is
 // ["containers", ""], `POST /containers//start` is ["containers", "", "start"].
@@ -101,7 +105,8 @@ module router_model {
 
 // ─── Instances ──────────────────────────────────────────────────────────
 
-// Go, TypeScript, and Rust after #48: an empty segment is not a name.
+// The extraction rule of Go, TypeScript, and Rust after #48: an empty
+// segment is not a name.
 module router {
   import router_model(ALLOW_EMPTY_NAME = false).*
 
