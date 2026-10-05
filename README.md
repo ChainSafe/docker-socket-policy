@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 74 unit + 26 integration | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 112 unit | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 108 unit | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 101 unit + 32 integration | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 139 unit | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 156 unit (1 skipped) | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -363,7 +363,7 @@ group to `SupplementaryGroups=`. Otherwise startup fails with the
 
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants.
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models only container-name extraction in the router's container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)).
 
 The CI pipeline runs verification on every push and PR. A violation blocks the build.
 
@@ -371,7 +371,7 @@ The CI pipeline runs verification on every push and PR. A violation blocks the b
 make typecheck            # Quint type-check (proves type safety)
 make verify               # Random-simulation verification (default evaluator)
 make verify BACKEND=rust  # Same, using the faster Rust backend
-make test-spec            # Quint `run` tests for listener.qnt (one per design-table row)
+make test-spec            # Quint `run` tests for listener.qnt and router.qnt (one per table row)
 make validate             # All checks: typecheck + verify + go vet + go test
 ```
 

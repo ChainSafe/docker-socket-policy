@@ -19,7 +19,7 @@ deploy/ — Docker Compose + integration tests
 - `make build-rs` / `make test-rs` / `make lint-rs` — Rust only
 - `make build-ts` / `make test-ts` / `make lint-ts` — TypeScript only
 - `make verify` — Quint spec simulation (request handling + listener)
-- `make test-spec` — Quint `run` tests for `spec/listener.qnt`
+- `make test-spec` — Quint `run` tests for `spec/listener.qnt` and `spec/router.qnt`
 - `make test-integration` — Docker Compose integration tests
 - `make test-integration-sock` — listening-socket integration tests (`IMPL=rs|ts` for the others)
 
@@ -41,7 +41,7 @@ deploy/ — Docker Compose + integration tests
 - Rust: 139 unit tests (main/listener: 23, policy: 15, middleware: 50, proxy: 41, handler: 4, audit: 4, transport: 2)
 - TypeScript: 156 unit tests, 1 skipped (flags: 44, listen: 13 incl. 1 skipped concurrency test (#46), middleware: 41, proxy: 28, policy: 10, handler: 6, shutdown: 5, transport: 5, audit: 4)
 - Integration, per implementation: 32 tests via deploy/test.sh and 15 socket tests via deploy/test-sock.sh (docker-compose)
-- Quint: `make test-spec` runs the `spec/listener.qnt` `run` tests
+- Quint: `make test-spec` runs the `spec/listener.qnt` `run` tests (instances `listener_locked`, `listener_unlocked`) and the `spec/router.qnt` `run` tests (instances `router`, `router_pre48`)
 
 ## Test Conventions
 - Go: stdlib `testing` package, `go test ./...`
