@@ -37,17 +37,17 @@ deploy/ — Docker Compose + integration tests
 - Zero external deps where possible (Go: yaml.v3, Rust: tokio/hyper/serde/clap, TS: yaml)
 
 ## Test Coverage
-- Go: 99 unit tests (main/listener: 23, policy: 10, middleware: 29, proxy: 33, audit: 4)
-- Rust: 137 unit tests (main/listener: 23, policy: 15, middleware: 50, proxy: 39, handler: 4, audit: 4, transport: 2)
-- TypeScript: 155 unit tests, 1 skipped (flags: 44, listen: 13 incl. 1 skipped concurrency test (#46), middleware: 41, proxy: 27, policy: 10, handler: 6, shutdown: 5, transport: 5, audit: 4)
-- Integration, per implementation: 30 tests via deploy/test.sh and 15 socket tests via deploy/test-sock.sh (docker-compose)
+- Go: 101 unit tests (main/listener: 23, policy: 10, middleware: 29, proxy: 35, audit: 4)
+- Rust: 139 unit tests (main/listener: 23, policy: 15, middleware: 50, proxy: 41, handler: 4, audit: 4, transport: 2)
+- TypeScript: 156 unit tests, 1 skipped (flags: 44, listen: 13 incl. 1 skipped concurrency test (#46), middleware: 41, proxy: 28, policy: 10, handler: 6, shutdown: 5, transport: 5, audit: 4)
+- Integration, per implementation: 32 tests via deploy/test.sh and 15 socket tests via deploy/test-sock.sh (docker-compose)
 - Quint: `make test-spec` runs the `spec/listener.qnt` `run` tests
 
 ## Test Conventions
 - Go: stdlib `testing` package, `go test ./...`
 - Rust: `#[cfg(test)]` inline modules, `cargo test`
 - TypeScript: `node:test` framework, `npm run build && node --test dist/*.test.js`
-- Integration: `make test-integration` (30 test cases) and `make test-integration-sock` (15 socket cases) via Docker Compose
+- Integration: `make test-integration` (32 test cases) and `make test-integration-sock` (15 socket cases) via Docker Compose
 
 ## Contribution Workflow
 
