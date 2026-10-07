@@ -29,6 +29,12 @@
 // ALLOW_PERCENT = true models Rust and TypeScript before #53, which routed
 // on the raw path and let encoded segments through. false models all three
 // after the fix: any `%` in the path is denied, for every method.
+//
+// No instance models Go before #53. Go decoded before routing, which is
+// route(m, decodePath(segs)); with this table that agrees with the daemon
+// by construction, so the property cannot express Go's risk: decoding that
+// differs from the daemon's, such as encoded version segments (#57). Go's
+// change is covered by the language handler tests.
 
 module router_model {
   const ALLOW_EMPTY_NAME: bool
@@ -134,8 +140,8 @@ module router_model {
   // ─── Tests: one run per table row ───────────────────────────────────
   //
   // Rows whose outcome depends on neither ALLOW_EMPTY_NAME nor
-  // ALLOW_PERCENT run on every instance. The rows that do, and soundTest,
-  // live in `router`.
+  // ALLOW_PERCENT run on every instance. The rows that do, soundTest and
+  // percentSoundTest live in `router`.
 
   run emptyNameGetAllowedTest =
     assert(route("GET", ["containers", ""]) == "allowRead")
@@ -178,6 +184,13 @@ module router {
   run percentReservedDeleteDeniedTest =
     assert(route("DELETE", ["containers", "%6A%73%6F%6E"]) == "deny")
 
+  run percentNameStartDeniedTest =
+    assert(route("POST", ["containers", "%2F", "start"]) == "deny")
+
+  // A pin, not a discriminator: routing on the raw path already denies it,
+  // since `beacon%2Fstart` is not an action. Only Go's decode-first handler
+  // before #53 would have allowed it, as the daemon reads
+  // `POST /containers/beacon/start`.
   run percentSubpathStartDeniedTest =
     assert(route("POST", ["containers", "beacon%2Fstart"]) == "deny")
 
@@ -185,10 +198,10 @@ module router {
     assert(route("GET", ["containers", "%2F"]) == "deny")
 
   run soundTest =
-    assert(and {
-      lifecycleOnlyTargetsRealNames,
-      routerSeesWhatDaemonSees,
-    })
+    assert(lifecycleOnlyTargetsRealNames)
+
+  run percentSoundTest =
+    assert(routerSeesWhatDaemonSees)
 }
 
 // Rust before #48: `/containers/` and `/containers//start` reach
@@ -215,6 +228,7 @@ module router_pre53 {
     assert(and {
       not(routerSeesWhatDaemonSees),
       route("DELETE", ["containers", "%2F"]) == "allowUnknown",
+      route("POST", ["containers", "%2F", "start"]) == "allowUnknown",
       route("GET", ["containers", "%2F"]) == "allowRead",
     })
 }
