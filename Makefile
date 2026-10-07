@@ -7,7 +7,7 @@ LISTENER_SPEC ?= spec/listener.qnt
 ROUTER_SPEC := spec/router.qnt
 BACKEND ?=
 
-.PHONY: build clean test lint verify typecheck test-spec validate ci-verify release-verify
+.PHONY: build clean test lint verify typecheck test-spec validate ci-verify release-verify test-release
 .PHONY: build-go test-go lint-go build-rs test-rs build-ts test-ts
 
 # ─── Go ──────────────────────────────────────────────
@@ -141,6 +141,11 @@ test-integration-sock-ts:
 	$(MAKE) test-integration-sock IMPL=ts
 
 validate: typecheck verify lint-go test-go
+
+# ─── Release scripts ─────────────────────────────────
+
+test-release:
+	bash scripts/release-version_test.sh
 
 # ─── Reproducible build verification ─────────────────
 

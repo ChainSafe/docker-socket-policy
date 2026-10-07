@@ -59,6 +59,12 @@ jobs:
       - run: make test-ts
       - run: make build-ts
 
+  release-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: make test-release
+
   integration:
     runs-on: ubuntu-latest
     needs: [go]
