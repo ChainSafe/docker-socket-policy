@@ -3,6 +3,7 @@ package proxy
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ChainSafe/docker-socket-policy/go/internal/policy"
@@ -495,11 +496,16 @@ allowed_image_prefixes:
 		// percentReservedDeleteDeniedTest (#53): %6A%73%6F%6E decodes to json.
 		{"DELETE", "/containers/%6A%73%6F%6E", ActionDeny},
 		// percentSubpathStartDeniedTest (#53): a pin; raw routing already denies it.
+		// It discriminates only in Go's handler before #53, which decoded first;
+		// the foo%20bar handler test covers that.
 		{"POST", "/containers/beacon%2Fstart", ActionDeny},
 		// percentNameStartDeniedTest (#53)
 		{"POST", "/containers/%2F/start", ActionDeny},
 		// percentGetDeniedTest (#53)
 		{"GET", "/containers/%2F", ActionDeny},
+		// #53, language-only: HEAD is outside the model's METHODS, but the rule
+		// covers every method.
+		{"HEAD", "/containers/%2F", ActionDeny},
 		// #53: the check runs on the versioned path too.
 		{"DELETE", "/v1.45/containers/foo%25", ActionDeny},
 		// #53: an encoded version prefix is not stripped.
@@ -515,6 +521,10 @@ allowed_image_prefixes:
 			if got.Action != tt.want {
 				t.Fatalf("Route(%s, %s) = %v, want %v (deny msg: %q)",
 					tt.method, tt.path, got.Action, tt.want, got.DenyMsg)
+			}
+			if tt.want == ActionDeny && !strings.Contains(got.DenyMsg, "percent-encoded") {
+				t.Fatalf("Route(%s, %s) deny msg = %q, want it to contain %q",
+					tt.method, tt.path, got.DenyMsg, "percent-encoded")
 			}
 		})
 	}

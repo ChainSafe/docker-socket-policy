@@ -594,11 +594,16 @@ mod tests {
             // percentReservedDeleteDeniedTest (#53): %6A%73%6F%6E decodes to json.
             ("DELETE", "/containers/%6A%73%6F%6E", Action::Deny),
             // percentSubpathStartDeniedTest (#53): a pin; raw routing already denies it.
+            // It discriminates only in Go's handler before #53, which decoded first;
+            // the foo%20bar handler test covers that.
             ("POST", "/containers/beacon%2Fstart", Action::Deny),
             // percentNameStartDeniedTest (#53)
             ("POST", "/containers/%2F/start", Action::Deny),
             // percentGetDeniedTest (#53)
             ("GET", "/containers/%2F", Action::Deny),
+            // #53, language-only: HEAD is outside the model's METHODS, but the rule
+            // covers every method.
+            ("HEAD", "/containers/%2F", Action::Deny),
             // #53: the check runs on the versioned path too.
             ("DELETE", "/v1.45/containers/foo%25", Action::Deny),
             // #53: an encoded version prefix is not stripped.
@@ -611,6 +616,16 @@ mod tests {
         for (method, path, want) in cases {
             let got = router.route(method, path, None);
             assert_eq!(got.action, want, "route({} {})", method, path);
+            if want == Action::Deny {
+                let msg = got.deny_msg.unwrap_or_default();
+                assert!(
+                    msg.contains("percent-encoded"),
+                    "route({} {}) deny msg = {:?}, want it to contain \"percent-encoded\"",
+                    method,
+                    path,
+                    msg
+                );
+            }
         }
     }
 

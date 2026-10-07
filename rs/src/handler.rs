@@ -405,6 +405,9 @@ mod tests {
             .unwrap();
         let resp = handler.handle(req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("percent-encoded"), "deny reason = {:?}", body);
         assert!(captured_uri.lock().unwrap().is_none(), "expected no forward");
     }
 
@@ -417,6 +420,9 @@ mod tests {
             .unwrap();
         let resp = handler.handle(req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("percent-encoded"), "deny reason = {:?}", body);
         assert!(captured_uri.lock().unwrap().is_none(), "expected no forward");
     }
 

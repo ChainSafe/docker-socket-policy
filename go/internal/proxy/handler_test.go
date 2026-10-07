@@ -109,6 +109,9 @@ func TestHandler_DeniesPercentEncodedName(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", w.Code)
 	}
+	if !strings.Contains(w.Body.String(), "percent-encoded") {
+		t.Fatalf("expected a percent-encoded deny reason, got %q", w.Body.String())
+	}
 	if rec.lastRequest != nil {
 		t.Fatal("expected no forward for a percent-encoded path")
 	}
@@ -125,6 +128,9 @@ func TestHandler_DeniesPercentEncodedSlash(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "percent-encoded") {
+		t.Fatalf("expected a percent-encoded deny reason, got %q", w.Body.String())
 	}
 	if rec.lastRequest != nil {
 		t.Fatal("expected no forward for a percent-encoded path")

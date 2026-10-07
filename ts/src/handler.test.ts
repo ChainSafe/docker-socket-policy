@@ -164,6 +164,7 @@ describe("Handler", () => {
     const { res, recorder } = makeResponse();
     await handler.handle(makeRequest("DELETE", "/containers/foo%20bar"), res);
     assert.equal(recorder.statusCode, 403);
+    assert.ok(recorder.body.includes("percent-encoded"), `deny reason = ${JSON.stringify(recorder.body)}`);
     assert.equal(transport.lastRequest, undefined);
   });
 
@@ -174,6 +175,7 @@ describe("Handler", () => {
     const { res, recorder } = makeResponse();
     await handler.handle(makeRequest("DELETE", "/containers/%2F"), res);
     assert.equal(recorder.statusCode, 403);
+    assert.ok(recorder.body.includes("percent-encoded"), `deny reason = ${JSON.stringify(recorder.body)}`);
     assert.equal(transport.lastRequest, undefined);
   });
 

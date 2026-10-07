@@ -364,6 +364,8 @@ check "DELETE /containers/no-such%20x -> 403 (percent-encoded path)" "403" "$S"
 S=$(delete_status "$PROXY/containers/%2F")
 check "DELETE /containers/%2F -> 403 (percent-encoded path)" "403" "$S"
 
+# The handler tests prove the query reaches the daemon unchanged; this check
+# proves an encoded query is not denied.
 S=$(get_status "$PROXY/v1.45/containers/json?filters=%7B%22status%22%3A%5B%22running%22%5D%7D")
 check "GET /v1.45/containers/json?filters=<encoded> -> 200 (query not inspected)" "200" "$S"
 

@@ -284,11 +284,16 @@ describe("Router", () => {
       // percentReservedDeleteDeniedTest (#53): %6A%73%6F%6E decodes to json.
       ["DELETE", "/containers/%6A%73%6F%6E", Action.Deny],
       // percentSubpathStartDeniedTest (#53): a pin; raw routing already denies it.
+      // It discriminates only in Go's handler before #53, which decoded first;
+      // the foo%20bar handler test covers that.
       ["POST", "/containers/beacon%2Fstart", Action.Deny],
       // percentNameStartDeniedTest (#53)
       ["POST", "/containers/%2F/start", Action.Deny],
       // percentGetDeniedTest (#53)
       ["GET", "/containers/%2F", Action.Deny],
+      // #53, language-only: HEAD is outside the model's METHODS, but the rule
+      // covers every method.
+      ["HEAD", "/containers/%2F", Action.Deny],
       // #53: the check runs on the versioned path too.
       ["DELETE", "/v1.45/containers/foo%25", Action.Deny],
       // #53: an encoded version prefix is not stripped.
@@ -297,10 +302,21 @@ describe("Router", () => {
       ["GET", "/networks/a%20b", Action.Deny],
       // #53 control: a plain name is still routed as a container.
       ["DELETE", "/containers/foo", Action.Allow],
+      // #53, TS-only: only the TS router receives the query string (Go and Rust
+      // route URL.EscapedPath() / uri.path()). A % in the query is not checked.
+      ["GET", "/containers/json?filters=%7B%7D", Action.Allow],
+      // Non-GET, so the GET passthrough cannot hide a check placed before the split.
+      ["DELETE", "/containers/foo?force=%31", Action.Allow],
     ];
     for (const [method, path, want] of cases) {
       const r = router.route(method, path);
       assert.equal(r.action, want, `route(${method} ${path})`);
+      if (want === Action.Deny) {
+        assert.ok(
+          r.denyMsg?.includes("percent-encoded"),
+          `route(${method} ${path}) deny msg = ${JSON.stringify(r.denyMsg)}`,
+        );
+      }
     }
   });
 });
