@@ -5,8 +5,8 @@
 set -euo pipefail
 
 SEMVER='^v?([0-9]+)\.([0-9]+)\.([0-9]+)$'
-BREAKING_SUBJECT='^[a-z]+(\([^)]*\))?!:'
-FEATURE_SUBJECT='^feat(\([^)]*\))?:'
+BREAKING_SUBJECT='^[A-Za-z]+(\([^)]*\))?!:'
+FEATURE_SUBJECT='^[Ff][Ee][Aa][Tt](\([^)]*\))?:'
 
 die() {
 	echo "release-version: $*" >&2
