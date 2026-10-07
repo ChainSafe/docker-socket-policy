@@ -84,6 +84,7 @@ test-spec:
 	$(QUINT) test $(LISTENER_SPEC) --main=listener_unlocked
 	$(QUINT) test $(ROUTER_SPEC) --main=router
 	$(QUINT) test $(ROUTER_SPEC) --main=router_pre48
+	$(QUINT) test $(ROUTER_SPEC) --main=router_pre53
 
 verify-ts:
 	$(QUINT) run $(SPEC) --max-steps=50 --invariants allInvariants --backend typescript
