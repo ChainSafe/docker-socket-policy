@@ -46,14 +46,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Bump patch version
+      # Rules: docs/release-versioning.md
+      - name: Bump version from commit types
         id: bump
         run: |
-          LATEST=$(git tag --list 'v*' --sort=-v:refname | head -1 || echo "v0.0.0")
-          MAJOR=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f1)
-          MINOR=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f2)
-          PATCH=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f3)
-          echo "tag=v${MAJOR}.${MINOR}.$((PATCH + 1))" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          LATEST=$(git tag --list --sort=-v:refname | grep -E -m1 '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          RANGE=${LATEST:+$LATEST..}HEAD
+          echo "Latest tag: ${LATEST:-none}; range: $RANGE"
+          git log -z --format=%B "$RANGE" | scripts/release-version.sh "$LATEST" | tee -a "$GITHUB_OUTPUT"
+          git log -z --format=%B "$RANGE" | scripts/release-notes.sh > "$RUNNER_TEMP/release-notes.md"
       - name: Create tag
         run: |
           git config user.name "github-actions[bot]"
@@ -64,6 +66,7 @@ jobs:
         run: |
           gh release create "${{ steps.bump.outputs.tag }}" \
             --title "${{ steps.bump.outputs.tag }}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
             --generate-notes \
             --draft \
             --prerelease
