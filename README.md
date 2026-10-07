@@ -216,6 +216,8 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | GET/HEAD | Any | Allowed (read-only) |
 | Other | Other | **DENIED** |
 
+Any request whose path contains a percent-encoded byte (`%`) is denied with 403 for every method, GET and HEAD included, because the daemon decodes the path before routing. The query string is not inspected, so filters such as `docker ps --filter …` still work. A consequence is that networks whose names contain a space or `%` cannot be inspected or removed through the proxy.
+
 ## Configuration
 
 ### CLI Flags

@@ -50,11 +50,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	route := h.router.Route(r.Method, r.URL.Path, bodyJSON)
+	// Route on the raw path: r.URL.Path is already decoded and would hide %-escapes (#53).
+	path := r.URL.EscapedPath()
+	route := h.router.Route(r.Method, path, bodyJSON)
 
 	extra := map[string]interface{}{
 		"method": r.Method,
-		"path":   r.URL.Path,
+		"path":   path,
 	}
 	if route.Service != "" {
 		extra["service"] = route.Service
@@ -64,7 +66,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if route.Action == ActionDeny {
-		slog.Warn("denied", "method", r.Method, "path", r.URL.Path, "reason", route.DenyMsg)
+		slog.Warn("denied", "method", r.Method, "path", path, "reason", route.DenyMsg)
 		h.auditLog.Deny(r.Method, r.RequestURI, route.DenyMsg, extra)
 		http.Error(w, route.DenyMsg, http.StatusForbidden)
 		return
@@ -73,7 +75,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if route.Action == ActionCreateContainer && route.Policy != nil && bodyJSON != nil {
 		result := h.chain.Execute(r, route.Policy, bodyJSON)
 		if !result.Allowed {
-			slog.Warn("denied by middleware", "method", r.Method, "path", r.URL.Path, "reason", result.Reason)
+			slog.Warn("denied by middleware", "method", r.Method, "path", path, "reason", result.Reason)
 			h.auditLog.Deny(r.Method, r.RequestURI, result.Reason, extra)
 			http.Error(w, result.Reason, http.StatusForbidden)
 			return
@@ -89,7 +91,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
-	slog.Info("allowed", "method", r.Method, "path", r.URL.Path)
+	slog.Info("allowed", "method", r.Method, "path", path)
 	h.auditLog.Allow(r.Method, r.RequestURI, "request allowed", extra)
 
 	h.transport.ServeHTTP(w, r)

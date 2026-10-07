@@ -34,6 +34,11 @@ impl Router {
         path: &str,
         body: Option<&HashMap<String, serde_json::Value>>,
     ) -> RouteResult {
+        // The daemon decodes the path before routing, so deny any escape (#53).
+        if path.contains('%') {
+            return deny("percent-encoded path not allowed");
+        }
+
         let path = strip_api_version(path);
 
         // Read-only endpoints

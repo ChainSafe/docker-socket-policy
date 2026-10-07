@@ -34,6 +34,11 @@ func NewRouter(manager *policy.Manager) *Router {
 }
 
 func (r *Router) Route(method, path string, body map[string]interface{}) *RouteResult {
+	// The daemon decodes the path before routing, so deny any escape (#53).
+	if strings.Contains(path, "%") {
+		return &RouteResult{Action: ActionDeny, DenyMsg: "percent-encoded path not allowed"}
+	}
+
 	path = stripAPIVersion(path)
 
 	if path == "/_ping" || path == "/version" || path == "/info" || strings.HasPrefix(path, "/events") {
