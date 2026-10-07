@@ -15,7 +15,7 @@ The workflow scans every commit in `<latest tag>..HEAD`. It finds the bump for e
 | `no-tag` | there is no tag matching `vX.Y.Z` | start from `v0.0.0`, then apply the rows above | — |
 
 - A minor bump resets the patch number. A major bump resets the minor and patch numbers.
-- The latest tag is the highest version among tags that match `vX.Y.Z` exactly. Other tags are ignored. Versions are compared as numbers, so `v0.10.0` is greater than `v0.9.0`.
+- The latest tag is the highest version among tags that match `vX.Y.Z` exactly and are reachable from the commit being released (`git tag --merged HEAD`). Other tags are ignored. Versions are compared as numbers, so `v0.10.0` is greater than `v0.9.0`.
 - If the range is empty (HEAD is already tagged), the release is still a patch.
 
 ## What Counts
