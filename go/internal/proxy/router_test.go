@@ -407,6 +407,8 @@ allowed_image_prefixes:
 // (/v1.43/containers/create). The router must strip the prefix and route the
 // rest exactly like the unversioned path. TypeScript only stripped undotted
 // prefixes (/v1/...), so dotted paths fell through to the default deny.
+// The TS table also pins TS-only over-strip rows, because Go and Rust strip
+// any /v…/ first segment (#55).
 func TestRouteVersionedPaths(t *testing.T) {
 	m := newTestManager(t, map[string]string{
 		"beacon.yaml": `

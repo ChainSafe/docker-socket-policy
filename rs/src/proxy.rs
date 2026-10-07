@@ -512,6 +512,8 @@ mod tests {
     /// router must strip the prefix and route the rest exactly like the
     /// unversioned path. TypeScript only stripped undotted prefixes
     /// (/v1/...), so dotted paths fell through to the default deny.
+    /// The TS table also pins TS-only over-strip rows, because Go and Rust
+    /// strip any /v…/ first segment (#55).
     #[test]
     fn test_route_versioned_paths() {
         let router = Router::new(make_manager(vec!["alpine"]));
