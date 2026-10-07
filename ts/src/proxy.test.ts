@@ -224,4 +224,32 @@ describe("Router", () => {
       assert.equal(r.action, want, `route(${method} ${path})`);
     }
   });
+
+  // Cross-language parity guard for #52. The Docker CLI prefixes every request
+  // with a dotted API version (/v1.43/containers/create). The router must
+  // strip the prefix and route the rest exactly like the unversioned path.
+  // stripAPIVersion only stripped undotted prefixes (/v1/...), so dotted paths
+  // fell through to the default deny.
+  it("routes dotted API-version paths like the unversioned ones", () => {
+    const cases: [string, string, Record<string, unknown> | undefined, Action][] = [
+      // #52: dotted version, container lifecycle delete.
+      ["DELETE", "/v1.43/containers/foo", undefined, Action.Allow],
+      // #52: dotted version, container lifecycle start.
+      ["POST", "/v1.43/containers/beacon/start", undefined, Action.Allow],
+      // #52: dotted version, create with a policy-allowed image.
+      ["POST", "/v1.43/containers/create", { Image: "nginx:latest" }, Action.CreateContainer],
+      // #52: undotted control — stripped correctly everywhere already.
+      ["POST", "/v1/containers/beacon/start", undefined, Action.Allow],
+      // #52: the reserved segment survives the strip (#24 parity).
+      ["DELETE", "/v1.43/containers/json", undefined, Action.Deny],
+      // #52 no-overreach: /version is an endpoint, not a version prefix.
+      ["GET", "/version", undefined, Action.Allow],
+      // #52 no-overreach: /volumes must not be mistaken for a version prefix.
+      ["DELETE", "/volumes/x", undefined, Action.Deny],
+    ];
+    for (const [method, path, body, want] of cases) {
+      const r = router.route(method, path, body);
+      assert.equal(r.action, want, `route(${method} ${path})`);
+    }
+  });
 });
