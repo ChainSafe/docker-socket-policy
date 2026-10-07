@@ -401,14 +401,12 @@ allowed_image_prefixes:
 	}
 }
 
-// TestRouteVersionedPaths is the cross-language parity guard for #52.
+// TestRouteVersionedPaths is the cross-language parity guard for #52 and #57.
 //
 // The Docker CLI prefixes every request with a dotted API version
 // (/v1.43/containers/create). The router must strip the prefix and route the
-// rest exactly like the unversioned path. TypeScript only stripped undotted
-// prefixes (/v1/...), so dotted paths fell through to the default deny.
-// The TS table also pins TS-only over-strip rows, because Go and Rust strip
-// any /v…/ first segment (#55).
+// rest exactly like the unversioned path. The table pins one canonical prefix
+// rule, ^/v\d+(\.\d+)?/ with ASCII digits, in all three languages (#52, #57).
 func TestRouteVersionedPaths(t *testing.T) {
 	m := newTestManager(t, map[string]string{
 		"beacon.yaml": `
@@ -435,6 +433,28 @@ allowed_image_prefixes:
 		{"POST", "/v1/containers/beacon/start", nil, ActionAllow},
 		// #52: the reserved segment survives the strip (#24 parity).
 		{"DELETE", "/v1.43/containers/json", nil, ActionDeny},
+		// #57: undotted version, container lifecycle delete.
+		{"DELETE", "/v1/containers/foo", nil, ActionAllow},
+		// #57: multi-digit major version.
+		{"DELETE", "/v10.0/containers/foo", nil, ActionAllow},
+		// #57: /volumes/ is not a version; the daemon routes this as a volume removal.
+		{"DELETE", "/volumes/containers/foo", nil, ActionDeny},
+		// #57: /version/ is not a version prefix.
+		{"DELETE", "/version/containers/foo", nil, ActionDeny},
+		// #57: two dots is not an API version.
+		{"DELETE", "/v1.2.3/containers/foo", nil, ActionDeny},
+		// #57: no digits after v.
+		{"DELETE", "/vabc/containers/foo", nil, ActionDeny},
+		// #57: bare v.
+		{"DELETE", "/v/containers/foo", nil, ActionDeny},
+		// #57: dot without a minor version.
+		{"DELETE", "/v1./containers/foo", nil, ActionDeny},
+		// #57: strip once; the remaining /v1.43/containers/foo matches no route.
+		{"DELETE", "/v1/v1.43/containers/foo", nil, ActionDeny},
+		// #57: a non-ASCII digit (U+0661 ARABIC-INDIC DIGIT ONE) is not a version digit.
+		{"DELETE", "/v\u0661/containers/foo", nil, ActionDeny},
+		// #57 sanity row, cannot fail: GET /version is allowed as a read-only request.
+		{"GET", "/version", nil, ActionAllow},
 	}
 	for _, tt := range tests {
 		t.Run(tt.method+" "+tt.path, func(t *testing.T) {

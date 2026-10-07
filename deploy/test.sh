@@ -336,6 +336,11 @@ check "POST /v1.45/containers/*/start -> 404 (daemon answered, not proxy 403)" "
 S=$(delete_status "$PROXY/v1.45/containers/json")
 check "DELETE /v1.45/containers/json -> 403 (reserved survives version strip)" "403" "$S"
 
+# #57: /volumes/ is not an API-version prefix. The daemon would run a volume
+# removal; the proxy must not classify it as a container delete.
+S=$(delete_status "$PROXY/volumes/containers/no-such-container")
+check "DELETE /volumes/containers/no-such-container -> 403 (not a version prefix)" "403" "$S"
+
 # #52: versioned create, the `docker run` path. Mirrors the unversioned
 # allowed-image create above: the daemon answers 201, or 404 when the image is
 # not present locally — anything but a proxy 403.
