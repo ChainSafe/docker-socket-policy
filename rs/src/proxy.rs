@@ -197,11 +197,32 @@ fn deny(msg: &str) -> RouteResult {
     }
 }
 
+// Strips one leading /v<N>/ or /v<N>.<M>/ (ASCII digits only); anything else is left as is (#57).
 fn strip_api_version(path: &str) -> &str {
-    if let Some(rest) = path.strip_prefix("/v") {
-        if let Some(idx) = rest.find('/') {
-            return &rest[idx..];
+    let Some(rest) = path.strip_prefix("/v") else {
+        return path;
+    };
+    let bytes = rest.as_bytes();
+    let digits = |from: usize| {
+        bytes[from..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    };
+    let major = digits(0);
+    if major == 0 {
+        return path;
+    }
+    let mut i = major;
+    if bytes.get(i) == Some(&b'.') {
+        let minor = digits(i + 1);
+        if minor == 0 {
+            return path;
         }
+        i += 1 + minor;
+    }
+    if bytes.get(i) == Some(&b'/') {
+        return &rest[i..];
     }
     path
 }

@@ -158,14 +158,33 @@ func (r *Router) routeImagePull(body map[string]interface{}) *RouteResult {
 	return &RouteResult{Action: ActionAllow, Image: fromImage}
 }
 
+// stripAPIVersion strips one leading /v<N>/ or /v<N>.<M>/ (ASCII digits only), else returns path unchanged (#57).
 func stripAPIVersion(path string) string {
-	if strings.HasPrefix(path, "/v") {
-		parts := strings.SplitN(path, "/", 3)
-		if len(parts) >= 3 {
-			return "/" + parts[2]
+	if !strings.HasPrefix(path, "/v") {
+		return path
+	}
+	i := scanDigits(path, 2)
+	if i == 2 {
+		return path
+	}
+	if i < len(path) && path[i] == '.' {
+		j := scanDigits(path, i+1)
+		if j == i+1 {
+			return path
 		}
+		i = j
+	}
+	if i < len(path) && path[i] == '/' {
+		return path[i:]
 	}
 	return path
+}
+
+func scanDigits(s string, i int) int {
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	return i
 }
 
 func matchEndpoint(path, resource, endpoint string) bool {
