@@ -326,15 +326,15 @@ S=$(post_empty "$PROXY/containers//start")
 check "POST /containers//start -> 403 (empty name, not a container)" "403" "$S"
 
 # Dotted API-version prefix (#52). The Docker CLI versions every request
-# (/v1.47/containers/...). The proxy must strip the prefix and route the rest
+# (/v1.45/containers/...). The proxy must strip the prefix and route the rest
 # like the unversioned path: a lifecycle call reaches the daemon (404, no such
 # container — not a proxy 403), and a reserved segment is still denied.
 # TypeScript only stripped undotted prefixes, so these fell to the default deny.
-S=$(post_empty "$PROXY/v1.47/containers/no-such-container/start")
-check "POST /v1.47/containers/*/start -> 404 (daemon answered, not proxy 403)" "404" "$S"
+S=$(post_empty "$PROXY/v1.45/containers/no-such-container/start")
+check "POST /v1.45/containers/*/start -> 404 (daemon answered, not proxy 403)" "404" "$S"
 
-S=$(delete_status "$PROXY/v1.47/containers/json")
-check "DELETE /v1.47/containers/json -> 403 (reserved survives version strip)" "403" "$S"
+S=$(delete_status "$PROXY/v1.45/containers/json")
+check "DELETE /v1.45/containers/json -> 403 (reserved survives version strip)" "403" "$S"
 
 # ─── Summary ──────────────────────────────────────────
 

@@ -225,11 +225,15 @@ describe("Router", () => {
     }
   });
 
-  // Cross-language parity guard for #52. The Docker CLI prefixes every request
-  // with a dotted API version (/v1.43/containers/create). The router must
-  // strip the prefix and route the rest exactly like the unversioned path.
-  // stripAPIVersion only stripped undotted prefixes (/v1/...), so dotted paths
-  // fell through to the default deny.
+  // Guard for #52. The first five rows are the cross-language parity table:
+  // the Docker CLI prefixes every request with a dotted API version
+  // (/v1.43/containers/create), and the router must strip the prefix and route
+  // the rest exactly like the unversioned path. stripAPIVersion only stripped
+  // undotted prefixes (/v1/...), so dotted paths fell through to the default
+  // deny. The last three rows are TS-only: they pin TS's intended strip
+  // (/v<major> or /v<major>.<minor> only). Go and Rust currently strip any
+  // /v…/ first segment and so ALLOW both over-strip paths — tracked in
+  // #53/#55; do not copy those rows there as parity.
   it("routes dotted API-version paths like the unversioned ones", () => {
     const cases: [string, string, Record<string, unknown> | undefined, Action][] = [
       // #52: dotted version, container lifecycle delete.
@@ -242,10 +246,15 @@ describe("Router", () => {
       ["POST", "/v1/containers/beacon/start", undefined, Action.Allow],
       // #52: the reserved segment survives the strip (#24 parity).
       ["DELETE", "/v1.43/containers/json", undefined, Action.Deny],
-      // #52 no-overreach: /version is an endpoint, not a version prefix.
+      // #52 sanity row, cannot fail: GET /version lands on the GET passthrough
+      // whatever is stripped. Kept as documentation of the expected outcome.
       ["GET", "/version", undefined, Action.Allow],
-      // #52 no-overreach: /volumes must not be mistaken for a version prefix.
-      ["DELETE", "/volumes/x", undefined, Action.Deny],
+      // #52 over-strip guard (TS-only, see header): stripping /volumes/ as a
+      // version prefix would make this DELETE /containers/foo -> Allow.
+      ["DELETE", "/volumes/containers/foo", undefined, Action.Deny],
+      // #52 over-strip guard (TS-only, see header): two dots is not an API
+      // version; stripping /v1.2.3/ would make this DELETE /containers/foo -> Allow.
+      ["DELETE", "/v1.2.3/containers/foo", undefined, Action.Deny],
     ];
     for (const [method, path, body, want] of cases) {
       const r = router.route(method, path, body);
