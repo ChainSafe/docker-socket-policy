@@ -507,6 +507,36 @@ mod tests {
         }
     }
 
+    /// Cross-language parity guard for #52. The Docker CLI prefixes every
+    /// request with a dotted API version (/v1.43/containers/create). The
+    /// router must strip the prefix and route the rest exactly like the
+    /// unversioned path. TypeScript only stripped undotted prefixes
+    /// (/v1/...), so dotted paths fell through to the default deny.
+    /// The TS table also pins TS-only over-strip rows, because Go and Rust
+    /// strip any /v…/ first segment (#55).
+    #[test]
+    fn test_route_versioned_paths() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let create_body: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Image": "alpine:latest"})).unwrap();
+        let cases = [
+            // #52: dotted version, container lifecycle delete.
+            ("DELETE", "/v1.43/containers/foo", None, Action::Allow),
+            // #52: dotted version, container lifecycle start.
+            ("POST", "/v1.43/containers/beacon/start", None, Action::Allow),
+            // #52: dotted version, create with a policy-allowed image.
+            ("POST", "/v1.43/containers/create", Some(&create_body), Action::CreateContainer),
+            // #52: undotted control — stripped correctly everywhere already.
+            ("POST", "/v1/containers/beacon/start", None, Action::Allow),
+            // #52: the reserved segment survives the strip (#24 parity).
+            ("DELETE", "/v1.43/containers/json", None, Action::Deny),
+        ];
+        for (method, path, body, want) in cases {
+            let got = router.route(method, path, body);
+            assert_eq!(got.action, want, "route({} {})", method, path);
+        }
+    }
+
     #[test]
     fn test_extract_container_name_skips_empty_segment() {
         for path in ["/containers/", "/containers//start"] {

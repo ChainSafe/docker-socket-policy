@@ -325,6 +325,29 @@ check "DELETE /containers/ -> 403 (empty name, not a container)" "403" "$S"
 S=$(post_empty "$PROXY/containers//start")
 check "POST /containers//start -> 403 (empty name, not a container)" "403" "$S"
 
+# Dotted API-version prefix (#52). The Docker CLI versions every request
+# (/v1.45/containers/...). The proxy must strip the prefix and route the rest
+# like the unversioned path: a lifecycle call reaches the daemon (404, no such
+# container — not a proxy 403), and a reserved segment is still denied.
+# TypeScript only stripped undotted prefixes, so these fell to the default deny.
+S=$(post_empty "$PROXY/v1.45/containers/no-such-container/start")
+check "POST /v1.45/containers/*/start -> 404 (daemon answered, not proxy 403)" "404" "$S"
+
+S=$(delete_status "$PROXY/v1.45/containers/json")
+check "DELETE /v1.45/containers/json -> 403 (reserved survives version strip)" "403" "$S"
+
+# #52: versioned create, the `docker run` path. Mirrors the unversioned
+# allowed-image create above: the daemon answers 201, or 404 when the image is
+# not present locally — anything but a proxy 403.
+S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/v1.45/containers/create")
+if [ "$S" = "201" ] || [ "$S" = "404" ]; then
+  echo "  PASS: POST /v1.45/containers/create with allowed image -> $S (not 403)"
+  PASS=$((PASS+1))
+else
+  echo "  FAIL: POST /v1.45/containers/create with allowed image (expected 201|404, got $S)"
+  FAIL=$((FAIL+1))
+fi
+
 # ─── Summary ──────────────────────────────────────────
 
 echo ""

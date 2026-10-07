@@ -401,6 +401,52 @@ allowed_image_prefixes:
 	}
 }
 
+// TestRouteVersionedPaths is the cross-language parity guard for #52.
+//
+// The Docker CLI prefixes every request with a dotted API version
+// (/v1.43/containers/create). The router must strip the prefix and route the
+// rest exactly like the unversioned path. TypeScript only stripped undotted
+// prefixes (/v1/...), so dotted paths fell through to the default deny.
+// The TS table also pins TS-only over-strip rows, because Go and Rust strip
+// any /v…/ first segment (#55).
+func TestRouteVersionedPaths(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m)
+
+	tests := []struct {
+		method string
+		path   string
+		body   map[string]interface{}
+		want   Action
+	}{
+		// #52: dotted version, container lifecycle delete.
+		{"DELETE", "/v1.43/containers/foo", nil, ActionAllow},
+		// #52: dotted version, container lifecycle start.
+		{"POST", "/v1.43/containers/beacon/start", nil, ActionAllow},
+		// #52: dotted version, create with a policy-allowed image.
+		{"POST", "/v1.43/containers/create", map[string]interface{}{"Image": "chainsafe/lodestar:next"}, ActionCreateContainer},
+		// #52: undotted control — stripped correctly everywhere already.
+		{"POST", "/v1/containers/beacon/start", nil, ActionAllow},
+		// #52: the reserved segment survives the strip (#24 parity).
+		{"DELETE", "/v1.43/containers/json", nil, ActionDeny},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, tt.body)
+			if got.Action != tt.want {
+				t.Fatalf("Route(%s, %s) = %v, want %v (deny msg: %q)",
+					tt.method, tt.path, got.Action, tt.want, got.DenyMsg)
+			}
+		})
+	}
+}
+
 func TestExtractContainerNameSkipsEmptySegment(t *testing.T) {
 	for _, path := range []string{"/containers/", "/containers//start"} {
 		if got := extractContainerName(path); got != "" {
