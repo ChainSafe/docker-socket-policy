@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 101 unit + 32 integration | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 139 unit | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 156 unit (1 skipped) | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 102 unit + 34 integration | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 140 unit | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 157 unit (1 skipped) | Node 22 ESM, built-in http |
 
 ### Build All
 
