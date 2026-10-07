@@ -116,7 +116,8 @@ export class Router {
 }
 
 function stripAPIVersion(path: string): string {
-  const match = path.match(/^\/v\d+\//);
+  // Accepts /v<major> and /v<major>.<minor> (the Docker CLI sends /v1.43/) (#52).
+  const match = path.match(/^\/v\d+(\.\d+)?\//);
   return match ? path.slice(match[0].length - 1) : path;
 }
 
