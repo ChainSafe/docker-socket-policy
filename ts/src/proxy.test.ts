@@ -233,7 +233,7 @@ describe("Router", () => {
   // deny. The last three rows are TS-only: they pin TS's intended strip
   // (/v<major> or /v<major>.<minor> only). Go and Rust currently strip any
   // /v…/ first segment and so ALLOW both over-strip paths — tracked in
-  // #53/#55; do not copy those rows there as parity.
+  // #55; do not copy those rows there as parity.
   it("routes dotted API-version paths like the unversioned ones", () => {
     const cases: [string, string, Record<string, unknown> | undefined, Action][] = [
       // #52: dotted version, container lifecycle delete.
