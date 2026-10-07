@@ -8,11 +8,11 @@ The workflow scans every commit in `<latest tag>..HEAD`. It finds the bump for e
 
 | Row | The commits in the range include | Below 1.0.0 | 1.0.0 and above |
 |---|---|---|---|
-| `release-as` | a `Release-As: vX.Y.Z` line | exactly that version | exactly that version |
+| `release-as` | a `Release-As: vX.Y.Z` line (the newest one decides) | exactly that version | exactly that version |
 | `breaking` | a subject `type!:` / `type(scope)!:`, or a line starting `BREAKING CHANGE:` / `BREAKING-CHANGE:` | minor | major |
 | `feature` | a subject `feat:` / `feat(scope):` | minor | minor |
 | `other` | anything else (`fix`, `docs`, `chore`, `test`, `spec`, `ci`, non-conventional) | patch | patch |
-| `no-tag` | there is no release tag | start from `v0.0.0`, then apply the rows above | — |
+| `no-tag` | there is no tag matching `vX.Y.Z` | start from `v0.0.0`, then apply the rows above | — |
 
 - A minor bump resets the patch number. A major bump resets the minor and patch numbers.
 - The latest tag is the highest version among tags that match `vX.Y.Z` exactly. Other tags are ignored. Versions are compared as numbers, so `v0.10.0` is greater than `v0.9.0`.
@@ -38,19 +38,18 @@ A `Release-As` footer sets the version exactly and overrides the computed bump.
 
 | Item | Rule |
 |---|---|
-| Syntax | `Release-As: vX.Y.Z`. The key is case-insensitive, the `v` is optional, and whitespace around the value is ignored. |
+| Syntax | `Release-As: vX.Y.Z`. The key is case-insensitive, the `v` is optional (`0.3.0` and `v0.3.0` are the same value), and whitespace around the value is ignored. |
+| Several in the range | only the newest one decides; older ones are ignored |
 | Valid value | three numeric parts, strictly greater than the latest tag |
-| Malformed value (for example, `Release-As: 0.3`) | the release job fails |
-| Value not greater than the latest tag | the release job fails |
-| Two different values in the range | the release job fails |
-| The same value more than once | accepted |
+| Newest value malformed (for example, `Release-As: 0.3`) | the `version` job's bump step fails |
+| Newest value not greater than the latest tag | the `version` job's bump step fails |
 | Scope | applies only to the release whose range contains it; the next release computes normally |
 
-If the job fails, no tag is created. To recover, push a new commit (for example, a revert or a commit with a corrected `Release-As` footer).
+The bump step runs before the tag is created, so when it fails no tag or release exists. To recover, merge a commit whose message carries a corrected `Release-As` footer: it becomes the newest one and decides. (Once the bump step has passed, a later failure, for example in `gh release create` or an artifact job, leaves the tag and draft behind; that is unchanged by this rule.)
 
 ## Release Notes
 
-If the range contains breaking commits, the workflow generates a **⚠️ Breaking changes** section. The section lists the subject of each breaking commit and its `BREAKING CHANGE:` text. It is passed to `gh release create --notes-file … --generate-notes`, which prepends it to GitHub's generated notes. If there are no breaking commits, the notes are GitHub's generated notes only. You do not have to edit the notes by hand.
+If the range contains breaking commits, the workflow generates a **⚠️ Breaking changes** section. The section lists the subject of each breaking commit and its `BREAKING CHANGE:` text. It is passed to `gh release create --notes-file … --generate-notes`, which prepends it to GitHub's generated notes. If there are no breaking commits, the notes are GitHub's generated notes only. You no longer have to add the breaking-change section by hand; impact or migration detail beyond the footer text still needs a human.
 
 ## Guidance for Whoever Squash-Merges
 
@@ -59,7 +58,7 @@ If the range contains breaking commits, the workflow generates a **⚠️ Breaki
 | Squash title | the Conventional Commit subject, which sets the type: `fix(release): … (#54)`, `feat!: … (#47)` |
 | Squash body | footers: `BREAKING CHANGE: <what breaks and how to migrate>`, `Release-As: vX.Y.Z` |
 
-Check the title before you merge. GitHub pre-fills it from the PR title, and a wrong type gives a wrong version.
+Check the pre-filled title and body before you merge: a wrong type gives a wrong version.
 
 ## Worked Examples
 
