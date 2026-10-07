@@ -73,6 +73,7 @@ Build verification steps must be documented in the project README or a dedicated
 ## Versioning
 
 - SemVer (`vMAJOR.MINOR.PATCH`)
+- The bump is derived from Conventional Commit types since the last tag; see [release-versioning.md](release-versioning.md) for this repo's rule
 - CHANGELOG per Keep a Changelog
 - Pre-release tags (e.g. `v1.0.0-rc.1`) publish with `--prerelease`
 

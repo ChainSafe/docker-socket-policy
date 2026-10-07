@@ -83,8 +83,10 @@ substitute.
      its issue closed by hand.
 4. **Commit with Conventional Commits** (`feat:`, `fix:`, `docs:`, `spec:`,
    `chore:`), optionally scoped — `fix(release):`. The release pipeline derives
-   version bumps from these, so the type is not cosmetic. Mark breaking changes
-   with `!` (`feat!:`) or a `BREAKING CHANGE:` footer.
+   version bumps from the commits since the last tag (see
+   [docs/release-versioning.md](docs/release-versioning.md)), so the type is not
+   cosmetic. Mark breaking changes with `!` (`feat!:`) or a `BREAKING CHANGE:`
+   footer; a `Release-As: vX.Y.Z` footer sets the version exactly.
 5. **Open the PR with a closing keyword** so the issue auto-closes on merge:
    `Closes #123` in the body. Fill in `.github/PULL_REQUEST_TEMPLATE.md` honestly —
    only tick test boxes for suites actually run, and paste the evidence.
