@@ -104,6 +104,7 @@ expect_error() {
 }
 
 # expect_notes NAME NEEDLE... -- MSG... — notes exit 0 and contain every NEEDLE.
+# A NEEDLE starting with "!" must NOT appear in the notes.
 expect_notes() {
 	local name=$1 why
 	shift
@@ -126,11 +127,23 @@ expect_notes() {
 	fi
 	local n
 	for n in "${needles[@]}"; do
-		case "$out" in
-		*"$n"*) ;;
+		case "$n" in
+		!*)
+			case "$out" in
+			*"${n#!}"*)
+				fail "$name" "want output without '${n#!}', got '$out'"
+				return
+				;;
+			esac
+			;;
 		*)
-			fail "$name" "want output containing '$n', got '$out'"
-			return
+			case "$out" in
+			*"$n"*) ;;
+			*)
+				fail "$name" "want output containing '$n', got '$out'"
+				return
+				;;
+			esac
 			;;
 		esac
 	done
@@ -170,6 +183,7 @@ expect other v0.2.25 patch v0.2.26 "fix: x"
 expect other/non-conventional v0.2.25 patch v0.2.26 "Update README"
 expect other/docs-chore-test v0.2.25 patch v0.2.26 "docs: a" "chore: b" "test: c" "spec: d" "ci: e"
 expect other/empty-range v0.2.25 patch v0.2.26
+expect other/case-insensitive v0.2.25 patch v0.2.26 "Fix: a"
 
 # ─── feature ─────────────────────────────────────────
 expect feature v0.2.25 minor v0.3.0 "feat: x"
@@ -179,6 +193,7 @@ expect feature/mid-line v0.2.25 patch v0.2.26 "fix: handle feat: prefix"
 expect feature/body-line-not-subject v0.2.25 patch v0.2.26 "fix: x${NL}${NL}feat: y"
 expect feature/highest-wins v0.2.25 minor v0.3.0 "fix: a" "feat: b" "docs: c"
 expect feature/above-1.0 v1.4.2 minor v1.5.0 "feat: x"
+expect feature/case-insensitive v0.2.25 minor v0.3.0 "FEAT: a"
 
 # ─── breaking ────────────────────────────────────────
 expect breaking v0.2.25 minor v0.3.0 "fix!: x"
@@ -190,6 +205,9 @@ expect breaking/body-bang-not-subject v0.2.25 patch v0.2.26 "fix: x${NL}${NL}fix
 expect breaking/above-1.0 v1.4.2 major v2.0.0 "fix!: x"
 expect breaking/feat-bang-major v1.4.2 major v2.0.0 "feat!: x"
 expect breaking/highest-wins v1.4.2 major v2.0.0 "fix: a" "fix!: b" "feat: c"
+expect breaking/case-insensitive v1.0.0 major v2.0.0 "Feat!: a"
+# The footer token is case-sensitive (Conventional Commits): a lowercase one is plain text.
+expect breaking/footer-lowercase v0.2.25 patch v0.2.26 "fix: x${NL}${NL}breaking change: y"
 
 # ─── no-tag ──────────────────────────────────────────
 expect no-tag "" patch v0.0.1 "fix: x"
@@ -243,6 +261,22 @@ expect_notes notes/breaking \
 expect_notes notes/breaking-subject \
 	"Breaking changes" "feat(rs)!: drop z" -- \
 	"feat(rs)!: drop z"
+expect_notes notes/breaking-subject-case-insensitive \
+	"Breaking changes" "Feat!: a" -- \
+	"Feat!: a"
+# The footer value runs to a blank line, the next footer token, or the end of the message.
+expect_notes notes/multi-line-footer \
+	"- fix: x${NL}  - line one${NL}    continues here" "!Release-As" -- \
+	"fix: x${NL}${NL}BREAKING CHANGE: line one${NL}continues here${NL}${NL}Release-As: v0.3.0"
+expect_notes notes/footer-ends-at-next-token \
+	"  - line one" "!Refs" -- \
+	"fix: x${NL}${NL}BREAKING CHANGE: line one${NL}Refs: #1"
+expect_notes notes/bare-footer \
+	"Breaking changes" "- fix: x" "!${NL}  -" -- \
+	"fix: x${NL}${NL}BREAKING CHANGE:"
+expect_notes notes/crlf \
+	"Breaking changes" "fix!: x" "  - y is gone" "!"$'\r' -- \
+	"fix!: x"$'\r'"${NL}"$'\r'"${NL}BREAKING CHANGE: y is gone"$'\r'
 expect_no_notes notes/none "fix: a" "feat: b${NL}${NL}* feat!: bullet only"
 expect_no_notes notes/empty-range
 
