@@ -209,7 +209,8 @@ fn strip_api_version(path: &str) -> &str {
 fn extract_container_name(path: &str) -> Option<&str> {
     let path = path.strip_prefix('/').unwrap_or(path);
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() >= 2 && parts[0] == "containers" && parts[1] != "create" && parts[1] != "json" && parts[1] != "exec" {
+    // An empty segment is not a name, mirroring Go/TS (#48).
+    if parts.len() >= 2 && parts[0] == "containers" && !parts[1].is_empty() && parts[1] != "create" && parts[1] != "json" && parts[1] != "exec" {
         Some(parts[1])
     } else {
         None
@@ -449,14 +450,20 @@ mod tests {
         let router = Router::new(make_manager(vec!["alpine"]));
         let cases = [
             // Reserved: must not be mistaken for a container to remove.
+            // reservedJsonDeleteDeniedTest
             ("DELETE", "/containers/json", Action::Deny),
+            // reservedCreateDeleteDeniedTest
             ("DELETE", "/containers/create", Action::Deny),
+            // reservedExecDeleteDeniedTest: denied by the exec check, before the lifecycle branch.
+            ("DELETE", "/containers/exec", Action::Deny),
             // Listing stays allowed, via the GET/HEAD passthrough.
             ("GET", "/containers/json", Action::Allow),
             // A real container name is still routed as a container.
+            // realNameDeleteAllowedTest
             ("DELETE", "/containers/mycontainer", Action::Allow),
             ("GET", "/containers/mycontainer", Action::Allow),
             // Reserved words are only reserved in the name position.
+            // reservedInSubpathAllowedTest
             ("GET", "/containers/mycontainer/json", Action::Allow),
         ];
         for (method, path, want) in cases {
@@ -476,6 +483,35 @@ mod tests {
             extract_container_name("/containers/mycontainer/json"),
             Some("mycontainer")
         );
+    }
+
+    /// Cross-language parity guard for #48. An empty segment in the name
+    /// position (/containers/, /containers//start) is not a container name.
+    /// Treating it as one routes the request down the lifecycle path, where an
+    /// unknown container is allowed through. Rows mirror the emptyName* runs
+    /// in spec/router.qnt.
+    #[test]
+    fn test_route_empty_container_name() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let cases = [
+            // emptyNameDeleteDeniedTest
+            ("DELETE", "/containers/", Action::Deny),
+            // emptyNameStartDeniedTest
+            ("POST", "/containers//start", Action::Deny),
+            // emptyNameGetAllowedTest
+            ("GET", "/containers/", Action::Allow),
+        ];
+        for (method, path, want) in cases {
+            let got = router.route(method, path, None);
+            assert_eq!(got.action, want, "route({} {})", method, path);
+        }
+    }
+
+    #[test]
+    fn test_extract_container_name_skips_empty_segment() {
+        for path in ["/containers/", "/containers//start"] {
+            assert_eq!(extract_container_name(path), None, "{} has no container name", path);
+        }
     }
 
     #[test]

@@ -315,6 +315,16 @@ check "DELETE /containers/create -> 403 (reserved, not a container)" "403" "$S"
 S=$(get_status "$PROXY/containers/json")
 check "GET /containers/json -> 200 (still the list endpoint)" "200" "$S"
 
+# Empty name segment (#48). /containers/ and /containers//start carry no
+# container name. Treating "" as a name sent the request down the lifecycle
+# path, where an unknown container is allowed through, so Rust forwarded these
+# while Go and TypeScript denied them.
+S=$(delete_status "$PROXY/containers/")
+check "DELETE /containers/ -> 403 (empty name, not a container)" "403" "$S"
+
+S=$(post_empty "$PROXY/containers//start")
+check "POST /containers//start -> 403 (empty name, not a container)" "403" "$S"
+
 # ─── Summary ──────────────────────────────────────────
 
 echo ""

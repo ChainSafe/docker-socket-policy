@@ -9,6 +9,7 @@ This directory contains a [Quint](https://quint-lang.org/) formal specification 
 | `docker_socket_policy.qnt` | Request-handling spec: policy types, state machine, endpoint routing table, 9 invariants (6 P0 / 3 P1), 6 attack scenario simulations |
 | `listener.qnt` | Listening-socket startup: flag/group selection, existing-path checks, single-instance lock, 6 invariants, one `run` test per design-table row. Instances `listener_locked` (Go, Rust) and `listener_unlocked` (TypeScript) |
 | `listener-design.md` | Design of the listening socket (dockerd parity) that `listener.qnt` models |
+| `router.qnt` | Container-name extraction and the container-lifecycle branch of the router only, not the full router. One `run` test per table row. Instances `router` (the extraction rule of Go, TypeScript, and Rust after #48) and `router_pre48` (Rust's rule before #48) |
 
 ## How to Run
 
@@ -32,6 +33,11 @@ quint typecheck spec/listener.qnt
 quint run spec/listener.qnt --main=listener_locked --max-steps=30 --invariant allListenerInvariants
 quint test spec/listener.qnt --main=listener_locked
 quint test spec/listener.qnt --main=listener_unlocked
+
+# Router model: typecheck, run the table tests on both instances
+quint typecheck spec/router.qnt
+quint test spec/router.qnt --main=router
+quint test spec/router.qnt --main=router_pre48
 
 # Formal model-checking via Apalache (exhaustive, requires Java)
 quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy.qnt
@@ -75,6 +81,23 @@ quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy
 quint run spec/listener.qnt --main=listener_unlocked --max-steps=30 --invariant noLiveTakeover   # violation expected
 ```
 
+### Router path parsing (`router.qnt`)
+
+A path is a list of segments, so `/containers/` is `["containers", ""]` and `/containers//start` is `["containers", "", "start"]`. The second segment is a container name unless it is empty or one of `create`, `json`, `exec`. `lifecycleOnlyTargetsRealNames` checks every method in `GET`, `POST`, `DELETE` against every path of 1 to 3 segments. It holds when each lifecycle allow (`allowKnown` or `allowUnknown`) targets a non-empty, non-reserved name. `soundTest` asserts it on `router`.
+
+| Row (`run <row>Test`) | Request | Outcome | Instances |
+|-----|---------|---------|-----------|
+| `emptyNameDeleteDenied` | `DELETE /containers/` | deny | `router` |
+| `emptyNameStartDenied` | `POST /containers//start` | deny | `router` |
+| `emptyNameGetAllowed` | `GET /containers/` | allow (passthrough) | both |
+| `reservedJsonDeleteDenied` | `DELETE /containers/json` | deny | both |
+| `reservedCreateDeleteDenied` | `DELETE /containers/create` | deny | both |
+| `reservedExecDeleteDenied` | `DELETE /containers/exec` | deny | both |
+| `realNameDeleteAllowed` | `DELETE /containers/mycontainer` | allow (unknown container) | both |
+| `reservedInSubpathAllowed` | `GET /containers/mycontainer/json` | allow | both |
+
+Each implementation's router tests use the same row names in comments (added with the #48 fix). `router_pre48` runs `pre48UnsoundTest`, which asserts that the property fails and that both `emptyName*Denied` requests are allowed as an unknown container ([#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)).
+
 ### Modeling Notes
 
 Two invariants are structurally tautological within the Quint model — they can't be falsified by any action sequence the simulator generates, so they don't get real coverage from `quint run`/`quint verify`:
@@ -83,6 +106,13 @@ Two invariants are structurally tautological within the Quint model — they can
 - **`routingTableComplete`** — checks that `endpointsTable` (a fixed constant) contains a fixed list of literals declared in the same file. It documents the intended routing table but doesn't cross-check it against any of the three Router implementations; that comparison has to be done manually (or via `quint-analyzer`) against `go/internal/proxy/router.go`, `rs/src/proxy.rs`, and `ts/src/proxy.ts`.
 
 - **`listener.qnt` checks the design, not the code.** Nothing in the model is derived from the Go, Rust or TypeScript sources. Conformance rests on each implementation's unit and integration tests, which carry the same names as the Quint `run`s (`groupDefaultPresent`, `pathStaleReplaced`, …) so every design-table row can be traced across all four. `raceWithoutLockTest` (in `listener_unlocked`) is the formal record of the TypeScript gap: Node has no `flock`, so two TypeScript instances starting together can orphan one another's socket ([#46](https://github.com/ChainSafe/docker-socket-policy/issues/46)).
+- **`lifecycleOnlyTargetsRealNames` is close to a tautology.** `route` only allows by name when `hasContainerName` holds, and `hasContainerName` is nearly the property itself. It is not vacuous: on `router_pre48`, where an empty segment counts as a name, the property fails, and `pre48UnsoundTest` asserts that. Most of the evidence comes from the table rows, whose names the language router tests reuse (added with the #48 fix).
+- **`router.qnt` is not the full router.** `route` models only the container-lifecycle branch. It leaves out the checks that the routers run before that branch, such as the exec, build and commit denials and `POST /containers/create`. For paths that those checks catch, the model's outcome can differ from what an implementation does:
+  - `DELETE /containers/mycontainer/exec` is `allowUnknown` in the model. Rust and TypeScript deny it with their exec checks. Go's exec check matches `exec` only in the name position, so Go sends this path down the lifecycle branch and allows it. This divergence between the languages belongs to the same family as [#24](https://github.com/ChainSafe/docker-socket-policy/issues/24) and [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48). It is outside this model's scope and is tracked with the other routing divergences.
+  - `POST /containers/create` is `deny` in the model, but in reality it routes to container create.
+
+  Only the property and the table rows are claims about the code. `reservedExecDeleteDenied` (`DELETE /containers/exec`) is decided in all three implementations by the exec check, not by the reserved set. Its language tests would therefore not catch `exec` being dropped from the reserved set.
+- **HEAD is outside the model.** `METHODS` is `GET`, `POST`, `DELETE`. The real lifecycle branches agree on those three methods only. For `HEAD /containers/x`, Go and TypeScript fall through to the GET/HEAD passthrough and allow it. Rust denies it in the lifecycle branch.
 - **Listener fault bias.** `step` crashes an instance on 1 in 10 draws instead of half of all steps, so random runs actually interleave live instances. Every crash stays reachable from every phase, so the reachable state space is unchanged.
 
 ### Attack Scenarios Prevented by Invariants
@@ -167,6 +197,6 @@ Quint formal verification runs in CI via `.github/workflows/ci.yml` (quint job),
 - run: quint run --max-steps=100 --invariants allInvariants --backend typescript spec/docker_socket_policy.qnt
 ```
 
-In practice the job calls `make typecheck`, `make test-spec` and `make verify BACKEND=typescript`, which also cover `listener.qnt`.
+In practice the job calls `make typecheck`, `make test-spec` and `make verify BACKEND=typescript`, which also cover `listener.qnt` and `router.qnt`.
 
 Releases are handled by `.github/workflows/release.yml`, which auto-bumps the patch version on push to `main`, creates a draft release, builds Docker images, generates SPDX + CycloneDX SBOMs with syft, and signs them with Cosign.
