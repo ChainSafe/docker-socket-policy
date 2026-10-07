@@ -155,4 +155,38 @@ describe("Handler", () => {
     const hostConfig = forwarded["HostConfig"] as Record<string, unknown>;
     assert.equal(hostConfig["NetworkMode"], "host");
   });
+
+  // #53: TS routed on the raw name and forwarded it; the daemon decodes it to
+  // "foo bar" and acts on that container.
+  it("denies a percent-encoded container name with 403", async () => {
+    const dir = makeEnv(defaultConfig);
+    const { handler, transport } = newHandler(dir);
+    const { res, recorder } = makeResponse();
+    await handler.handle(makeRequest("DELETE", "/containers/foo%20bar"), res);
+    assert.equal(recorder.statusCode, 403);
+    assert.equal(transport.lastRequest, undefined);
+  });
+
+  // #53: the daemon reads %2F as a request about "/".
+  it("denies a percent-encoded slash with 403", async () => {
+    const dir = makeEnv(defaultConfig);
+    const { handler, transport } = newHandler(dir);
+    const { res, recorder } = makeResponse();
+    await handler.handle(makeRequest("DELETE", "/containers/%2F"), res);
+    assert.equal(recorder.statusCode, 403);
+    assert.equal(transport.lastRequest, undefined);
+  });
+
+  // #53: the rule looks at the path only; an encoded query string is routine
+  // (docker ps --filter) and must reach the daemon unchanged.
+  it("forwards a percent-encoded query string unchanged", async () => {
+    const dir = makeEnv(defaultConfig);
+    const { handler, transport } = newHandler(dir);
+    const { res, recorder } = makeResponse();
+    const url = "/containers/json?filters=%7B%22status%22%3A%5B%22running%22%5D%7D";
+    await handler.handle(makeRequest("GET", url), res);
+    assert.notEqual(recorder.statusCode, 403);
+    assert.ok(transport.lastRequest, "expected request to be forwarded");
+    assert.equal(transport.lastRequest.url, url);
+  });
 });

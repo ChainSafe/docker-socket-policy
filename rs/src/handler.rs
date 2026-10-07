@@ -366,4 +366,73 @@ mod tests {
         let resp = handler.handle(req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
+
+    struct UriRecordingTransport {
+        captured_uri: Arc<std::sync::Mutex<Option<hyper::Uri>>>,
+    }
+
+    #[async_trait]
+    impl Transport for UriRecordingTransport {
+        async fn forward(
+            &self,
+            req: Request<Full<Bytes>>,
+        ) -> Result<Response<Full<Bytes>>, TransportError> {
+            *self.captured_uri.lock().unwrap() = Some(req.uri().clone());
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::new()))
+                .unwrap())
+        }
+    }
+
+    fn make_uri_recording_handler() -> (Handler, Arc<std::sync::Mutex<Option<hyper::Uri>>>) {
+        let manager = Manager::from_map(std::collections::HashMap::new());
+        let router = Arc::new(Router::new(manager));
+        let chain = Chain::new(false);
+        let audit = AuditLogger::new("/dev/null").unwrap();
+        let captured_uri = Arc::new(std::sync::Mutex::new(None));
+        let transport = UriRecordingTransport { captured_uri: captured_uri.clone() };
+        (Handler::new(router, chain, audit, Box::new(transport)), captured_uri)
+    }
+
+    /// #53: Rust routed on the raw name and forwarded it; the daemon decodes
+    /// it to "foo bar" and acts on that container.
+    #[tokio::test]
+    async fn test_handler_denies_percent_encoded_name() {
+        let (handler, captured_uri) = make_uri_recording_handler();
+        let req = Request::delete("http://localhost/containers/foo%20bar")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(captured_uri.lock().unwrap().is_none(), "expected no forward");
+    }
+
+    /// #53: the daemon reads %2F as a request about "/".
+    #[tokio::test]
+    async fn test_handler_denies_percent_encoded_slash() {
+        let (handler, captured_uri) = make_uri_recording_handler();
+        let req = Request::delete("http://localhost/containers/%2F")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(captured_uri.lock().unwrap().is_none(), "expected no forward");
+    }
+
+    /// #53: the rule looks at the path only; an encoded query string is
+    /// routine (docker ps --filter) and must reach the daemon unchanged.
+    #[tokio::test]
+    async fn test_handler_forwards_percent_encoded_query() {
+        let (handler, captured_uri) = make_uri_recording_handler();
+        let query = "filters=%7B%22status%22%3A%5B%22running%22%5D%7D";
+        let req = Request::get(format!("http://localhost/containers/json?{}", query))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let captured = captured_uri.lock().unwrap();
+        let uri = captured.as_ref().expect("expected request to be forwarded");
+        assert_eq!(uri.query(), Some(query));
+    }
 }

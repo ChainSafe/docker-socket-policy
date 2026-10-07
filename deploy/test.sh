@@ -353,6 +353,20 @@ else
   FAIL=$((FAIL+1))
 fi
 
+# #53: percent-encoded paths. The daemon decodes the path before it routes,
+# so the proxy and the daemon could read the same request differently; any %
+# in the path is denied. curl sends the path as written (it does not decode
+# %XX, and there are no dot segments to squash). The query string is never
+# inspected: an encoded filter, as `docker ps --filter` sends, still passes.
+S=$(delete_status "$PROXY/containers/no-such%20x")
+check "DELETE /containers/no-such%20x -> 403 (percent-encoded path)" "403" "$S"
+
+S=$(delete_status "$PROXY/containers/%2F")
+check "DELETE /containers/%2F -> 403 (percent-encoded path)" "403" "$S"
+
+S=$(get_status "$PROXY/v1.45/containers/json?filters=%7B%22status%22%3A%5B%22running%22%5D%7D")
+check "GET /v1.45/containers/json?filters=<encoded> -> 200 (query not inspected)" "200" "$S"
+
 # ─── Summary ──────────────────────────────────────────
 
 echo ""

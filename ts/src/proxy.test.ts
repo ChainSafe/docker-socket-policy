@@ -270,4 +270,37 @@ describe("Router", () => {
       assert.equal(r.action, want, `route(${method} ${path})`);
     }
   });
+
+  // Cross-language parity guard for #53. The daemon percent-decodes the path
+  // before it routes, so any % in the path lets the proxy and the daemon read
+  // the same request differently. A path containing % is denied for every
+  // method. Rows mirror the percent* runs in spec/router.qnt.
+  it("denies percent-encoded paths", () => {
+    const cases: [string, string, Action][] = [
+      // percentSlashDeleteDeniedTest (#53)
+      ["DELETE", "/containers/%2F", Action.Deny],
+      // percentLowerSlashDeleteDeniedTest (#53)
+      ["DELETE", "/containers/%2f", Action.Deny],
+      // percentReservedDeleteDeniedTest (#53): %6A%73%6F%6E decodes to json.
+      ["DELETE", "/containers/%6A%73%6F%6E", Action.Deny],
+      // percentSubpathStartDeniedTest (#53): a pin; raw routing already denies it.
+      ["POST", "/containers/beacon%2Fstart", Action.Deny],
+      // percentNameStartDeniedTest (#53)
+      ["POST", "/containers/%2F/start", Action.Deny],
+      // percentGetDeniedTest (#53)
+      ["GET", "/containers/%2F", Action.Deny],
+      // #53: the check runs on the versioned path too.
+      ["DELETE", "/v1.45/containers/foo%25", Action.Deny],
+      // #53: an encoded version prefix is not stripped.
+      ["DELETE", "/v%31/containers/foo", Action.Deny],
+      // #53: network names that need escaping are denied, GET included.
+      ["GET", "/networks/a%20b", Action.Deny],
+      // #53 control: a plain name is still routed as a container.
+      ["DELETE", "/containers/foo", Action.Allow],
+    ];
+    for (const [method, path, want] of cases) {
+      const r = router.route(method, path);
+      assert.equal(r.action, want, `route(${method} ${path})`);
+    }
+  });
 });

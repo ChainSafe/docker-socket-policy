@@ -467,6 +467,59 @@ allowed_image_prefixes:
 	}
 }
 
+// TestRoutePercentEncodedPaths is the cross-language parity guard for #53.
+//
+// The daemon percent-decodes the path before it routes, so any % in the path
+// lets the proxy and the daemon read the same request differently. A path
+// containing % is denied for every method. Paths are given raw, as the handler
+// passes r.URL.EscapedPath(). Rows mirror the percent* runs in spec/router.qnt.
+func TestRoutePercentEncodedPaths(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m)
+
+	tests := []struct {
+		method string
+		path   string
+		want   Action
+	}{
+		// percentSlashDeleteDeniedTest (#53)
+		{"DELETE", "/containers/%2F", ActionDeny},
+		// percentLowerSlashDeleteDeniedTest (#53)
+		{"DELETE", "/containers/%2f", ActionDeny},
+		// percentReservedDeleteDeniedTest (#53): %6A%73%6F%6E decodes to json.
+		{"DELETE", "/containers/%6A%73%6F%6E", ActionDeny},
+		// percentSubpathStartDeniedTest (#53): a pin; raw routing already denies it.
+		{"POST", "/containers/beacon%2Fstart", ActionDeny},
+		// percentNameStartDeniedTest (#53)
+		{"POST", "/containers/%2F/start", ActionDeny},
+		// percentGetDeniedTest (#53)
+		{"GET", "/containers/%2F", ActionDeny},
+		// #53: the check runs on the versioned path too.
+		{"DELETE", "/v1.45/containers/foo%25", ActionDeny},
+		// #53: an encoded version prefix is not stripped.
+		{"DELETE", "/v%31/containers/foo", ActionDeny},
+		// #53: network names that need escaping are denied, GET included.
+		{"GET", "/networks/a%20b", ActionDeny},
+		// #53 control: a plain name is still routed as a container.
+		{"DELETE", "/containers/foo", ActionAllow},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, nil)
+			if got.Action != tt.want {
+				t.Fatalf("Route(%s, %s) = %v, want %v (deny msg: %q)",
+					tt.method, tt.path, got.Action, tt.want, got.DenyMsg)
+			}
+		})
+	}
+}
+
 func TestExtractContainerNameSkipsEmptySegment(t *testing.T) {
 	for _, path := range []string{"/containers/", "/containers//start"} {
 		if got := extractContainerName(path); got != "" {
