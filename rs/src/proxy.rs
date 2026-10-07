@@ -34,6 +34,11 @@ impl Router {
         path: &str,
         body: Option<&HashMap<String, serde_json::Value>>,
     ) -> RouteResult {
+        // The daemon decodes the path before routing, so deny any escape (#53).
+        if path.contains('%') {
+            return deny("percent-encoded path not allowed");
+        }
+
         let path = strip_api_version(path);
 
         // Read-only endpoints
@@ -575,6 +580,57 @@ mod tests {
         for (method, path, body, want) in cases {
             let got = router.route(method, path, body);
             assert_eq!(got.action, want, "route({} {})", method, path);
+        }
+    }
+
+    /// Cross-language parity guard for #53. The daemon percent-decodes the
+    /// path before it routes, so any % in the path lets the proxy and the
+    /// daemon read the same request differently. A path containing % is
+    /// denied for every method. Paths are given raw, as the handler routes
+    /// them. Rows mirror the percent* runs in spec/router.qnt.
+    #[test]
+    fn test_route_percent_encoded_paths() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let cases = [
+            // percentSlashDeleteDeniedTest (#53)
+            ("DELETE", "/containers/%2F", Action::Deny),
+            // percentLowerSlashDeleteDeniedTest (#53)
+            ("DELETE", "/containers/%2f", Action::Deny),
+            // percentReservedDeleteDeniedTest (#53): %6A%73%6F%6E decodes to json.
+            ("DELETE", "/containers/%6A%73%6F%6E", Action::Deny),
+            // percentSubpathStartDeniedTest (#53): a pin; raw routing already denies it.
+            // It discriminates only in Go's handler before #53, which decoded first;
+            // the foo%20bar handler test covers that.
+            ("POST", "/containers/beacon%2Fstart", Action::Deny),
+            // percentNameStartDeniedTest (#53)
+            ("POST", "/containers/%2F/start", Action::Deny),
+            // percentGetDeniedTest (#53)
+            ("GET", "/containers/%2F", Action::Deny),
+            // #53, language-only: HEAD is outside the model's METHODS, but the rule
+            // covers every method.
+            ("HEAD", "/containers/%2F", Action::Deny),
+            // #53: the check runs on the versioned path too.
+            ("DELETE", "/v1.45/containers/foo%25", Action::Deny),
+            // #53: an encoded version prefix is not stripped.
+            ("DELETE", "/v%31/containers/foo", Action::Deny),
+            // #53: network names that need escaping are denied, GET included.
+            ("GET", "/networks/a%20b", Action::Deny),
+            // #53 control: a plain name is still routed as a container.
+            ("DELETE", "/containers/foo", Action::Allow),
+        ];
+        for (method, path, want) in cases {
+            let got = router.route(method, path, None);
+            assert_eq!(got.action, want, "route({} {})", method, path);
+            if want == Action::Deny {
+                let msg = got.deny_msg.unwrap_or_default();
+                assert!(
+                    msg.contains("percent-encoded"),
+                    "route({} {}) deny msg = {:?}, want it to contain \"percent-encoded\"",
+                    method,
+                    path,
+                    msg
+                );
+            }
         }
     }
 

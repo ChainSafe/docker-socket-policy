@@ -23,6 +23,8 @@ export class Router {
   route(method: string, path: string, body?: Record<string, unknown>): RouteResult {
     const qmIdx = path.indexOf("?");
     const cleanPath = qmIdx !== -1 ? path.slice(0, qmIdx) : path;
+    // The daemon decodes the path before routing, so deny any escape (#53).
+    if (cleanPath.includes("%")) return { action: Action.Deny, denyMsg: "percent-encoded path not allowed" };
     path = stripAPIVersion(cleanPath);
 
     // Read-only endpoints

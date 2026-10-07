@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ChainSafe/docker-socket-policy/go/internal/audit"
@@ -81,6 +82,81 @@ func TestHandler_DeniesRoute(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", w.Code)
+	}
+}
+
+// newPercentRequest builds a request from a raw target and checks that the
+// escaped path really carries the % (#53).
+func newPercentRequest(t *testing.T, method, target string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(method, target, nil)
+	if !strings.Contains(req.URL.EscapedPath(), "%") {
+		t.Fatalf("precondition: EscapedPath() = %q has no %%", req.URL.EscapedPath())
+	}
+	return req
+}
+
+// #53: before the fix the Go handler routed on the decoded r.URL.Path
+// ("foo bar"), so a router-only fix would never see the '%' and would let
+// this through. The handler must route on the escaped path.
+func TestHandler_DeniesPercentEncodedName(t *testing.T) {
+	rec := &recorderTransport{}
+	h := newTestHandler(t, nil, rec)
+
+	req := newPercentRequest(t, "DELETE", "/containers/foo%20bar")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "percent-encoded") {
+		t.Fatalf("expected a percent-encoded deny reason, got %q", w.Body.String())
+	}
+	if rec.lastRequest != nil {
+		t.Fatal("expected no forward for a percent-encoded path")
+	}
+}
+
+// #53: the daemon reads %2F as a request about "/".
+func TestHandler_DeniesPercentEncodedSlash(t *testing.T) {
+	rec := &recorderTransport{}
+	h := newTestHandler(t, nil, rec)
+
+	req := newPercentRequest(t, "DELETE", "/containers/%2F")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "percent-encoded") {
+		t.Fatalf("expected a percent-encoded deny reason, got %q", w.Body.String())
+	}
+	if rec.lastRequest != nil {
+		t.Fatal("expected no forward for a percent-encoded path")
+	}
+}
+
+// #53: the rule looks at the path only; an encoded query string is routine
+// (docker ps --filter) and must reach the daemon unchanged.
+func TestHandler_ForwardsPercentEncodedQuery(t *testing.T) {
+	rec := &recorderTransport{}
+	h := newTestHandler(t, nil, rec)
+
+	const query = "filters=%7B%22status%22%3A%5B%22running%22%5D%7D"
+	req := httptest.NewRequest("GET", "/containers/json?"+query, nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if rec.lastRequest == nil {
+		t.Fatal("expected request to be forwarded")
+	}
+	if got := rec.lastRequest.URL.RawQuery; got != query {
+		t.Fatalf("forwarded query = %q, want %q", got, query)
 	}
 }
 
