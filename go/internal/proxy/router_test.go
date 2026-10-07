@@ -435,6 +435,8 @@ allowed_image_prefixes:
 		{"DELETE", "/v1.43/containers/json", nil, ActionDeny},
 		// #57: undotted version, container lifecycle delete.
 		{"DELETE", "/v1/containers/foo", nil, ActionAllow},
+		// #57: multi-digit major version.
+		{"DELETE", "/v10.0/containers/foo", nil, ActionAllow},
 		// #57: /volumes/ is not a version; the daemon routes this as a volume removal.
 		{"DELETE", "/volumes/containers/foo", nil, ActionDeny},
 		// #57: /version/ is not a version prefix.
@@ -447,9 +449,11 @@ allowed_image_prefixes:
 		{"DELETE", "/v/containers/foo", nil, ActionDeny},
 		// #57: dot without a minor version.
 		{"DELETE", "/v1./containers/foo", nil, ActionDeny},
-		// #57: only ASCII digits count (U+0661 ARABIC-INDIC DIGIT ONE).
+		// #57: strip once; the remaining /v1.43/containers/foo matches no route.
+		{"DELETE", "/v1/v1.43/containers/foo", nil, ActionDeny},
+		// #57: a non-ASCII digit (U+0661 ARABIC-INDIC DIGIT ONE) is not a version digit.
 		{"DELETE", "/v\u0661/containers/foo", nil, ActionDeny},
-		// #57 sanity row, cannot fail: GET /version lands on the GET passthrough.
+		// #57 sanity row, cannot fail: GET /version is allowed as a read-only request.
 		{"GET", "/version", nil, ActionAllow},
 	}
 	for _, tt := range tests {

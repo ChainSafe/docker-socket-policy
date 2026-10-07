@@ -530,6 +530,8 @@ mod tests {
             ("DELETE", "/v1.43/containers/json", None, Action::Deny),
             // #57: undotted version, container lifecycle delete.
             ("DELETE", "/v1/containers/foo", None, Action::Allow),
+            // #57: multi-digit major version.
+            ("DELETE", "/v10.0/containers/foo", None, Action::Allow),
             // #57: /volumes/ is not a version; the daemon routes this as a volume removal.
             ("DELETE", "/volumes/containers/foo", None, Action::Deny),
             // #57: /version/ is not a version prefix.
@@ -542,9 +544,11 @@ mod tests {
             ("DELETE", "/v/containers/foo", None, Action::Deny),
             // #57: dot without a minor version.
             ("DELETE", "/v1./containers/foo", None, Action::Deny),
-            // #57: only ASCII digits count (U+0661 ARABIC-INDIC DIGIT ONE).
+            // #57: strip once; the remaining /v1.43/containers/foo matches no route.
+            ("DELETE", "/v1/v1.43/containers/foo", None, Action::Deny),
+            // #57: a non-ASCII digit (U+0661 ARABIC-INDIC DIGIT ONE) is not a version digit.
             ("DELETE", "/v\u{0661}/containers/foo", None, Action::Deny),
-            // #57 sanity row, cannot fail: GET /version lands on the GET passthrough.
+            // #57 sanity row, cannot fail: GET /version is allowed as a read-only request.
             ("GET", "/version", None, Action::Allow),
         ];
         for (method, path, body, want) in cases {
