@@ -39,7 +39,7 @@ A `Release-As` footer sets the version exactly and overrides the computed bump.
 | Item | Rule |
 |---|---|
 | Syntax | `Release-As: vX.Y.Z`. The key is case-insensitive, the `v` is optional (`0.3.0` and `v0.3.0` are the same value), and whitespace around the value is ignored. |
-| Several in the range | only the newest one decides; older ones are ignored |
+| Several in the range | only the newest one decides; older ones are ignored. Within one message, the last `Release-As` line decides. |
 | Valid value | three numeric parts, strictly greater than the latest tag |
 | Newest value malformed (for example, `Release-As: 0.3`) | the `version` job's bump step fails |
 | Newest value not greater than the latest tag | the `version` job's bump step fails |
@@ -49,7 +49,7 @@ The bump step runs before the tag is created, so when it fails no tag or release
 
 ## Release Notes
 
-If the range contains breaking commits, the workflow generates a **⚠️ Breaking changes** section. The section lists the subject of each breaking commit and its `BREAKING CHANGE:` text. It is passed to `gh release create --notes-file … --generate-notes`, which prepends it to GitHub's generated notes. If there are no breaking commits, the notes are GitHub's generated notes only. You no longer have to add the breaking-change section by hand; impact or migration detail beyond the footer text still needs a human.
+If the range contains breaking commits, the workflow generates a **⚠️ Breaking changes** section. A commit is breaking for the notes by exactly the `breaking` row's rule (a `!` subject or a `BREAKING CHANGE:` / `BREAKING-CHANGE:` line), so a `* feat!: …` bullet in a squash body does not add an entry. The section lists the subject of each breaking commit and its `BREAKING CHANGE:` text. It is passed to `gh release create --notes-file … --generate-notes`, which prepends it to GitHub's generated notes. If there are no breaking commits, the notes are GitHub's generated notes only. You no longer have to add the breaking-change section by hand; impact or migration detail beyond the footer text still needs a human.
 
 ## Guidance for Whoever Squash-Merges
 
