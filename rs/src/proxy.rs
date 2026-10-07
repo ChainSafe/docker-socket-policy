@@ -507,13 +507,11 @@ mod tests {
         }
     }
 
-    /// Cross-language parity guard for #52. The Docker CLI prefixes every
-    /// request with a dotted API version (/v1.43/containers/create). The
-    /// router must strip the prefix and route the rest exactly like the
-    /// unversioned path. TypeScript only stripped undotted prefixes
-    /// (/v1/...), so dotted paths fell through to the default deny.
-    /// The TS table also pins TS-only over-strip rows, because Go and Rust
-    /// strip any /v…/ first segment (#55).
+    /// Cross-language parity guard for #52 and #57. The Docker CLI prefixes
+    /// every request with a dotted API version (/v1.43/containers/create).
+    /// The router must strip the prefix and route the rest exactly like the
+    /// unversioned path. The table pins one canonical prefix rule,
+    /// ^/v\d+(\.\d+)?/ with ASCII digits, in all three languages (#52, #57).
     #[test]
     fn test_route_versioned_paths() {
         let router = Router::new(make_manager(vec!["alpine"]));
@@ -530,6 +528,24 @@ mod tests {
             ("POST", "/v1/containers/beacon/start", None, Action::Allow),
             // #52: the reserved segment survives the strip (#24 parity).
             ("DELETE", "/v1.43/containers/json", None, Action::Deny),
+            // #57: undotted version, container lifecycle delete.
+            ("DELETE", "/v1/containers/foo", None, Action::Allow),
+            // #57: /volumes/ is not a version; the daemon routes this as a volume removal.
+            ("DELETE", "/volumes/containers/foo", None, Action::Deny),
+            // #57: /version/ is not a version prefix.
+            ("DELETE", "/version/containers/foo", None, Action::Deny),
+            // #57: two dots is not an API version.
+            ("DELETE", "/v1.2.3/containers/foo", None, Action::Deny),
+            // #57: no digits after v.
+            ("DELETE", "/vabc/containers/foo", None, Action::Deny),
+            // #57: bare v.
+            ("DELETE", "/v/containers/foo", None, Action::Deny),
+            // #57: dot without a minor version.
+            ("DELETE", "/v1./containers/foo", None, Action::Deny),
+            // #57: only ASCII digits count (U+0661 ARABIC-INDIC DIGIT ONE).
+            ("DELETE", "/v\u{0661}/containers/foo", None, Action::Deny),
+            // #57 sanity row, cannot fail: GET /version lands on the GET passthrough.
+            ("GET", "/version", None, Action::Allow),
         ];
         for (method, path, body, want) in cases {
             let got = router.route(method, path, body);
