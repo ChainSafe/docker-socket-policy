@@ -217,7 +217,7 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | GET/HEAD | Any path without `%` | Allowed (read-only) |
 | Other | Other | **DENIED** |
 
-Any request whose path contains a percent-encoded byte (`%`) is denied with 403 for every method, GET and HEAD included, because the daemon decodes the path before routing. The query string is not inspected, so filters such as `docker ps --filter …` still work. The Go implementation also denies paths that contain raw characters it must re-encode, such as non-ASCII bytes or `{`; the Docker CLI never sends these. A consequence is that networks whose names contain a space or `%` cannot be inspected through the proxy (other network operations are denied regardless).
+Any request whose path contains a percent-encoded byte (`%`) is denied with 403 for every method, GET and HEAD included, because the daemon decodes the path before routing. The query string is not inspected, so filters such as `docker ps --filter …` still work. The Go implementation also denies paths that contain raw characters it must re-encode, such as non-ASCII bytes or `{`; the Docker CLI never sends these. A consequence is that networks whose names need percent-encoding (for example a space or `%`) cannot be inspected by name through the proxy; inspecting them by ID still works, and other network operations are denied regardless.
 
 ## Configuration
 

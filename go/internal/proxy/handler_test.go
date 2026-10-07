@@ -96,8 +96,9 @@ func newPercentRequest(t *testing.T, method, target string) *http.Request {
 	return req
 }
 
-// #53: Go decodes the name to "foo bar" before routing; the daemon would act
-// on that container.
+// #53: before the fix the Go handler routed on the decoded r.URL.Path
+// ("foo bar"), so a router-only fix would never see the '%' and would let
+// this through. The handler must route on the escaped path.
 func TestHandler_DeniesPercentEncodedName(t *testing.T) {
 	rec := &recorderTransport{}
 	h := newTestHandler(t, nil, rec)
