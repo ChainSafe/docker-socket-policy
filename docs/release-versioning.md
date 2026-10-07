@@ -26,6 +26,8 @@ The workflow scans every commit in `<latest tag>..HEAD`. It finds the bump for e
 | `BREAKING CHANGE:` / `BREAKING-CHANGE:` | start of any line in the message | footer in the squash body |
 | `Release-As:` | start of any line in the message | footer in the squash body |
 
+Types are matched case-insensitively (`Feat!:` counts as breaking), as Conventional Commits allows. The `BREAKING CHANGE:` / `BREAKING-CHANGE:` footer token is case-sensitive, as Conventional Commits requires.
+
 Only the subject decides the commit type because GitHub's default squash body lists the branch commits as `* …` bullets. A `* feat: x` bullet under a `fix:` subject is therefore history, not a feature, and it does not count. A breaking-change footer is a deliberate statement, so it counts wherever it starts a line.
 
 ## Why the Whole Range
@@ -49,7 +51,7 @@ The bump step runs before the tag is created, so when it fails no tag or release
 
 ## Release Notes
 
-If the range contains breaking commits, the workflow generates a **⚠️ Breaking changes** section. A commit is breaking for the notes by exactly the `breaking` row's rule (a `!` subject or a `BREAKING CHANGE:` / `BREAKING-CHANGE:` line), so a `* feat!: …` bullet in a squash body does not add an entry. The section lists the subject of each breaking commit and its `BREAKING CHANGE:` text. It is passed to `gh release create --notes-file … --generate-notes`, which prepends it to GitHub's generated notes. If there are no breaking commits, the notes are GitHub's generated notes only. You no longer have to add the breaking-change section by hand; impact or migration detail beyond the footer text still needs a human.
+If the range contains breaking commits, the workflow generates a **⚠️ Breaking changes** section. A commit is breaking for the notes by exactly the `breaking` row's rule (a `!` subject or a `BREAKING CHANGE:` / `BREAKING-CHANGE:` line), so a `* feat!: …` bullet in a squash body does not add an entry. A footer's text runs from `BREAKING CHANGE:` to the next blank line, the next footer-token line (any `Word: …` line, for example `Release-As:` or `Note:`), or the end of the message; continuation lines are kept and indented under the entry. Put migration notes directly under the footer, before any other token line. The section lists the subject of each breaking commit and its `BREAKING CHANGE:` text. It is passed to `gh release create --notes-file … --generate-notes`, which prepends it to GitHub's generated notes. If there are no breaking commits, the notes are GitHub's generated notes only. You no longer have to add the breaking-change section by hand; impact or migration detail beyond the footer text still needs a human.
 
 ## Guidance for Whoever Squash-Merges
 
