@@ -78,7 +78,8 @@ Each footer line must start at column 0 of the file. #60 was merged with the def
 | #53 `fix!: deny percent-encoded request paths` | v0.2.26 (patch, notes written by hand) | v0.3.0 (`breaking`), with a generated breaking-changes section |
 | #56 + #58 (both `fix`) | v0.2.25 | v0.2.25 (`other`) |
 | #54 (#60), merged with the default squash body (no footer) | v0.2.27 (patch, computed by this rule) | v0.2.27 (`other`), correct for #54 alone |
-| #61, squash body `Release-As: v0.3.0` | v0.3.0 | v0.3.0 (`release-as`). It corrects the version line for the breaking changes in #47 and #53. |
+| #61 (#62), also merged with the default squash body | not released: its release run was cancelled before tagging | would have been v0.2.28 (`other`) |
+| #63, squash body `Release-As: v0.3.0` (range `v0.2.27..HEAD`, so it includes #62) | v0.3.0 | v0.3.0 (`release-as`). It corrects the version line for the breaking changes in #47 and #53. |
 
 Other examples: `fix!: x` on v1.4.2 gives v2.0.0. `feat: x` on v1.4.2 gives v1.5.0. `fix: x` with no tag gives v0.0.1.
 
