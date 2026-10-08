@@ -58,7 +58,7 @@ impl Router {
         if path.starts_with("/auth") {
             return deny("auth endpoint is not allowed");
         }
-        if path == "/containers/exec" || path.starts_with("/containers/") && path.contains("/exec") {
+        if is_exec_path(path) {
             return deny("exec is not allowed");
         }
         if path.starts_with("/build") {
@@ -230,6 +230,16 @@ fn strip_api_version(path: &str) -> &str {
         return &rest[i..];
     }
     path
+}
+
+// Exec is matched on whole segments, so a name like exec-runner is not exec (#49).
+fn is_exec_path(path: &str) -> bool {
+    let mut segs = path.strip_prefix('/').unwrap_or(path).split('/');
+    match segs.next() {
+        Some("exec") => true,
+        Some("containers") => segs.any(|s| s == "exec"),
+        _ => false,
+    }
 }
 
 fn extract_container_name(path: &str) -> Option<&str> {

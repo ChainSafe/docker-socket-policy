@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/ChainSafe/docker-socket-policy/go/internal/policy"
@@ -49,7 +50,7 @@ func (r *Router) Route(method, path string, body map[string]interface{}) *RouteR
 		return &RouteResult{Action: ActionDeny, DenyMsg: "auth endpoint is not allowed"}
 	}
 
-	if matchEndpoint(path, "containers", "exec") {
+	if isExecPath(path) {
 		return &RouteResult{Action: ActionDeny, DenyMsg: "exec is not allowed"}
 	}
 
@@ -61,7 +62,7 @@ func (r *Router) Route(method, path string, body map[string]interface{}) *RouteR
 		return &RouteResult{Action: ActionDeny, DenyMsg: "commit is not allowed"}
 	}
 
-	if matchEndpoint(path, "containers", "create") && method == "POST" {
+	if path == "/containers/create" && method == "POST" {
 		return r.routeCreate(body)
 	}
 
@@ -94,7 +95,7 @@ func (r *Router) Route(method, path string, body map[string]interface{}) *RouteR
 		}
 	}
 
-	if matchEndpoint(path, "images", "create") && method == "POST" {
+	if path == "/images/create" && method == "POST" {
 		return r.routeImagePull(body)
 	}
 
@@ -192,13 +193,10 @@ func scanDigits(s string, i int) int {
 	return i
 }
 
-func matchEndpoint(path, resource, endpoint string) bool {
-	path = strings.TrimPrefix(path, "/")
-	parts := strings.SplitN(path, "/", 3)
-	if len(parts) < 2 {
-		return false
-	}
-	return parts[0] == resource && parts[1] == endpoint
+// isExecPath matches exec on whole segments, so a name like exec-runner is not exec (#49).
+func isExecPath(path string) bool {
+	segs := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	return segs[0] == "exec" || segs[0] == "containers" && slices.Contains(segs[1:], "exec")
 }
 
 // reservedContainerSegments are Docker endpoints that sit where a container

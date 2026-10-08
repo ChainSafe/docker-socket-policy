@@ -34,7 +34,7 @@ export class Router {
 
     // Denied endpoints
     if (path.startsWith("/auth")) return { action: Action.Deny, denyMsg: "auth endpoint is not allowed" };
-    if (path.includes("/exec")) return { action: Action.Deny, denyMsg: "exec is not allowed" };
+    if (isExecPath(path)) return { action: Action.Deny, denyMsg: "exec is not allowed" };
     if (path.startsWith("/build")) return { action: Action.Deny, denyMsg: "build is not allowed" };
     if (path.startsWith("/commit")) return { action: Action.Deny, denyMsg: "commit is not allowed" };
 
@@ -121,6 +121,12 @@ function stripAPIVersion(path: string): string {
   // Accepts /v<major> and /v<major>.<minor> (the Docker CLI sends /v1.43/) (#52).
   const match = path.match(/^\/v\d+(\.\d+)?\//);
   return match ? path.slice(match[0].length - 1) : path;
+}
+
+// Exec is matched on whole segments, so a name like exec-runner is not exec (#49).
+function isExecPath(path: string): boolean {
+  const [first, ...rest] = path.replace(/^\//, "").split("/");
+  return first === "exec" || (first === "containers" && rest.includes("exec"));
 }
 
 function extractContainerName(path: string): string | undefined {
