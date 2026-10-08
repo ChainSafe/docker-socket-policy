@@ -182,14 +182,14 @@ describe("Router", () => {
   // lifecycle path, where an unknown container is allowed through — Go allowed
   // DELETE /containers/json for exactly that reason.
   it("does not treat reserved path segments as container names", () => {
-    const cases: [string, string, Action][] = [
+    const cases: [string, string, Action, string?][] = [
       // Reserved: must not be mistaken for a container to remove.
       // reservedJsonDeleteDeniedTest
       ["DELETE", "/containers/json", Action.Deny],
       // reservedCreateDeleteDeniedTest
       ["DELETE", "/containers/create", Action.Deny],
       // reservedExecDeleteDeniedTest: denied by the exec check, before the lifecycle branch.
-      ["DELETE", "/containers/exec", Action.Deny],
+      ["DELETE", "/containers/exec", Action.Deny, "exec is not allowed"],
       // Listing stays allowed, via the GET/HEAD passthrough.
       ["GET", "/containers/json", Action.Allow],
       // A real container name is still routed as a container.
@@ -200,9 +200,12 @@ describe("Router", () => {
       // reservedInSubpathAllowedTest
       ["GET", "/containers/mycontainer/json", Action.Allow],
     ];
-    for (const [method, path, want] of cases) {
+    for (const [method, path, want, wantMsg] of cases) {
       const r = router.route(method, path);
       assert.equal(r.action, want, `route(${method} ${path})`);
+      if (wantMsg !== undefined) {
+        assert.equal(r.denyMsg, wantMsg, `route(${method} ${path})`);
+      }
     }
   });
 
@@ -355,6 +358,10 @@ describe("Router", () => {
       ["GET", "/containers/myexec/json", undefined, Action.Allow, undefined],
       // A name starting with exec is a plain name (#49, language-only).
       ["DELETE", "/containers/executor", undefined, Action.Allow, undefined],
+      // The reserved name, decided by the exec check (#49, language-only).
+      ["GET", "/containers/exec/json", undefined, Action.Deny, exec],
+      // A top-level name starting with exec is not the exec namespace (#49, language-only).
+      ["GET", "/executor", undefined, Action.Allow, undefined],
     ];
     for (const [method, path, body, want, wantMsg] of cases) {
       const r = router.route(method, path, body);

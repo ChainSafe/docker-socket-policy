@@ -316,26 +316,27 @@ allowed_image_prefixes:
 	r := NewRouter(m)
 
 	tests := []struct {
-		method string
-		path   string
-		want   Action
+		method  string
+		path    string
+		want    Action
+		wantMsg string
 	}{
 		// Reserved: must not be mistaken for a container to remove.
 		// reservedJsonDeleteDeniedTest
-		{"DELETE", "/containers/json", ActionDeny},
+		{"DELETE", "/containers/json", ActionDeny, ""},
 		// reservedCreateDeleteDeniedTest
-		{"DELETE", "/containers/create", ActionDeny},
+		{"DELETE", "/containers/create", ActionDeny, ""},
 		// reservedExecDeleteDeniedTest: denied by the exec check, before the lifecycle branch.
-		{"DELETE", "/containers/exec", ActionDeny},
+		{"DELETE", "/containers/exec", ActionDeny, "exec is not allowed"},
 		// Listing and inspecting stay allowed via the GET/HEAD passthrough.
-		{"GET", "/containers/json", ActionAllow},
+		{"GET", "/containers/json", ActionAllow, ""},
 		// A real container name is still routed as a container.
 		// realNameDeleteAllowedTest
-		{"DELETE", "/containers/mycontainer", ActionAllow},
-		{"GET", "/containers/mycontainer", ActionAllow},
+		{"DELETE", "/containers/mycontainer", ActionAllow, ""},
+		{"GET", "/containers/mycontainer", ActionAllow, ""},
 		// The reserved word as a *sub*-resource is a normal inspect.
 		// reservedInSubpathAllowedTest
-		{"GET", "/containers/mycontainer/json", ActionAllow},
+		{"GET", "/containers/mycontainer/json", ActionAllow, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
@@ -343,6 +344,10 @@ allowed_image_prefixes:
 			if got.Action != tt.want {
 				t.Fatalf("Route(%s, %s) = %v, want %v (deny msg: %q)",
 					tt.method, tt.path, got.Action, tt.want, got.DenyMsg)
+			}
+			if tt.wantMsg != "" && got.DenyMsg != tt.wantMsg {
+				t.Fatalf("Route(%s, %s) deny msg = %q, want %q",
+					tt.method, tt.path, got.DenyMsg, tt.wantMsg)
 			}
 		})
 	}
@@ -581,6 +586,10 @@ allowed_image_prefixes:
 		{"GET", "/containers/myexec/json", nil, ActionAllow, ""},
 		// A name starting with exec is a plain name (#49, language-only).
 		{"DELETE", "/containers/executor", nil, ActionAllow, ""},
+		// The reserved name, decided by the exec check (#49, language-only).
+		{"GET", "/containers/exec/json", nil, ActionDeny, "exec is not allowed"},
+		// A top-level name starting with exec is not the exec namespace (#49, language-only).
+		{"GET", "/executor", nil, ActionAllow, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.method+" "+tt.path, func(t *testing.T) {

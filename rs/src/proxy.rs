@@ -477,24 +477,27 @@ mod tests {
         let cases = [
             // Reserved: must not be mistaken for a container to remove.
             // reservedJsonDeleteDeniedTest
-            ("DELETE", "/containers/json", Action::Deny),
+            ("DELETE", "/containers/json", Action::Deny, None),
             // reservedCreateDeleteDeniedTest
-            ("DELETE", "/containers/create", Action::Deny),
+            ("DELETE", "/containers/create", Action::Deny, None),
             // reservedExecDeleteDeniedTest: denied by the exec check, before the lifecycle branch.
-            ("DELETE", "/containers/exec", Action::Deny),
+            ("DELETE", "/containers/exec", Action::Deny, Some("exec is not allowed")),
             // Listing stays allowed, via the GET/HEAD passthrough.
-            ("GET", "/containers/json", Action::Allow),
+            ("GET", "/containers/json", Action::Allow, None),
             // A real container name is still routed as a container.
             // realNameDeleteAllowedTest
-            ("DELETE", "/containers/mycontainer", Action::Allow),
-            ("GET", "/containers/mycontainer", Action::Allow),
+            ("DELETE", "/containers/mycontainer", Action::Allow, None),
+            ("GET", "/containers/mycontainer", Action::Allow, None),
             // Reserved words are only reserved in the name position.
             // reservedInSubpathAllowedTest
-            ("GET", "/containers/mycontainer/json", Action::Allow),
+            ("GET", "/containers/mycontainer/json", Action::Allow, None),
         ];
-        for (method, path, want) in cases {
+        for (method, path, want, want_msg) in cases {
             let got = router.route(method, path, None);
             assert_eq!(got.action, want, "route({} {})", method, path);
+            if let Some(want_msg) = want_msg {
+                assert_eq!(got.deny_msg.as_deref(), Some(want_msg), "route({} {})", method, path);
+            }
         }
     }
 
@@ -674,6 +677,10 @@ mod tests {
             ("GET", "/containers/myexec/json", None, Action::Allow, None),
             // A name starting with exec is a plain name (#49, language-only).
             ("DELETE", "/containers/executor", None, Action::Allow, None),
+            // The reserved name, decided by the exec check (#49, language-only).
+            ("GET", "/containers/exec/json", None, Action::Deny, exec),
+            // A top-level name starting with exec is not the exec namespace (#49, language-only).
+            ("GET", "/executor", None, Action::Allow, None),
         ];
         for (method, path, body, want, want_msg) in cases {
             let got = router.route(method, path, body);
