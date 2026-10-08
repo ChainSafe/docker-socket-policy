@@ -319,4 +319,51 @@ describe("Router", () => {
       }
     }
   });
+
+  // Cross-language parity guard for #49. Exec and create are matched on whole
+  // path segments. Exec is denied for every method when the first segment is
+  // exec, or when the first segment is containers and a later segment is
+  // exactly exec; a name that only contains exec routes normally.
+  // POST /containers/create and POST /images/create match only with exactly
+  // two segments. Rows mirror the exec* and create* runs in spec/router.qnt.
+  it("matches exec and create endpoints on whole path segments", () => {
+    const createBody = { Image: "nginx:latest" };
+    const pullBody = { fromImage: "nginx:latest" };
+    const exec = "exec is not allowed";
+    const cases: [string, string, Record<string, unknown> | undefined, Action, string | undefined][] = [
+      // execSubpathDeleteDeniedTest (#49)
+      ["DELETE", "/containers/mycontainer/exec", undefined, Action.Deny, exec],
+      // execSubpathPostDeniedTest (#49)
+      ["POST", "/containers/mycontainer/exec", undefined, Action.Deny, exec],
+      // execPrefixNameStartAllowedTest (#49): an unknown container.
+      ["POST", "/containers/exec-runner/start", undefined, Action.Allow, undefined],
+      // execPrefixNameDeleteAllowedTest (#49): an unknown container.
+      ["DELETE", "/containers/exec-runner", undefined, Action.Allow, undefined],
+      // execPrefixNameGetAllowedTest (#49)
+      ["GET", "/containers/exec-runner/json", undefined, Action.Allow, undefined],
+      // execNamespaceGetDeniedTest (#49): exec inspect leaks command lines.
+      ["GET", "/exec/abc/json", undefined, Action.Deny, exec],
+      // execNamespacePostDeniedTest (#49)
+      ["POST", "/exec/abc/start", undefined, Action.Deny, exec],
+      // createSubpathDeniedTest (#49): an allowed image, so only the path decides.
+      ["POST", "/containers/create/extra", createBody, Action.Deny, undefined],
+      // Exec is matched under containers or exec only (#49, language-only).
+      ["GET", "/images/exec", undefined, Action.Allow, undefined],
+      // An allowed image, so only the path decides (#49, language-only).
+      ["POST", "/images/create/extra", pullBody, Action.Deny, undefined],
+      // A name ending in exec is a plain name (#49, language-only).
+      ["GET", "/containers/myexec/json", undefined, Action.Allow, undefined],
+      // A name starting with exec is a plain name (#49, language-only).
+      ["DELETE", "/containers/executor", undefined, Action.Allow, undefined],
+    ];
+    for (const [method, path, body, want, wantMsg] of cases) {
+      const r = router.route(method, path, body);
+      assert.equal(r.action, want, `route(${method} ${path}) deny msg = ${JSON.stringify(r.denyMsg)}`);
+      // Exact match: the default deny for POST /containers/x/exec ends in
+      // "exec is not allowed" too, so a substring check passes vacuously.
+      if (wantMsg !== undefined) {
+        assert.equal(r.denyMsg, wantMsg, `route(${method} ${path})`);
+      }
+    }
+  });
 });

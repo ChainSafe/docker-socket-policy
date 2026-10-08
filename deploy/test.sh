@@ -369,6 +369,23 @@ check "DELETE /containers/%2F -> 403 (percent-encoded path)" "403" "$S"
 S=$(get_status "$PROXY/v1.45/containers/json?filters=%7B%22status%22%3A%5B%22running%22%5D%7D")
 check "GET /v1.45/containers/json?filters=<encoded> -> 200 (query not inspected)" "200" "$S"
 
+# #49: exec and create are matched on whole path segments. Exec is denied for
+# every method under /containers/<name>/exec and /exec/, GET included (exec
+# inspect leaks command lines). A name that only starts with exec reaches the
+# daemon (404, no such container — not a proxy 403). A create path with extra
+# segments is not the create endpoint, even with an allowed image.
+S=$(delete_status "$PROXY/containers/no-such/exec")
+check "DELETE /containers/*/exec -> 403 (exec subpath, any method)" "403" "$S"
+
+S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/containers/create/extra")
+check "POST /containers/create/extra -> 403 (not the create endpoint)" "403" "$S"
+
+S=$(post_empty "$PROXY/containers/exec-nosuch/start")
+check "POST /containers/exec-nosuch/start -> 404 (daemon answered, not proxy 403)" "404" "$S"
+
+S=$(get_status "$PROXY/exec/0000000000000000000000000000000000000000000000000000000000000000/json")
+check "GET /exec/*/json -> 403 (exec inspect denied)" "403" "$S"
+
 # ─── Summary ──────────────────────────────────────────
 
 echo ""

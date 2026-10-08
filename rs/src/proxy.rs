@@ -634,6 +634,58 @@ mod tests {
         }
     }
 
+    /// Cross-language parity guard for #49. Exec and create are matched on
+    /// whole path segments. Exec is denied for every method when the first
+    /// segment is exec, or when the first segment is containers and a later
+    /// segment is exactly exec; a name that only contains exec routes
+    /// normally. POST /containers/create and POST /images/create match only
+    /// with exactly two segments. Rows mirror the exec* and create* runs in
+    /// spec/router.qnt.
+    #[test]
+    fn test_route_exec_and_exact_endpoints() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let create_body: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Image": "alpine:latest"})).unwrap();
+        let pull_body: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"fromImage": "alpine:latest"})).unwrap();
+        let exec = Some("exec is not allowed");
+        let cases = [
+            // execSubpathDeleteDeniedTest (#49)
+            ("DELETE", "/containers/mycontainer/exec", None, Action::Deny, exec),
+            // execSubpathPostDeniedTest (#49)
+            ("POST", "/containers/mycontainer/exec", None, Action::Deny, exec),
+            // execPrefixNameStartAllowedTest (#49): an unknown container.
+            ("POST", "/containers/exec-runner/start", None, Action::Allow, None),
+            // execPrefixNameDeleteAllowedTest (#49): an unknown container.
+            ("DELETE", "/containers/exec-runner", None, Action::Allow, None),
+            // execPrefixNameGetAllowedTest (#49)
+            ("GET", "/containers/exec-runner/json", None, Action::Allow, None),
+            // execNamespaceGetDeniedTest (#49): exec inspect leaks command lines.
+            ("GET", "/exec/abc/json", None, Action::Deny, exec),
+            // execNamespacePostDeniedTest (#49)
+            ("POST", "/exec/abc/start", None, Action::Deny, exec),
+            // createSubpathDeniedTest (#49): an allowed image, so only the path decides.
+            ("POST", "/containers/create/extra", Some(&create_body), Action::Deny, None),
+            // Exec is matched under containers or exec only (#49, language-only).
+            ("GET", "/images/exec", None, Action::Allow, None),
+            // An allowed image, so only the path decides (#49, language-only).
+            ("POST", "/images/create/extra", Some(&pull_body), Action::Deny, None),
+            // A name ending in exec is a plain name (#49, language-only).
+            ("GET", "/containers/myexec/json", None, Action::Allow, None),
+            // A name starting with exec is a plain name (#49, language-only).
+            ("DELETE", "/containers/executor", None, Action::Allow, None),
+        ];
+        for (method, path, body, want, want_msg) in cases {
+            let got = router.route(method, path, body);
+            assert_eq!(got.action, want, "route({} {}) deny msg = {:?}", method, path, got.deny_msg);
+            // Exact match: the default deny for POST /containers/x/exec ends in
+            // "exec is not allowed" too, so a substring check passes vacuously.
+            if let Some(want_msg) = want_msg {
+                assert_eq!(got.deny_msg.as_deref(), Some(want_msg), "route({} {})", method, path);
+            }
+        }
+    }
+
     #[test]
     fn test_extract_container_name_skips_empty_segment() {
         for path in ["/containers/", "/containers//start"] {

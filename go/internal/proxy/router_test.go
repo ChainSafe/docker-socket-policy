@@ -530,6 +530,75 @@ allowed_image_prefixes:
 	}
 }
 
+// TestRouteExecAndExactEndpoints is the cross-language parity guard for #49.
+//
+// Exec and create are matched on whole path segments. Exec is denied for every
+// method when the first segment is exec, or when the first segment is
+// containers and a later segment is exactly exec; a name that only contains
+// exec routes normally. POST /containers/create and POST /images/create match
+// only with exactly two segments. Rows mirror the exec* and create* runs in
+// spec/router.qnt.
+func TestRouteExecAndExactEndpoints(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m)
+	createBody := map[string]interface{}{"Image": "chainsafe/lodestar:next"}
+	pullBody := map[string]interface{}{"fromImage": "chainsafe/lodestar:next"}
+
+	tests := []struct {
+		method  string
+		path    string
+		body    map[string]interface{}
+		want    Action
+		wantMsg string
+	}{
+		// execSubpathDeleteDeniedTest (#49)
+		{"DELETE", "/containers/mycontainer/exec", nil, ActionDeny, "exec is not allowed"},
+		// execSubpathPostDeniedTest (#49)
+		{"POST", "/containers/mycontainer/exec", nil, ActionDeny, "exec is not allowed"},
+		// execPrefixNameStartAllowedTest (#49): an unknown container.
+		{"POST", "/containers/exec-runner/start", nil, ActionAllow, ""},
+		// execPrefixNameDeleteAllowedTest (#49): an unknown container.
+		{"DELETE", "/containers/exec-runner", nil, ActionAllow, ""},
+		// execPrefixNameGetAllowedTest (#49)
+		{"GET", "/containers/exec-runner/json", nil, ActionAllow, ""},
+		// execNamespaceGetDeniedTest (#49): exec inspect leaks command lines.
+		{"GET", "/exec/abc/json", nil, ActionDeny, "exec is not allowed"},
+		// execNamespacePostDeniedTest (#49)
+		{"POST", "/exec/abc/start", nil, ActionDeny, "exec is not allowed"},
+		// createSubpathDeniedTest (#49): an allowed image, so only the path decides.
+		{"POST", "/containers/create/extra", createBody, ActionDeny, ""},
+		// Exec is matched under containers or exec only (#49, language-only).
+		{"GET", "/images/exec", nil, ActionAllow, ""},
+		// An allowed image, so only the path decides (#49, language-only).
+		{"POST", "/images/create/extra", pullBody, ActionDeny, ""},
+		// A name ending in exec is a plain name (#49, language-only).
+		{"GET", "/containers/myexec/json", nil, ActionAllow, ""},
+		// A name starting with exec is a plain name (#49, language-only).
+		{"DELETE", "/containers/executor", nil, ActionAllow, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, tt.body)
+			if got.Action != tt.want {
+				t.Fatalf("Route(%s, %s) = %v, want %v (deny msg: %q)",
+					tt.method, tt.path, got.Action, tt.want, got.DenyMsg)
+			}
+			// Exact match: the default deny for POST /containers/x/exec ends in
+			// "exec is not allowed" too, so a substring check passes vacuously.
+			if tt.wantMsg != "" && got.DenyMsg != tt.wantMsg {
+				t.Fatalf("Route(%s, %s) deny msg = %q, want %q",
+					tt.method, tt.path, got.DenyMsg, tt.wantMsg)
+			}
+		})
+	}
+}
+
 func TestExtractContainerNameSkipsEmptySegment(t *testing.T) {
 	for _, path := range []string{"/containers/", "/containers//start"} {
 		if got := extractContainerName(path); got != "" {
