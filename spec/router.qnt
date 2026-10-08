@@ -239,7 +239,7 @@ module router_model {
 
 // ─── Instances ──────────────────────────────────────────────────────────
 
-// Go, TypeScript, and Rust after #48 and #53: an empty segment is not a
+// Go, TypeScript, and Rust after #48, #53 and #49: an empty segment is not a
 // name, and a percent-encoded path is denied.
 module router {
   import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false).*
