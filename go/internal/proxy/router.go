@@ -196,7 +196,7 @@ func scanDigits(s string, i int) int {
 // isExecPath matches exec on whole segments, so a name like exec-runner is not exec (#49).
 func isExecPath(path string) bool {
 	segs := strings.Split(strings.TrimPrefix(path, "/"), "/")
-	return segs[0] == "exec" || segs[0] == "containers" && slices.Contains(segs[1:], "exec")
+	return segs[0] == "exec" || (segs[0] == "containers" && slices.Contains(segs[1:], "exec"))
 }
 
 // reservedContainerSegments are Docker endpoints that sit where a container

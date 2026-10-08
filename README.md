@@ -208,7 +208,7 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | POST | `/containers/create` | Validated by middleware chain |
 | POST | `/containers/{name}/start\|stop\|restart\|kill\|wait\|pause\|unpause` | Allowed on known containers |
 | DELETE | `/containers/{name}` | Allowed on known containers |
-| Any | `/containers/{name}/exec` | **DENIED** |
+| Any | `/containers/…/exec` (an `exec` segment anywhere under `/containers`) | **DENIED** |
 | Any | `/exec/*` | **DENIED** |
 | POST | `/containers/{name}/rename\|update` | **DENIED** |
 | POST | `/images/create` | Validated by registry gate |
