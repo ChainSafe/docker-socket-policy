@@ -62,6 +62,14 @@ If the range contains breaking commits, the workflow generates a **⚠️ Breaki
 
 Check the pre-filled title and body before you merge: a wrong type gives a wrong version.
 
+In this repo the default squash body is the list of the branch's commits (`squash_merge_commit_message: COMMIT_MESSAGES`). Footers written in the PR description are **not** included. When a footer matters, add it in the merge dialog, or merge from the CLI with the message in a file:
+
+```sh
+gh pr merge <N> --squash --subject "<type>(<scope>): <summary> (#<issue>)" --body-file <file>
+```
+
+Each footer line must start at column 0 of the file. #60 was merged with the default body, so its `Release-As: v0.3.0` footer never reached `main` and it shipped as v0.2.27 (see below).
+
 ## Worked Examples
 
 | Change | Shipped as | With this rule |
@@ -69,7 +77,8 @@ Check the pre-filled title and body before you merge: a wrong type gives a wrong
 | #47 `feat!: dockerd-parity listening socket` | v0.2.22 (patch) | v0.3.0 (`breaking`, below 1.0) |
 | #53 `fix!: deny percent-encoded request paths` | v0.2.26 (patch, notes written by hand) | v0.3.0 (`breaking`), with a generated breaking-changes section |
 | #56 + #58 (both `fix`) | v0.2.25 | v0.2.25 (`other`) |
-| #54 (this change), squash body `Release-As: v0.3.0` | — | v0.3.0 (`release-as`). It corrects the version for the breaking changes in #47 and #53. |
+| #54 (#60), merged with the default squash body (no footer) | v0.2.27 (patch, computed by this rule) | v0.2.27 (`other`), correct for #54 alone |
+| #61, squash body `Release-As: v0.3.0` | v0.3.0 | v0.3.0 (`release-as`). It corrects the version line for the breaking changes in #47 and #53. |
 
 Other examples: `fix!: x` on v1.4.2 gives v2.0.0. `feat: x` on v1.4.2 gives v1.5.0. `fix: x` with no tag gives v0.0.1.
 
