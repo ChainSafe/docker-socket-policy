@@ -1,13 +1,14 @@
 // ─── Module: router_model ───────────────────────────────────────────────
 //
 // How the router extracts a container name from a request path, how the
-// container-lifecycle branch routes on it (#48), and the percent-encoded
-// path deny that runs first in the router (#53). Mirrors
+// container-lifecycle branch routes on it (#48), the percent-encoded
+// path deny that runs first in the router (#53), and the segment-exact exec
+// deny and POST /containers/create route (#49). Mirrors
 // `extract_container_name` and the lifecycle branch of `Router::route` in
-// rs/src/proxy.rs. This is not the full router: the percent check is
-// modeled, but the API-version strip and the checks that run between the
-// percent check and the lifecycle branch (exec, build, commit,
-// POST /containers/create) are left out. Go (`extractContainerName`) and
+// rs/src/proxy.rs. This is not the full router: the API-version strip and
+// the other checks that run between the percent check and the lifecycle
+// branch (build, commit, the read-only endpoints, auth) are left out, as is
+// POST /images/create. Go (`extractContainerName`) and
 // TypeScript (`extractContainerName`) have the same lifecycle branch for
 // GET, POST and DELETE. HEAD differs: Go and TypeScript allow it through
 // the passthrough, Rust denies it. HEAD is outside METHODS.
@@ -91,9 +92,27 @@ module router_model {
   pure def routeByName(name: str): str =
     if (KNOWN_SERVICES.contains(name)) "allowKnown" else "allowUnknown"
 
-  // The percent check (#53) comes first, before the GET passthrough.
+  // Exec matches whole segments only (#49): the `/exec/<id>/…` namespace,
+  // or `exec` anywhere after `containers`. A segment such as `exec-runner`
+  // is a name like any other.
+  pure def isExecPath(segs: List[str]): bool =
+    if (segs.length() == 0) false
+    else or {
+      segs[0] == "exec",
+      segs[0] == "containers" and segs.indices().exists(i => i >= 1 and segs[i] == "exec"),
+    }
+
+  pure def isDenied(outcome: str): bool =
+    outcome == "deny" or outcome == "denyExec"
+
+  // The percent check (#53) comes first. The exec check (#49) follows, before
+  // the create route, the lifecycle branch and the GET passthrough, so it
+  // denies every method. POST /containers/create matches only the exact
+  // segments; a longer path falls through.
   pure def route(method: str, segs: List[str]): str =
     if (not(ALLOW_PERCENT) and hasEncodedSeg(segs)) "deny"
+    else if (isExecPath(segs)) "denyExec"
+    else if (method == "POST" and segs == ["containers", "create"]) "routeCreate"
     else if (hasContainerName(segs)) {
       val name = containerNameOf(segs)
       if (method == "POST" and BY_NAME_ACTIONS.contains(lastSeg(segs))) routeByName(name)
@@ -110,6 +129,7 @@ module router_model {
   pure val WORDS = Set(
     "containers", "", "json", "create", "exec", "mycontainer", "beacon", "start",
     "%2F", "%2f", "%6A%73%6F%6E", "beacon%2Fstart",
+    "exec-runner", "abc", "extra",
   )
   pure val METHODS = Set("GET", "POST", "DELETE")
 
@@ -134,14 +154,42 @@ module router_model {
   // decoding leaves its path unchanged (#53). Ranges over GET too.
   pure val routerSeesWhatDaemonSees: bool =
     METHODS.forall(m => PATHS.forall(segs =>
-      route(m, segs) != "deny" implies decodePath(segs) == segs
+      not(isDenied(route(m, segs))) implies decodePath(segs) == segs
+    ))
+
+  // A path with `exec` in an exec position is denied for every method (#49).
+  // Ranges over GET too. The exec positions are written out here rather
+  // than taken from isExecPath, so that a narrower rule in `route` fails it.
+  pure val execNeverAllowed: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      segs.indices().exists(i => and {
+        segs[i] == "exec",
+        i == 0 or segs[0] == "containers",
+      }) implies isDenied(route(m, segs))
+    ))
+
+  // `exec-runner` only starts with `exec`. Renaming it to the plain unknown
+  // name `mycontainer`, wherever it appears, never changes the outcome (#49).
+  pure def renameExecLike(segs: List[str]): List[str] =
+    segs.foldl([], (acc, s) => acc.append(if (s == "exec-runner") "mycontainer" else s))
+
+  pure val execPrefixNamesRoute: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      route(m, segs) == route(m, renameExecLike(segs))
+    ))
+
+  // The create route is taken for exactly POST /containers/create (#49).
+  pure val createOnlyExact: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      (route(m, segs) == "routeCreate") iff (m == "POST" and segs == ["containers", "create"])
     ))
 
   // ─── Tests: one run per table row ───────────────────────────────────
   //
   // Rows whose outcome depends on neither ALLOW_EMPTY_NAME nor
-  // ALLOW_PERCENT run on every instance. The rows that do, soundTest and
-  // percentSoundTest live in `router`.
+  // ALLOW_PERCENT run on every instance. The rows that do and the property
+  // tests (soundTest, percentSoundTest, execSoundTest, execPrefixSoundTest,
+  // createExactSoundTest) live in `router`.
 
   run emptyNameGetAllowedTest =
     assert(route("GET", ["containers", ""]) == "allowRead")
@@ -152,14 +200,41 @@ module router_model {
   run reservedCreateDeleteDeniedTest =
     assert(route("DELETE", ["containers", "create"]) == "deny")
 
+  // Decided by the exec check, as in all three implementations.
   run reservedExecDeleteDeniedTest =
-    assert(route("DELETE", ["containers", "exec"]) == "deny")
+    assert(route("DELETE", ["containers", "exec"]) == "denyExec")
 
   run realNameDeleteAllowedTest =
     assert(route("DELETE", ["containers", "mycontainer"]) == "allowUnknown")
 
   run reservedInSubpathAllowedTest =
     assert(route("GET", ["containers", "mycontainer", "json"]) == "allowRead")
+
+  // Segment-exact exec and create matching (#49).
+
+  run execSubpathDeleteDeniedTest =
+    assert(route("DELETE", ["containers", "mycontainer", "exec"]) == "denyExec")
+
+  run execSubpathPostDeniedTest =
+    assert(route("POST", ["containers", "mycontainer", "exec"]) == "denyExec")
+
+  run execPrefixNameStartAllowedTest =
+    assert(route("POST", ["containers", "exec-runner", "start"]) == "allowUnknown")
+
+  run execPrefixNameDeleteAllowedTest =
+    assert(route("DELETE", ["containers", "exec-runner"]) == "allowUnknown")
+
+  run execPrefixNameGetAllowedTest =
+    assert(route("GET", ["containers", "exec-runner", "json"]) == "allowRead")
+
+  run execNamespaceGetDeniedTest =
+    assert(route("GET", ["exec", "abc", "json"]) == "denyExec")
+
+  run execNamespacePostDeniedTest =
+    assert(route("POST", ["exec", "abc", "start"]) == "denyExec")
+
+  run createSubpathDeniedTest =
+    assert(route("POST", ["containers", "create", "extra"]) == "deny")
 }
 
 // ─── Instances ──────────────────────────────────────────────────────────
@@ -202,6 +277,15 @@ module router {
 
   run percentSoundTest =
     assert(routerSeesWhatDaemonSees)
+
+  run execSoundTest =
+    assert(execNeverAllowed)
+
+  run execPrefixSoundTest =
+    assert(execPrefixNamesRoute)
+
+  run createExactSoundTest =
+    assert(createOnlyExact)
 }
 
 // Rust before #48: `/containers/` and `/containers//start` reach

@@ -9,7 +9,7 @@ This directory contains a [Quint](https://quint-lang.org/) formal specification 
 | `docker_socket_policy.qnt` | Request-handling spec: policy types, state machine, endpoint routing table, 9 invariants (6 P0 / 3 P1), 6 attack scenario simulations |
 | `listener.qnt` | Listening-socket startup: flag/group selection, existing-path checks, single-instance lock, 6 invariants, one `run` test per design-table row. Instances `listener_locked` (Go, Rust) and `listener_unlocked` (TypeScript) |
 | `listener-design.md` | Design of the listening socket (dockerd parity) that `listener.qnt` models |
-| `router.qnt` | The percent-encoded path deny, container-name extraction and the container-lifecycle branch of the router only, not the full router. The daemon's percent-decoding as a fixed table. One `run` test per table row. Instances `router` (Go, TypeScript, and Rust after #48 and #53), `router_pre48` (Rust's extraction rule before #48) and `router_pre53` (Rust and TypeScript before #53, routing on the raw path) |
+| `router.qnt` | The percent-encoded path deny, the segment-exact exec deny and `POST /containers/create` route, container-name extraction and the container-lifecycle branch of the router only, not the full router. The daemon's percent-decoding as a fixed table. One `run` test per table row. Instances `router` (Go, TypeScript, and Rust after #48 and #53), `router_pre48` (Rust's extraction rule before #48) and `router_pre53` (Rust and TypeScript before #53, routing on the raw path) |
 
 ## How to Run
 
@@ -84,12 +84,15 @@ quint run spec/listener.qnt --main=listener_unlocked --max-steps=30 --invariant 
 
 ### Router path parsing (`router.qnt`)
 
-A path is a list of raw, still percent-encoded segments with the query string removed, so `/containers/` is `["containers", ""]`, `/containers//start` is `["containers", "", "start"]` and `/containers/%2F` is `["containers", "%2F"]`. The first check in `route` denies any path with an encoded segment, for every method (#53). After it, the second segment is a container name unless it is empty or one of `create`, `json`, `exec`. Both properties check every method in `GET`, `POST`, `DELETE` against every path of 1 to 3 segments:
+A path is a list of raw, still percent-encoded segments with the query string removed, so `/containers/` is `["containers", ""]`, `/containers//start` is `["containers", "", "start"]` and `/containers/%2F` is `["containers", "%2F"]`. The first check in `route` denies any path with an encoded segment, for every method (#53). The second denies exec, for every method, as `denyExec` (#49): when the first segment is `exec` (the `/exec/<id>/…` namespace), or when the first segment is `containers` and any later segment is exactly `exec`. A segment that only starts with or contains `exec`, such as `exec-runner`, is not matched. The third routes `POST` with exactly the segments `["containers", "create"]` to `routeCreate`; a longer path falls through. After these, the second segment is a container name unless it is empty or one of `create`, `json`, `exec`. Every property checks every method in `GET`, `POST`, `DELETE` against every path of 1 to 3 segments:
 
 - `lifecycleOnlyTargetsRealNames` holds when each lifecycle allow (`allowKnown` or `allowUnknown`) targets a non-empty, non-reserved name.
 - `routerSeesWhatDaemonSees` holds when every request the router does not deny reads the same to the daemon: decoding leaves its path unchanged. The daemon's decoding is the table `DAEMON_DECODING`: `%2F` and `%2f` decode to `["", ""]` (a `/` splits the segment), `%6A%73%6F%6E` to `["json"]`, and `beacon%2Fstart` to `["beacon", "start"]`.
+- `execNeverAllowed` holds when every path with `exec` in an exec position is denied. The exec positions are written out in the property, not taken from `route`'s `isExecPath`.
+- `execPrefixNamesRoute` holds when renaming `exec-runner` to the plain unknown name `mycontainer`, wherever it appears in the path, never changes the outcome.
+- `createOnlyExact` holds when `routeCreate` is the outcome for exactly `POST /containers/create`.
 
-On `router`, `soundTest` asserts `lifecycleOnlyTargetsRealNames` and `percentSoundTest` asserts `routerSeesWhatDaemonSees`.
+On `router`, `soundTest` asserts `lifecycleOnlyTargetsRealNames`, `percentSoundTest` asserts `routerSeesWhatDaemonSees`, `execSoundTest` asserts `execNeverAllowed`, `execPrefixSoundTest` asserts `execPrefixNamesRoute` and `createExactSoundTest` asserts `createOnlyExact`.
 
 | Row (`run <row>Test`) | Request | Outcome | Instances |
 |-----|---------|---------|-----------|
@@ -98,7 +101,7 @@ On `router`, `soundTest` asserts `lifecycleOnlyTargetsRealNames` and `percentSou
 | `emptyNameGetAllowed` | `GET /containers/` | allow (passthrough) | all |
 | `reservedJsonDeleteDenied` | `DELETE /containers/json` | deny | all |
 | `reservedCreateDeleteDenied` | `DELETE /containers/create` | deny | all |
-| `reservedExecDeleteDenied` | `DELETE /containers/exec` | deny | all |
+| `reservedExecDeleteDenied` | `DELETE /containers/exec` | deny (exec) | all |
 | `realNameDeleteAllowed` | `DELETE /containers/mycontainer` | allow (unknown container) | all |
 | `reservedInSubpathAllowed` | `GET /containers/mycontainer/json` | allow | all |
 
@@ -113,7 +116,20 @@ Rows for the percent-encoded path deny ([#53](https://github.com/ChainSafe/docke
 | `percentSubpathStartDenied` (pin) | `POST /containers/beacon%2Fstart` | deny | `POST /containers/beacon/start` |
 | `percentGetDenied` | `GET /containers/%2F` | deny | `GET /containers//` |
 
-Each implementation's router tests use the same row names in comments (added with the #48 and #53 fixes). `router_pre48` runs `pre48UnsoundTest`, which asserts that `lifecycleOnlyTargetsRealNames` fails and that both `emptyName*Denied` requests are allowed as an unknown container ([#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). `router_pre53` runs `pre53UnsoundTest`, which asserts that `routerSeesWhatDaemonSees` fails, that `DELETE /containers/%2F` and `POST /containers/%2F/start` are allowed as an unknown container, and that `GET /containers/%2F` is allowed through the passthrough.
+Rows for segment-exact exec and create matching ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)), all instances. "deny (exec)" is the outcome `denyExec`, which the implementations report as `exec is not allowed`:
+
+| Row (`run <row>Test`) | Request | Outcome |
+|-----|---------|---------|
+| `execSubpathDeleteDenied` | `DELETE /containers/mycontainer/exec` | deny (exec) |
+| `execSubpathPostDenied` | `POST /containers/mycontainer/exec` | deny (exec) |
+| `execPrefixNameStartAllowed` | `POST /containers/exec-runner/start` | allow (unknown container) |
+| `execPrefixNameDeleteAllowed` | `DELETE /containers/exec-runner` | allow (unknown container) |
+| `execPrefixNameGetAllowed` | `GET /containers/exec-runner/json` | allow (read) |
+| `execNamespaceGetDenied` | `GET /exec/abc/json` | deny (exec) |
+| `execNamespacePostDenied` | `POST /exec/abc/start` | deny (exec) |
+| `createSubpathDenied` | `POST /containers/create/extra` | deny (default, not the create route) |
+
+Each implementation's router tests use the same row names in comments (added with the #48, #53 and #49 fixes). `router_pre48` runs `pre48UnsoundTest`, which asserts that `lifecycleOnlyTargetsRealNames` fails and that both `emptyName*Denied` requests are allowed as an unknown container ([#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). `router_pre53` runs `pre53UnsoundTest`, which asserts that `routerSeesWhatDaemonSees` fails, that `DELETE /containers/%2F` and `POST /containers/%2F/start` are allowed as an unknown container, and that `GET /containers/%2F` is allowed through the passthrough.
 
 ### Modeling Notes
 
@@ -130,11 +146,9 @@ Two invariants are structurally tautological within the Quint model — they can
 - **The query string is outside the model.** Paths are segment lists with the query string already removed, so the model says nothing about `%` in the query. The implementations never inspect the query string for this rule; encoded queries such as `?filters=%7B…%7D` are routine and must still be forwarded. That is pinned by the language handler tests and the integration tests, not by the model.
 - **GET is covered.** The percent check runs before the GET passthrough, and `routerSeesWhatDaemonSees` ranges over `GET` as well as `POST` and `DELETE`. On `router_pre53` the passthrough lets `GET /containers/%2F` through, and the property fails for it too.
 - **No instance models Go before #53.** Go decoded before routing, which is `route(m, decodePath(segs))`. With this table that agrees with the daemon by construction, so `routerSeesWhatDaemonSees` cannot express Go's risk: decoding that differs from the daemon's, such as encoded version segments ([#57](https://github.com/ChainSafe/docker-socket-policy/issues/57)). Go's change is covered by the language handler tests.
-- **`router.qnt` is not the full router.** `route` models the percent check, which runs first in all three routers, and the container-lifecycle branch. It leaves out the API-version strip and the checks that the routers run between those two, such as the exec, build and commit denials and `POST /containers/create`. For paths that those checks catch, the model's outcome can differ from what an implementation does:
-  - `DELETE /containers/mycontainer/exec` is `allowUnknown` in the model. Rust and TypeScript deny it with their exec checks. Go's exec check matches `exec` only in the name position, so Go sends this path down the lifecycle branch and allows it. This divergence between the languages belongs to the same family as [#24](https://github.com/ChainSafe/docker-socket-policy/issues/24) and [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48). It is outside this model's scope and is tracked with the other routing divergences.
-  - `POST /containers/create` is `deny` in the model, but in reality it routes to container create.
-
-  Only the properties and the table rows are claims about the code. `reservedExecDeleteDenied` (`DELETE /containers/exec`) is decided in all three implementations by the exec check, not by the reserved set. Its language tests would therefore not catch `exec` being dropped from the reserved set.
+- **`router.qnt` is not the full router.** `route` models the percent check, which runs first in all three routers, the exec check, the exact `POST /containers/create` route and the container-lifecycle branch, in that order. It leaves out the API-version strip and the other checks that the routers run before the lifecycle branch, such as the read-only endpoints, auth, and the build and commit denials, as well as `POST /images/create` and the endpoints after the lifecycle branch. For paths that those checks catch, the model's outcome can differ from what an implementation does: `GET /build` is `allowRead` in the model, for example, while the routers deny it as `build is not allowed`. The `images` rows of #49 (`GET /images/exec` allowed, `POST /images/create/extra` denied) are therefore language-only rows. Only the properties and the table rows are claims about the code.
+- **Exec and create match whole segments (#49).** Before #49 the routers disagreed: Go matched `exec` only in the name position (`/containers/exec`), so `DELETE /containers/mycontainer/exec` went down the lifecycle branch and was allowed, and `GET /exec/<id>/json` went through the GET passthrough. Rust matched the substring `/exec` anywhere after `/containers/`, and TypeScript anywhere in the path, so both also denied containers named `exec-runner` or `executor`. Go also accepted `POST /containers/create/extra` as a container create. In the model the exec check runs before the create route, the lifecycle branch and the GET passthrough, so it denies every method, GET included: exec inspect shows the full command line. `reservedExecDeleteDenied` (`DELETE /containers/exec`) is decided by the exec check, as in all three implementations, and now asserts `denyExec`. `exec` stays in the reserved set, but no row, in the model or in the language tests, would catch it being dropped from there.
+- **The #49 properties are not vacuous.** None of them is shown on a separate instance; replacing the rule in `route` makes them fail. With a substring-style rule (a segment that starts with `exec`, modeled as the set `exec`, `exec-runner`), `execPrefixSoundTest` and the three `execPrefixName*Allowed` rows fail. With Go's rule before #49 (`exec` only as the second segment under `containers`), `execSoundTest` and the four `exec*Denied` rows fail. `execSubpathPostDenied` and `execNamespacePostDenied` fail there only because the outcome is the default `deny`, not `denyExec`: the request is still refused, as before #49, but not by the exec check. With Go's prefix match for create, `createExactSoundTest` and `createSubpathDenied` fail. `execNeverAllowed` writes out the exec positions itself instead of calling `isExecPath`, so that a narrower `isExecPath` cannot narrow the property with it.
 - **HEAD is outside the model.** `METHODS` is `GET`, `POST`, `DELETE`. The real lifecycle branches agree on those three methods only. For `HEAD /containers/x`, Go and TypeScript fall through to the GET/HEAD passthrough and allow it. Rust denies it in the lifecycle branch.
 - **Listener fault bias.** `step` crashes an instance on 1 in 10 draws instead of half of all steps, so random runs actually interleave live instances. Every crash stays reachable from every phase, so the reachable state space is unchanged.
 
