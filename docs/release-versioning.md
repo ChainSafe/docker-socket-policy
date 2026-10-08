@@ -62,13 +62,9 @@ If the range contains breaking commits, the workflow generates a **⚠️ Breaki
 
 Check the pre-filled title and body before you merge: a wrong type gives a wrong version.
 
-In this repo the default squash body is the list of the branch's commits (`squash_merge_commit_message: COMMIT_MESSAGES`). Footers written in the PR description are **not** included. When a footer matters, add it in the merge dialog, or merge from the CLI with the message in a file:
+In this repo the default squash body is built from the branch's commit messages (`squash_merge_commit_message: COMMIT_MESSAGES`); for a single-commit PR it is that commit's message. Footers written in the PR description or in a separate file are **not** included.
 
-```sh
-gh pr merge <N> --squash --subject "<type>(<scope>): <summary> (#<issue>)" --body-file <file>
-```
-
-Each footer line must start at column 0 of the file. #60 was merged with the default body, so its `Release-As: v0.3.0` footer never reached `main` and it shipped as v0.2.27 (see below).
+**Put footers in a branch commit's own message** (`git commit` with a body ending in `Release-As: vX.Y.Z` or `BREAKING CHANGE: …`, at column 0). The default squash then carries them, whoever merges and however. Editing the merge dialog, or `gh pr merge <N> --squash --subject … --body-file <file>`, also works but depends on the person merging remembering; footers were lost that way three times (#60, #62, #64; see below).
 
 ## Worked Examples
 
@@ -79,7 +75,8 @@ Each footer line must start at column 0 of the file. #60 was merged with the def
 | #56 + #58 (both `fix`) | v0.2.25 | v0.2.25 (`other`) |
 | #54 (#60), merged with the default squash body (no footer) | v0.2.27 (patch, computed by this rule) | v0.2.27 (`other`), correct for #54 alone |
 | #61 (#62), also merged with the default squash body | not released: its release run was cancelled before tagging | would have been v0.2.28 (`other`) |
-| #63, squash body `Release-As: v0.3.0` (range `v0.2.27..HEAD`, so it includes #62) | v0.3.0 | v0.3.0 (`release-as`). It corrects the version line for the breaking changes in #47 and #53. |
+| #63 (#64), footer only in a separate merge-message file; merged with the default body | not released: run cancelled before tagging | would have been v0.2.28 (`other`) |
+| #63 follow-up, footer `Release-As: v0.3.0` in the branch commit itself (range `v0.2.27..HEAD`, includes #62 and #64) | v0.3.0 | v0.3.0 (`release-as`). It corrects the version line for the breaking changes in #47 and #53. |
 
 Other examples: `fix!: x` on v1.4.2 gives v2.0.0. `feat: x` on v1.4.2 gives v1.5.0. `fix: x` with no tag gives v0.0.1.
 
