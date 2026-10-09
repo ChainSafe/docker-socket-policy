@@ -25,10 +25,7 @@ export interface ShutdownOptions {
  * never completes would block exit forever, with no equivalent of Go's or
  * Rust's 30s cap.
  */
-export function createShutdown(
-  server: Server,
-  options: ShutdownOptions = {},
-): (signal: string) => void {
+export function createShutdown(server: Server, options: ShutdownOptions = {}): (signal: string) => void {
   const timeoutMs = options.timeoutMs ?? SHUTDOWN_TIMEOUT_MS;
   const log = options.log ?? ((m: string) => console.log(m));
   const error = options.error ?? ((m: string) => console.error(m));

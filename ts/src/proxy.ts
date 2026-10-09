@@ -53,8 +53,10 @@ export class Router {
       if (path.endsWith("/wait") && method === "POST") return this.routeByName(containerName);
       if (path.endsWith("/pause") && method === "POST") return this.routeByName(containerName);
       if (path.endsWith("/unpause") && method === "POST") return this.routeByName(containerName);
-      if (path.endsWith("/rename") && method === "POST") return { action: Action.Deny, denyMsg: "rename is not allowed" };
-      if (path.endsWith("/update") && method === "POST") return { action: Action.Deny, denyMsg: "update is not allowed" };
+      if (path.endsWith("/rename") && method === "POST")
+        return { action: Action.Deny, denyMsg: "rename is not allowed" };
+      if (path.endsWith("/update") && method === "POST")
+        return { action: Action.Deny, denyMsg: "update is not allowed" };
       if (method === "DELETE") return this.routeByName(containerName);
       if (method === "GET") return { action: Action.Allow };
     }

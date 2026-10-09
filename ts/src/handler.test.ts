@@ -45,9 +45,7 @@ function makeRequest(method: string, url: string, body?: string): IncomingMessag
   const stream = Readable.from(body ? [Buffer.from(body)] : []);
   (stream as IncomingMessage).method = method;
   (stream as IncomingMessage).url = url;
-  (stream as IncomingMessage).headers = body
-    ? { "content-length": String(Buffer.byteLength(body)) }
-    : {};
+  (stream as IncomingMessage).headers = body ? { "content-length": String(Buffer.byteLength(body)) } : {};
   return stream as IncomingMessage;
 }
 
@@ -117,10 +115,7 @@ describe("Handler", () => {
     const dir = makeEnv(defaultConfig);
     const { handler, transport } = newHandler(dir);
     const { res, recorder } = makeResponse();
-    await handler.handle(
-      makeRequest("POST", "/containers/create", JSON.stringify({ Image: "ubuntu:latest" })),
-      res,
-    );
+    await handler.handle(makeRequest("POST", "/containers/create", JSON.stringify({ Image: "ubuntu:latest" })), res);
     assert.equal(recorder.statusCode, 403);
     assert.equal(transport.lastRequest, undefined);
   });
