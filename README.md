@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 107 unit + 39 integration | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 144 unit | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 161 unit (1 skipped) | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 108 unit + 43 integration | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 145 unit | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 162 unit (1 skipped) | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -208,16 +208,19 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | POST | `/containers/create` | Validated by middleware chain |
 | POST | `/containers/{name}/start\|stop\|restart\|kill\|wait\|pause\|unpause` | Allowed on known containers |
 | DELETE | `/containers/{name}` | Allowed on known containers |
-| POST | `/containers/{name}/exec` | **DENIED** |
+| Any | `/containers/…/exec` (an `exec` segment anywhere under `/containers`) | **DENIED** |
+| Any | `/exec/*` | **DENIED** |
 | POST | `/containers/{name}/rename\|update` | **DENIED** |
 | POST | `/images/create` | Validated by registry gate |
 | POST | `/auth` | **DENIED** |
 | POST | `/build` | **DENIED** |
 | POST | `/commit` | **DENIED** |
-| GET/HEAD | Any path without `%` | Allowed (read-only) |
+| GET/HEAD | Any other path without `%` | Allowed (read-only) |
 | Other | Other | **DENIED** |
 
 Any request whose path contains a percent-encoded byte (`%`) is denied with 403 for every method, GET and HEAD included, because the daemon decodes the path before routing. The query string is not inspected, so filters such as `docker ps --filter …` still work. The Go implementation also denies paths that contain raw characters it must re-encode, such as non-ASCII bytes or `{`; the Docker CLI never sends these. A consequence is that networks whose names need percent-encoding (for example a space or `%`) cannot be inspected by name through the proxy; inspecting them by ID still works, and other network operations are denied regardless.
+
+Exec is matched on whole path segments, so containers named like `exec-runner` work normally, and exec inspect (`GET /exec/{id}/json`) is denied too.
 
 ## Configuration
 

@@ -58,7 +58,7 @@ impl Router {
         if path.starts_with("/auth") {
             return deny("auth endpoint is not allowed");
         }
-        if path == "/containers/exec" || path.starts_with("/containers/") && path.contains("/exec") {
+        if is_exec_path(path) {
             return deny("exec is not allowed");
         }
         if path.starts_with("/build") {
@@ -230,6 +230,16 @@ fn strip_api_version(path: &str) -> &str {
         return &rest[i..];
     }
     path
+}
+
+// Exec is matched on whole segments, so a name like exec-runner is not exec (#49).
+fn is_exec_path(path: &str) -> bool {
+    let mut segs = path.strip_prefix('/').unwrap_or(path).split('/');
+    match segs.next() {
+        Some("exec") => true,
+        Some("containers") => segs.any(|s| s == "exec"),
+        _ => false,
+    }
 }
 
 fn extract_container_name(path: &str) -> Option<&str> {
@@ -477,24 +487,27 @@ mod tests {
         let cases = [
             // Reserved: must not be mistaken for a container to remove.
             // reservedJsonDeleteDeniedTest
-            ("DELETE", "/containers/json", Action::Deny),
+            ("DELETE", "/containers/json", Action::Deny, None),
             // reservedCreateDeleteDeniedTest
-            ("DELETE", "/containers/create", Action::Deny),
+            ("DELETE", "/containers/create", Action::Deny, None),
             // reservedExecDeleteDeniedTest: denied by the exec check, before the lifecycle branch.
-            ("DELETE", "/containers/exec", Action::Deny),
+            ("DELETE", "/containers/exec", Action::Deny, Some("exec is not allowed")),
             // Listing stays allowed, via the GET/HEAD passthrough.
-            ("GET", "/containers/json", Action::Allow),
+            ("GET", "/containers/json", Action::Allow, None),
             // A real container name is still routed as a container.
             // realNameDeleteAllowedTest
-            ("DELETE", "/containers/mycontainer", Action::Allow),
-            ("GET", "/containers/mycontainer", Action::Allow),
+            ("DELETE", "/containers/mycontainer", Action::Allow, None),
+            ("GET", "/containers/mycontainer", Action::Allow, None),
             // Reserved words are only reserved in the name position.
             // reservedInSubpathAllowedTest
-            ("GET", "/containers/mycontainer/json", Action::Allow),
+            ("GET", "/containers/mycontainer/json", Action::Allow, None),
         ];
-        for (method, path, want) in cases {
+        for (method, path, want, want_msg) in cases {
             let got = router.route(method, path, None);
             assert_eq!(got.action, want, "route({} {})", method, path);
+            if let Some(want_msg) = want_msg {
+                assert_eq!(got.deny_msg.as_deref(), Some(want_msg), "route({} {})", method, path);
+            }
         }
     }
 
@@ -630,6 +643,62 @@ mod tests {
                     path,
                     msg
                 );
+            }
+        }
+    }
+
+    /// Cross-language parity guard for #49. Exec and create are matched on
+    /// whole path segments. Exec is denied for every method when the first
+    /// segment is exec, or when the first segment is containers and a later
+    /// segment is exactly exec; a name that only contains exec routes
+    /// normally. POST /containers/create and POST /images/create match only
+    /// with exactly two segments. Rows mirror the exec* and create* runs in
+    /// spec/router.qnt.
+    #[test]
+    fn test_route_exec_and_exact_endpoints() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let create_body: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Image": "alpine:latest"})).unwrap();
+        let pull_body: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"fromImage": "alpine:latest"})).unwrap();
+        let exec = Some("exec is not allowed");
+        let cases = [
+            // execSubpathDeleteDeniedTest (#49)
+            ("DELETE", "/containers/mycontainer/exec", None, Action::Deny, exec),
+            // execSubpathPostDeniedTest (#49)
+            ("POST", "/containers/mycontainer/exec", None, Action::Deny, exec),
+            // execPrefixNameStartAllowedTest (#49): an unknown container.
+            ("POST", "/containers/exec-runner/start", None, Action::Allow, None),
+            // execPrefixNameDeleteAllowedTest (#49): an unknown container.
+            ("DELETE", "/containers/exec-runner", None, Action::Allow, None),
+            // execPrefixNameGetAllowedTest (#49)
+            ("GET", "/containers/exec-runner/json", None, Action::Allow, None),
+            // execNamespaceGetDeniedTest (#49): exec inspect leaks command lines.
+            ("GET", "/exec/abc/json", None, Action::Deny, exec),
+            // execNamespacePostDeniedTest (#49)
+            ("POST", "/exec/abc/start", None, Action::Deny, exec),
+            // createSubpathDeniedTest (#49): an allowed image, so only the path decides.
+            ("POST", "/containers/create/extra", Some(&create_body), Action::Deny, None),
+            // Exec is matched under containers or exec only (#49, language-only).
+            ("GET", "/images/exec", None, Action::Allow, None),
+            // An allowed image, so only the path decides (#49, language-only).
+            ("POST", "/images/create/extra", Some(&pull_body), Action::Deny, None),
+            // A name ending in exec is a plain name (#49, language-only).
+            ("GET", "/containers/myexec/json", None, Action::Allow, None),
+            // A name starting with exec is a plain name (#49, language-only).
+            ("DELETE", "/containers/executor", None, Action::Allow, None),
+            // The reserved name, decided by the exec check (#49, language-only).
+            ("GET", "/containers/exec/json", None, Action::Deny, exec),
+            // A top-level name starting with exec is not the exec namespace (#49, language-only).
+            ("GET", "/executor", None, Action::Allow, None),
+        ];
+        for (method, path, body, want, want_msg) in cases {
+            let got = router.route(method, path, body);
+            assert_eq!(got.action, want, "route({} {}) deny msg = {:?}", method, path, got.deny_msg);
+            // Exact match: the default deny for POST /containers/x/exec ends in
+            // "exec is not allowed" too, so a substring check passes vacuously.
+            if let Some(want_msg) = want_msg {
+                assert_eq!(got.deny_msg.as_deref(), Some(want_msg), "route({} {})", method, path);
             }
         }
     }
