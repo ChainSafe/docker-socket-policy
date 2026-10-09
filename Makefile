@@ -8,7 +8,7 @@ ROUTER_SPEC := spec/router.qnt
 BACKEND ?=
 
 .PHONY: build clean test lint verify typecheck test-spec validate ci-verify release-verify test-release
-.PHONY: build-go test-go lint-go build-rs test-rs build-ts test-ts
+.PHONY: build-go test-go lint-go build-rs test-rs build-ts test-ts fmt-go fmt-rs fmt-ts fmt-all hooks
 
 # ─── Go ──────────────────────────────────────────────
 
@@ -19,8 +19,11 @@ test-go:
 	cd go && go test ./... -count=1
 
 lint-go:
-	cd go && test -z "$$(gofmt -l .)" || { gofmt -l .; exit 1; }
+	cd go && out=$$(gofmt -l . 2>&1); test -z "$$out" || { echo "gofmt needed (run make fmt-go):"; echo "$$out"; exit 1; }
 	cd go && go vet ./...
+
+fmt-go:
+	cd go && gofmt -w .
 
 # ─── Rust ────────────────────────────────────────────
 
@@ -32,6 +35,9 @@ test-rs:
 
 lint-rs:
 	cd rs && cargo fmt --check && cargo check
+
+fmt-rs:
+	cd rs && cargo fmt
 
 # ─── Rust release binary location
 RS_BINARY = rs/target/release/docker-socket-policy
@@ -47,11 +53,19 @@ test-ts:
 lint-ts:
 	cd ts && npm run typecheck && npm run format:check
 
+fmt-ts:
+	cd ts && npx prettier --write src
+
 # ─── Aggregate targets ───────────────────────────────
 
 build-all: build-go build-rs build-ts
 test-all: test-go test-rs test-ts
 lint-all: lint-go lint-rs lint-ts
+fmt-all: fmt-go fmt-rs fmt-ts
+
+hooks:
+	git config core.hooksPath .githooks
+	@echo "git hooks active: core.hooksPath=.githooks (pre-commit, pre-push)"
 
 # ─── Legacy aliases (default to Go) ──────────────────
 

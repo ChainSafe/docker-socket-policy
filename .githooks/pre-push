@@ -1,0 +1,10 @@
+#!/bin/sh
+# Refuse pushes that do not pass make lint-all (formatting, vet, typecheck).
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+if ! make lint-all; then
+	echo "lint failed; fix it or bypass once with git push --no-verify" >&2
+	exit 1
+fi

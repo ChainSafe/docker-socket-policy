@@ -17,6 +17,17 @@ Thank you for your interest! This project uses a multi-language approach — Go,
 - Test all: `make test-all`
 - Lint all: `make lint-all`
 
+### Git hooks (recommended)
+
+Run `make hooks` once per clone. It sets `core.hooksPath` to `.githooks`, which enables:
+
+- `pre-commit` — checks the formatting of staged Go (`gofmt`), Rust (`cargo fmt`) and TypeScript (`prettier`) files
+- `pre-push` — runs `make lint-all`
+
+To fix formatting, run `make fmt-go`, `make fmt-rs`, `make fmt-ts`, or `make fmt-all`. Prettier comes from `ts/node_modules`, so run `npm ci` in `ts/` first.
+
+To bypass a hook once, pass `--no-verify` to `git commit` or `git push`. CI runs the same checks.
+
 ## Architecture
 
 All three languages implement the same architecture:

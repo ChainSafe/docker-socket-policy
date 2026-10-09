@@ -1,0 +1,84 @@
+#!/bin/sh
+# Refuse commits whose staged Go, Rust or TypeScript files are not formatted.
+#
+# The checks read the working-tree copy of each staged file, not the staged
+# blob, so with partial staging (git add -p) the result can differ from what
+# is committed. The pre-push hook (make lint-all) and CI are the backstop.
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -n "$staged" ] || exit 0
+
+go_files=$(printf '%s\n' "$staged" | grep -E '^go/.*\.go$' || true)
+rs_files=$(printf '%s\n' "$staged" | grep -E '^rs/.*\.rs$' || true)
+ts_files=$(printf '%s\n' "$staged" | grep -E '^ts/src/.*\.ts$' | sed 's|^ts/||' || true)
+
+failed=""
+
+fail() {
+	failed="$failed $1"
+}
+
+# Split file lists on newlines only, and never glob-expand them.
+set -f
+nl='
+'
+
+if [ -n "$go_files" ]; then
+	if ! command -v gofmt >/dev/null 2>&1; then
+		echo "pre-commit: gofmt not found on PATH (install Go)" >&2
+		fail go
+	else
+		old_ifs=$IFS
+		IFS=$nl
+		# shellcheck disable=SC2086 # intentional newline splitting
+		if ! out=$(gofmt -l -- $go_files 2>&1) || [ -n "$out" ]; then
+			echo "pre-commit: gofmt needed:" >&2
+			printf '%s\n' "$out" >&2
+			fail go
+		fi
+		IFS=$old_ifs
+	fi
+fi
+
+if [ -n "$rs_files" ]; then
+	if ! command -v cargo >/dev/null 2>&1; then
+		echo "pre-commit: cargo not found on PATH (install Rust via rustup)" >&2
+		fail rs
+	elif ! out=$(cd rs && cargo fmt --check 2>&1); then
+		printf '%s\n' "$out" >&2
+		echo "pre-commit: cargo fmt needed" >&2
+		fail rs
+	fi
+fi
+
+if [ -n "$ts_files" ]; then
+	if [ ! -x ts/node_modules/.bin/prettier ]; then
+		echo "pre-commit: prettier not found at ts/node_modules/.bin/prettier (run npm ci in ts/)" >&2
+		fail ts
+	else
+		old_ifs=$IFS
+		IFS=$nl
+		# shellcheck disable=SC2086 # intentional newline splitting
+		if ! out=$(cd ts && npx --no-install prettier --check -- $ts_files 2>&1); then
+			printf '%s\n' "$out" >&2
+			echo "pre-commit: prettier needed" >&2
+			fail ts
+		fi
+		IFS=$old_ifs
+	fi
+fi
+
+if [ -n "$failed" ]; then
+	echo >&2
+	echo "pre-commit: formatting check failed for:$failed" >&2
+	for lang in $failed; do
+		echo "  run: make fmt-$lang" >&2
+	done
+	echo "  bypass once: git commit --no-verify" >&2
+	exit 1
+fi
+
+exit 0
