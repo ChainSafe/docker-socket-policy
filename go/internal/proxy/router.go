@@ -11,7 +11,7 @@ import (
 type Action int
 
 const (
-	ActionDeny            Action = iota
+	ActionDeny Action = iota
 	ActionAllow
 	ActionCreateContainer
 )
