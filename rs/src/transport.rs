@@ -28,10 +28,7 @@ impl std::error::Error for TransportError {}
 
 #[async_trait]
 pub trait Transport: Send + Sync {
-    async fn forward(
-        &self,
-        req: Request<Full<Bytes>>,
-    ) -> Result<Response<Full<Bytes>>, TransportError>;
+    async fn forward(&self, req: Request<Full<Bytes>>) -> Result<Response<Full<Bytes>>, TransportError>;
 }
 
 pub struct UnixSocketTransport {
@@ -55,10 +52,7 @@ fn map_connect_error(e: io::Error) -> TransportError {
 
 #[async_trait]
 impl Transport for UnixSocketTransport {
-    async fn forward(
-        &self,
-        req: Request<Full<Bytes>>,
-    ) -> Result<Response<Full<Bytes>>, TransportError> {
+    async fn forward(&self, req: Request<Full<Bytes>>) -> Result<Response<Full<Bytes>>, TransportError> {
         let stream = match tokio::net::UnixStream::connect(&self.docker_host).await {
             Ok(s) => s,
             Err(e) => return Err(map_connect_error(e)),
@@ -98,10 +92,7 @@ mod tests {
     #[tokio::test]
     async fn test_forward_missing_socket_errors() {
         let transport = UnixSocketTransport::new("/nonexistent/docker.sock");
-        let req = Request::builder()
-            .uri("/_ping")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
+        let req = Request::builder().uri("/_ping").body(Full::new(Bytes::new())).unwrap();
         let res = transport.forward(req).await;
         assert!(res.is_err(), "expected forwarding to a missing socket to fail");
         assert!(!matches!(res, Err(TransportError::SocketPermission(_))));

@@ -202,7 +202,10 @@ fn acquire_instance_lock(socket_path: &str) -> io::Result<std::fs::File> {
         if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
-                format!("{} is in use by another instance (lock {} held)", socket_path, lock_path),
+                format!(
+                    "{} is in use by another instance (lock {} held)",
+                    socket_path, lock_path
+                ),
             ));
         }
         return Err(io::Error::new(e.kind(), format!("locking {}: {}", lock_path, e)));
@@ -239,7 +242,12 @@ fn prepare_socket_path(path: &str) -> io::Result<()> {
     std::thread::spawn(move || {
         let _ = tx.send(std::os::unix::net::UnixStream::connect(target).map(drop));
     });
-    let in_use = || io::Error::new(io::ErrorKind::AddrInUse, format!("{} is in use by another process", path));
+    let in_use = || {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("{} is in use by another process", path),
+        )
+    };
     match rx.recv_timeout(PROBE_TIMEOUT) {
         Ok(Ok(())) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(in_use()),
         Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {}
@@ -257,8 +265,7 @@ fn prepare_socket_path(path: &str) -> io::Result<()> {
         }
     }
 
-    std::fs::remove_file(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("removing stale socket {}: {}", path, e)))
+    std::fs::remove_file(path).map_err(|e| io::Error::new(e.kind(), format!("removing stale socket {}: {}", path, e)))
 }
 
 /// Binds the Unix socket listener for `--listen-socket`.
@@ -344,8 +351,8 @@ fn resolve_group(group: &str) -> Result<u32, String> {
             )),
         };
     }
-    let name = std::ffi::CString::new(group)
-        .map_err(|_| format!("--listen-socket-group {:?}: contains a NUL byte", group))?;
+    let name =
+        std::ffi::CString::new(group).map_err(|_| format!("--listen-socket-group {:?}: contains a NUL byte", group))?;
 
     // getgrnam_r is the reentrant form; the non-_r variant returns a pointer
     // into a shared static buffer.
@@ -415,10 +422,7 @@ fn validate_docker_host(addr: &str) -> Result<(), String> {
         .iter()
         .any(|s| addr.starts_with(s))
     {
-        return Err(format!(
-            "--docker-host only supports Unix socket paths, got: {}",
-            addr
-        ));
+        return Err(format!("--docker-host only supports Unix socket paths, got: {}", addr));
     }
     Ok(())
 }
@@ -473,10 +477,8 @@ fn spawn_unix_listener(
         // request finishes rather than waiting out the timeout.
         drop(listener);
         unlink_listen_socket(&addr);
-        let drained = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
-            while conns.join_next().await.is_some() {}
-        })
-        .await;
+        let drained =
+            tokio::time::timeout(SHUTDOWN_TIMEOUT, async { while conns.join_next().await.is_some() {} }).await;
         if drained.is_err() {
             tracing::error!(
                 "drain deadline exceeded after {:?}, abandoning in-flight connections",
@@ -501,11 +503,8 @@ fn unlink_listen_socket(addr: &str) {
     }
 }
 
-async fn serve_connection<S>(
-    handler: Arc<handler::Handler>,
-    stream: S,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) where
+async fn serve_connection<S>(handler: Arc<handler::Handler>, stream: S, mut shutdown_rx: broadcast::Receiver<()>)
+where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
@@ -615,7 +614,11 @@ mod tests {
         let path = dir.join("important.txt");
         std::fs::write(&path, b"important data").unwrap();
         let err = open_listener(&path, None).expect_err("regular file was not refused");
-        assert!(err.to_string().contains("not a socket"), "error = {:?}", err.to_string());
+        assert!(
+            err.to_string().contains("not a socket"),
+            "error = {:?}",
+            err.to_string()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"important data", "file was modified");
 
         let path = dir.join("adir");
@@ -678,7 +681,12 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
             let err = prepare_socket_path(&path).expect_err("0000 socket was not refused");
             let want = format!("refusing to remove {}", path);
-            assert!(err.to_string().starts_with(&want), "error = {:?}, want prefix {:?}", err.to_string(), want);
+            assert!(
+                err.to_string().starts_with(&want),
+                "error = {:?}, want prefix {:?}",
+                err.to_string(),
+                want
+            );
             assert!(std::fs::symlink_metadata(&path).is_ok(), "socket was removed");
         }
 
@@ -689,7 +697,12 @@ mod tests {
             std::fs::write(&path, b"data").unwrap();
             let err = prepare_socket_path(&path).expect_err("regular file was not refused");
             let want = format!("refusing to remove {}: not a socket", path);
-            assert!(err.to_string().starts_with(&want), "error = {:?}, want prefix {:?}", err.to_string(), want);
+            assert!(
+                err.to_string().starts_with(&want),
+                "error = {:?}, want prefix {:?}",
+                err.to_string(),
+                want
+            );
             assert_eq!(std::fs::read(&path).unwrap(), b"data", "regular file was modified");
         }
     }
@@ -738,7 +751,10 @@ mod tests {
             err.to_string(),
             path
         );
-        assert!(std::fs::symlink_metadata(&target).is_err(), "symlink target was created");
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "symlink target was created"
+        );
     }
 
     #[test]
@@ -789,7 +805,11 @@ mod tests {
             for result in results {
                 match result {
                     Ok(pair) => {
-                        assert!(winner.is_none(), "iteration {}: more than one open_listener succeeded", i);
+                        assert!(
+                            winner.is_none(),
+                            "iteration {}: more than one open_listener succeeded",
+                            i
+                        );
                         winner = Some(pair);
                     }
                     Err(e) => assert_eq!(e.to_string(), want, "iteration {}: loser error", i),
@@ -836,7 +856,12 @@ mod tests {
 
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: fds has room for the two descriptors pipe(2) writes.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe: {}", io::Error::last_os_error());
+        assert_eq!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) },
+            0,
+            "pipe: {}",
+            io::Error::last_os_error()
+        );
         let (read_fd, write_fd) = (fds[0], fds[1]);
         // SAFETY: sysconf(3) has no preconditions.
         let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }.clamp(256, 65536) as libc::c_int;
@@ -876,22 +901,38 @@ mod tests {
         // SAFETY: write_fd is ours and open.
         unsafe { libc::close(write_fd) };
 
-        let mut pfd = libc::pollfd { fd: read_fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: pfd is a valid pollfd for the duration of the call.
         let ready = unsafe { libc::poll(&mut pfd, 1, 10_000) };
         let mut byte = 0u8;
         // SAFETY: byte is a valid 1-byte buffer.
-        let n = if ready == 1 { unsafe { libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) } } else { 0 };
+        let n = if ready == 1 {
+            unsafe { libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) }
+        } else {
+            0
+        };
         unsafe { libc::close(read_fd) };
         drop(fork_lock);
         assert_eq!(ready, 1, "child did not report ready within 10s");
         assert_eq!((n, byte), (1, b'r'), "child failed to take the lock");
 
-        assert!(acquire_instance_lock(&path).is_err(), "acquired the lock while the child held it");
+        assert!(
+            acquire_instance_lock(&path).is_err(),
+            "acquired the lock while the child held it"
+        );
 
         // SAFETY: pid is our unreaped child.
         unsafe {
-            assert_eq!(libc::kill(pid, libc::SIGKILL), 0, "kill: {}", io::Error::last_os_error());
+            assert_eq!(
+                libc::kill(pid, libc::SIGKILL),
+                0,
+                "kill: {}",
+                io::Error::last_os_error()
+            );
             assert_eq!(libc::waitpid(pid, std::ptr::null_mut(), 0), pid, "waitpid");
         }
         child.0 = 0;
@@ -925,9 +966,14 @@ mod tests {
             ("dsp.sock", "must be an absolute path"),
         ];
         for (addr, want) in cases {
-            let err = validate_listen_socket(addr)
-                .expect_err(&format!("{:?} should be rejected", addr));
-            assert!(err.contains(want), "error for {:?} was {:?}, want it to contain {:?}", addr, err, want);
+            let err = validate_listen_socket(addr).expect_err(&format!("{:?} should be rejected", addr));
+            assert!(
+                err.contains(want),
+                "error for {:?} was {:?}, want it to contain {:?}",
+                addr,
+                err,
+                want
+            );
         }
     }
 
@@ -953,8 +999,7 @@ mod tests {
             ("unix:///var/run/docker.sock", "only supports Unix socket paths"),
         ];
         for (addr, want) in cases {
-            let err = validate_docker_host(addr)
-                .expect_err(&format!("{:?} should be rejected", addr));
+            let err = validate_docker_host(addr).expect_err(&format!("{:?} should be rejected", addr));
             assert!(err.contains(want), "error for {:?} was {:?}", addr, err);
         }
     }
@@ -964,7 +1009,11 @@ mod tests {
         let path = unique_socket_path();
 
         let result = bind_unix_listener(path.to_str().unwrap(), None);
-        assert!(result.is_ok(), "expected bind to a fresh path to succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "expected bind to a fresh path to succeed: {:?}",
+            result.err()
+        );
         assert!(path.exists(), "expected socket file to be created");
 
         std::fs::remove_file(&path).ok();
@@ -981,8 +1030,7 @@ mod tests {
         async fn forward(
             &self,
             _req: hyper::Request<http_body_util::Full<bytes::Bytes>>,
-        ) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, transport::TransportError>
-        {
+        ) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, transport::TransportError> {
             tokio::time::sleep(self.delay).await;
             Ok(hyper::Response::builder()
                 .status(418)
@@ -1139,7 +1187,10 @@ mod tests {
         for v in ["4294967295", "4294967296", "12345678901234567890"] {
             assert_eq!(
                 resolve_group(v),
-                Err(format!("--listen-socket-group {:?}: gid out of range (0-4294967294)", v))
+                Err(format!(
+                    "--listen-socket-group {:?}: gid out of range (0-4294967294)",
+                    v
+                ))
             );
         }
         // Only a digit string is numeric; a sign makes it a (nonexistent) name.
@@ -1159,9 +1210,8 @@ mod tests {
                 _ => Err(format!("--listen-socket-group {:?}: unknown group", name)),
             }
         };
-        let none = |name: &str| -> Result<u32, String> {
-            Err(format!("--listen-socket-group {:?}: unknown group", name))
-        };
+        let none =
+            |name: &str| -> Result<u32, String> { Err(format!("--listen-socket-group {:?}: unknown group", name)) };
 
         // group_default_present
         assert_eq!(select_socket_group(None, known, EGID), Ok((2001, None)));
@@ -1227,7 +1277,12 @@ mod tests {
         let result = bind_unix_listener(&path, Some(0));
         let err = result.expect_err("bind_unix_listener(path, Some(0)) as non-root succeeded, want EPERM");
         let want = "the proxy's user must be a member of it";
-        assert!(err.to_string().contains(want), "error = {:?}, want it to contain {:?}", err.to_string(), want);
+        assert!(
+            err.to_string().contains(want),
+            "error = {:?}, want it to contain {:?}",
+            err.to_string(),
+            want
+        );
     }
 
     /// A clean shutdown must not leave the socket file on disk, matching Go
@@ -1253,10 +1308,7 @@ mod tests {
             .expect("listener did not shut down")
             .expect("listener task panicked");
 
-        assert!(
-            !path.exists(),
-            "socket file was left behind after a clean shutdown"
-        );
+        assert!(!path.exists(), "socket file was left behind after a clean shutdown");
         std::fs::remove_file(&path).ok();
     }
 

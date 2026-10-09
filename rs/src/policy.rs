@@ -58,7 +58,10 @@ impl Manager {
         let entries = match std::fs::read_dir(config_dir) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("warn: config dir {} not found, starting with empty policy set", config_dir);
+                eprintln!(
+                    "warn: config dir {} not found, starting with empty policy set",
+                    config_dir
+                );
                 return Ok(Manager { policies_by_name });
             }
             Err(e) => return Err(e.into()),
@@ -197,7 +200,10 @@ denied_flags:
 
     #[test]
     fn test_extract_image_name_registry_path() {
-        assert_eq!(extract_image_name("registry.example.com/myimage:tag"), "registry.example.com/myimage");
+        assert_eq!(
+            extract_image_name("registry.example.com/myimage:tag"),
+            "registry.example.com/myimage"
+        );
     }
 
     #[test]
@@ -316,22 +322,42 @@ denied_flags:
     #[test]
     fn test_manager_list() {
         let mut policies = HashMap::new();
-        policies.insert("a".into(), Policy {
-            service_name: "a".into(),
-            user_id: None, group_id: None,
-            allowed_image_prefixes: vec!["img".into()],
-            image_tag_pattern: None, image_digest_allowed: false,
-            container_config: None, volumes: None, ports: None,
-            env_file: None, allowed_cli_flags: None, flag_rules: None, denied_flags: None,
-        });
-        policies.insert("b".into(), Policy {
-            service_name: "b".into(),
-            user_id: None, group_id: None,
-            allowed_image_prefixes: vec!["img".into()],
-            image_tag_pattern: None, image_digest_allowed: false,
-            container_config: None, volumes: None, ports: None,
-            env_file: None, allowed_cli_flags: None, flag_rules: None, denied_flags: None,
-        });
+        policies.insert(
+            "a".into(),
+            Policy {
+                service_name: "a".into(),
+                user_id: None,
+                group_id: None,
+                allowed_image_prefixes: vec!["img".into()],
+                image_tag_pattern: None,
+                image_digest_allowed: false,
+                container_config: None,
+                volumes: None,
+                ports: None,
+                env_file: None,
+                allowed_cli_flags: None,
+                flag_rules: None,
+                denied_flags: None,
+            },
+        );
+        policies.insert(
+            "b".into(),
+            Policy {
+                service_name: "b".into(),
+                user_id: None,
+                group_id: None,
+                allowed_image_prefixes: vec!["img".into()],
+                image_tag_pattern: None,
+                image_digest_allowed: false,
+                container_config: None,
+                volumes: None,
+                ports: None,
+                env_file: None,
+                allowed_cli_flags: None,
+                flag_rules: None,
+                denied_flags: None,
+            },
+        );
         let mgr = Manager::from_map(policies);
         let mut keys = mgr.list();
         keys.sort();

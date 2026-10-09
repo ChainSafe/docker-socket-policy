@@ -5,7 +5,13 @@ use std::collections::HashMap;
 use crate::policy::{ContainerConfig, FlagRule, Volume};
 
 pub trait Gate: Send + Sync {
-    fn check(&self, _method: &str, _path: &str, _policy: &Policy, _body: &HashMap<String, serde_json::Value>) -> std::result::Result<(), String> {
+    fn check(
+        &self,
+        _method: &str,
+        _path: &str,
+        _policy: &Policy,
+        _body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
         Ok(())
     }
 }
@@ -75,12 +81,20 @@ impl Chain {
 }
 
 fn charset_check(s: &str) -> bool {
-    s.len() <= 256 && s.chars().all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '=' | ':' | '/' | ',' | '-'))
+    s.len() <= 256
+        && s.chars()
+            .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '=' | ':' | '/' | ',' | '-'))
 }
 
 pub struct ExecGate;
 impl Gate for ExecGate {
-    fn check(&self, _method: &str, path: &str, _policy: &Policy, _body: &HashMap<String, serde_json::Value>) -> std::result::Result<(), String> {
+    fn check(
+        &self,
+        _method: &str,
+        path: &str,
+        _policy: &Policy,
+        _body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
         if path.contains("/exec") {
             return Err("exec is not allowed: docker exec provides a shell escape vector".into());
         }
@@ -90,11 +104,15 @@ impl Gate for ExecGate {
 
 pub struct ReadonlyGate;
 impl Gate for ReadonlyGate {
-    fn check(&self, method: &str, _path: &str, _policy: &Policy, _body: &HashMap<String, serde_json::Value>) -> std::result::Result<(), String> {
+    fn check(
+        &self,
+        method: &str,
+        _path: &str,
+        _policy: &Policy,
+        _body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
         match method {
-            "POST" | "PUT" | "DELETE" | "PATCH" => {
-                Err(format!("read-only mode: {} requests are not allowed", method))
-            }
+            "POST" | "PUT" | "DELETE" | "PATCH" => Err(format!("read-only mode: {} requests are not allowed", method)),
             _ => Ok(()),
         }
     }
@@ -102,7 +120,13 @@ impl Gate for ReadonlyGate {
 
 pub struct RegistryGate;
 impl Gate for RegistryGate {
-    fn check(&self, _method: &str, _path: &str, policy: &Policy, body: &HashMap<String, serde_json::Value>) -> std::result::Result<(), String> {
+    fn check(
+        &self,
+        _method: &str,
+        _path: &str,
+        policy: &Policy,
+        body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
         let image = body.get("Image").and_then(|v| v.as_str());
         let image = match image {
             Some(s) if !s.is_empty() => s,
@@ -115,9 +139,10 @@ impl Gate for RegistryGate {
             (image, "")
         };
 
-        let allowed = policy.allowed_image_prefixes.iter().any(|prefix| {
-            image_name == prefix || image_name.starts_with(&format!("{}/", prefix))
-        });
+        let allowed = policy
+            .allowed_image_prefixes
+            .iter()
+            .any(|prefix| image_name == prefix || image_name.starts_with(&format!("{}/", prefix)));
         if !allowed {
             return Err(format!("image {:?} is not in allowed prefixes", image_name));
         }
@@ -131,16 +156,18 @@ impl Gate for RegistryGate {
                 if !policy.image_digest_allowed {
                     return Err(format!("image digests not allowed for service {}", policy.service_name));
                 }
-                let re = regex::Regex::new(r"^sha256:[a-f0-9]{64}$")
-                    .map_err(|e| format!("invalid digest regex: {}", e))?;
+                let re =
+                    regex::Regex::new(r"^sha256:[a-f0-9]{64}$").map_err(|e| format!("invalid digest regex: {}", e))?;
                 if !re.is_match(tag_or_digest) {
                     return Err(format!("invalid digest format: {}", tag_or_digest));
                 }
             } else if let Some(ref pattern) = policy.image_tag_pattern {
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| format!("invalid tag pattern regex: {}", e))?;
+                let re = regex::Regex::new(pattern).map_err(|e| format!("invalid tag pattern regex: {}", e))?;
                 if !re.is_match(tag_or_digest) {
-                    return Err(format!("image tag {:?} does not match pattern {:?}", tag_or_digest, pattern));
+                    return Err(format!(
+                        "image tag {:?} does not match pattern {:?}",
+                        tag_or_digest, pattern
+                    ));
                 }
             }
         }
@@ -151,7 +178,13 @@ impl Gate for RegistryGate {
 
 pub struct MountSourceGate;
 impl Gate for MountSourceGate {
-    fn check(&self, _method: &str, _path: &str, policy: &Policy, body: &HashMap<String, serde_json::Value>) -> std::result::Result<(), String> {
+    fn check(
+        &self,
+        _method: &str,
+        _path: &str,
+        policy: &Policy,
+        body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
         let volumes = match &policy.volumes {
             Some(v) if !v.is_empty() => v,
             _ => return Ok(()),
@@ -183,7 +216,13 @@ impl Gate for MountSourceGate {
 
 pub struct EnvFileGate;
 impl Gate for EnvFileGate {
-    fn check(&self, _method: &str, _path: &str, policy: &Policy, body: &HashMap<String, serde_json::Value>) -> std::result::Result<(), String> {
+    fn check(
+        &self,
+        _method: &str,
+        _path: &str,
+        policy: &Policy,
+        body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
         let env_file = match &policy.env_file {
             Some(e) if !e.is_empty() => e,
             _ => return Ok(()),
@@ -215,7 +254,13 @@ impl Gate for EnvFileGate {
 
 pub struct CmdGate;
 impl Gate for CmdGate {
-    fn check(&self, _method: &str, _path: &str, policy: &Policy, body: &HashMap<String, serde_json::Value>) -> std::result::Result<(), String> {
+    fn check(
+        &self,
+        _method: &str,
+        _path: &str,
+        policy: &Policy,
+        body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
         let cmd = match body.get("Cmd").and_then(|v| v.as_array()) {
             Some(c) => c,
             None => return Ok(()),
@@ -240,7 +285,10 @@ impl Gate for CmdGate {
             }
             if let Some(allowed) = &policy.allowed_cli_flags {
                 if !allowed.contains(&flag.to_string()) {
-                    return Err(format!("flag {:?} is not in the allowlist for service {}", flag, policy.service_name));
+                    return Err(format!(
+                        "flag {:?} is not in the allowlist for service {}",
+                        flag, policy.service_name
+                    ));
                 }
             }
 
@@ -265,7 +313,10 @@ impl Gate for CmdGate {
                             let re = regex::Regex::new(&rule.value_pattern)
                                 .map_err(|e| format!("invalid flag rule regex: {}", e))?;
                             if !re.is_match(&value) {
-                                return Err(format!("flag {} value {:?} does not match pattern {:?}", flag, value, rule.value_pattern));
+                                return Err(format!(
+                                    "flag {} value {:?} does not match pattern {:?}",
+                                    flag, value, rule.value_pattern
+                                ));
                             }
                         }
                     }
@@ -300,9 +351,10 @@ impl Mutator for ContainerConfigMutator {
             hc.insert("RestartPolicy".to_string(), rp_obj);
         }
         if let Some(so) = &cc.security_options {
-            hc.insert("SecurityOpt".to_string(), serde_json::Value::Array(
-                so.iter().map(|s| serde_json::Value::String(s.clone())).collect()
-            ));
+            hc.insert(
+                "SecurityOpt".to_string(),
+                serde_json::Value::Array(so.iter().map(|s| serde_json::Value::String(s.clone())).collect()),
+            );
         }
         hc.insert("Privileged".to_string(), serde_json::Value::Bool(false));
         if let Some(u) = &cc.user {
@@ -754,7 +806,9 @@ mod tests {
         let gate = RegistryGate;
         let mut policy = make_policy("test", vec!["alpine"]);
         policy.image_digest_allowed = true;
-        let body = body_from_json(serde_json::json!({"Image": "alpine@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"}));
+        let body = body_from_json(
+            serde_json::json!({"Image": "alpine@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"}),
+        );
         assert!(gate.check("POST", "/containers/create", &policy, &body).is_ok());
     }
 
