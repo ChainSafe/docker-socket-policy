@@ -21,7 +21,7 @@ Thank you for your interest! This project uses a multi-language approach — Go,
 
 Run `make hooks` once per clone. It sets `core.hooksPath` to `.githooks`, which enables:
 
-- `pre-commit` — checks the formatting of staged Go (`gofmt`), Rust (`cargo fmt`) and TypeScript (`prettier`) files
+- `pre-commit` — checks formatting when Go, Rust or TypeScript files are staged: the staged Go (`gofmt`) and TypeScript (`prettier`) files, and the whole Rust crate (`cargo fmt --check`), because rustfmt follows `mod` declarations
 - `pre-push` — runs `make lint-all`
 
 Both hooks check the working tree, not the commits being pushed or the exact staged content, so uncommitted changes can affect the result. CI checks what you push.

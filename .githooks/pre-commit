@@ -58,6 +58,7 @@ if [ -n "$rs_files" ]; then
 	if ! command -v cargo >/dev/null 2>&1; then
 		echo "pre-commit: cargo not found on PATH (install Rust via rustup)" >&2
 		fail rs
+	# Checks the whole crate, not only the staged files: rustfmt follows mod declarations.
 	elif ! out=$(cd rs && cargo fmt --check 2>&1); then
 		printf '%s\n' "$out" >&2
 		echo "pre-commit: cargo fmt needed" >&2
@@ -73,7 +74,7 @@ if [ -n "$ts_files" ]; then
 		old_ifs=$IFS
 		IFS=$nl
 		# shellcheck disable=SC2086 # intentional newline splitting
-		if ! out=$(cd ts && npx --no-install prettier --check -- $ts_files 2>&1); then
+		if ! out=$(cd ts && node_modules/.bin/prettier --check -- $ts_files 2>&1); then
 			printf '%s\n' "$out" >&2
 			echo "pre-commit: prettier needed" >&2
 			fail ts

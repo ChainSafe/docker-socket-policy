@@ -8,7 +8,7 @@ ROUTER_SPEC := spec/router.qnt
 BACKEND ?=
 
 .PHONY: build clean test lint verify typecheck test-spec validate ci-verify release-verify test-release
-.PHONY: build-go test-go lint-go build-rs test-rs build-ts test-ts fmt-go fmt-rs fmt-ts fmt-all hooks
+.PHONY: build-go test-go lint-go build-rs test-rs lint-rs build-ts test-ts lint-ts build-all test-all lint-all fmt-go fmt-rs fmt-ts fmt-all hooks
 
 # ─── Go ──────────────────────────────────────────────
 
@@ -55,7 +55,7 @@ lint-ts:
 
 fmt-ts:
 	@test -x ts/node_modules/.bin/prettier || { echo "prettier not installed: run npm ci in ts/"; exit 1; }
-	cd ts && npx --no-install prettier --write src
+	cd ts && node_modules/.bin/prettier --write src
 
 # ─── Aggregate targets ───────────────────────────────
 
