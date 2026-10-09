@@ -54,7 +54,8 @@ lint-ts:
 	cd ts && npm run typecheck && npm run format:check
 
 fmt-ts:
-	cd ts && npx prettier --write src
+	@test -x ts/node_modules/.bin/prettier || { echo "prettier not installed: run npm ci in ts/"; exit 1; }
+	cd ts && npx --no-install prettier --write src
 
 # ─── Aggregate targets ───────────────────────────────
 

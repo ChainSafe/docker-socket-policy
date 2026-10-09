@@ -24,6 +24,8 @@ Run `make hooks` once per clone. It sets `core.hooksPath` to `.githooks`, which 
 - `pre-commit` — checks the formatting of staged Go (`gofmt`), Rust (`cargo fmt`) and TypeScript (`prettier`) files
 - `pre-push` — runs `make lint-all`
 
+Both hooks check the working tree, not the commits being pushed or the exact staged content, so uncommitted changes can affect the result. CI checks what you push.
+
 To fix formatting, run `make fmt-go`, `make fmt-rs`, `make fmt-ts`, or `make fmt-all`. Prettier comes from `ts/node_modules`, so run `npm ci` in `ts/` first.
 
 To bypass a hook once, pass `--no-verify` to `git commit` or `git push`. CI runs the same checks.

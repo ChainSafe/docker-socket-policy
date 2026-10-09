@@ -8,8 +8,19 @@ set -eu
 
 cd "$(git rev-parse --show-toplevel)"
 
-staged=$(git diff --cached --name-only --diff-filter=ACMR)
+staged=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR)
 [ -n "$staged" ] || exit 0
+
+# With quotePath=false git still quotes names containing a newline, a double
+# quote or a backslash. Those cannot be matched reliably, so fail closed.
+quoted=$(printf '%s\n' "$staged" | grep '^"' || true)
+if [ -n "$quoted" ]; then
+	echo "pre-commit: cannot check file names that git quotes:" >&2
+	printf '  %s\n' "$quoted" >&2
+	echo "  rename the file, or bypass once with git commit --no-verify" >&2
+	echo "  (pre-push and CI still check formatting)" >&2
+	exit 1
+fi
 
 go_files=$(printf '%s\n' "$staged" | grep -E '^go/.*\.go$' || true)
 rs_files=$(printf '%s\n' "$staged" | grep -E '^rs/.*\.rs$' || true)
