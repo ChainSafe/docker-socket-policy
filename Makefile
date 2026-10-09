@@ -19,6 +19,7 @@ test-go:
 	cd go && go test ./... -count=1
 
 lint-go:
+	cd go && test -z "$$(gofmt -l .)" || { gofmt -l .; exit 1; }
 	cd go && go vet ./...
 
 # ─── Rust ────────────────────────────────────────────
@@ -30,7 +31,7 @@ test-rs:
 	cd rs && cargo test
 
 lint-rs:
-	cd rs && cargo check
+	cd rs && cargo fmt --check && cargo check
 
 # ─── Rust release binary location
 RS_BINARY = rs/target/release/docker-socket-policy
@@ -44,7 +45,7 @@ test-ts:
 	cd ts && npm run build && node --test dist/*.test.js
 
 lint-ts:
-	cd ts && npm run typecheck
+	cd ts && npm run typecheck && npm run format:check
 
 # ─── Aggregate targets ───────────────────────────────
 
