@@ -162,6 +162,7 @@ validate: typecheck verify lint-go test-go
 
 test-release:
 	bash scripts/release-version_test.sh
+	bash scripts/release-latest-tag_test.sh
 
 # ─── Reproducible build verification ─────────────────
 
