@@ -102,5 +102,5 @@ Other examples: `fix!: x` on v1.4.2 gives v2.0.0. `feat: x` on v1.4.2 gives v1.5
 | `scripts/release-notes.sh` | Reads the same input and prints the breaking-changes section, or nothing. |
 | `scripts/release-latest-tag.sh` | Prints the newest strict `vX.Y.Z` tag merged into a ref (default `HEAD`), or nothing if there is none. Fails if git fails. |
 | `scripts/release-version_test.sh` | One test case per row of the rule table, plus edge cases. |
-| `scripts/release-latest-tag_test.sh` | Builds throwaway repos: no tags, non-strict tags, version sort, pre-releases, unmerged tags, an explicit ref, and a git failure. |
+| `scripts/release-latest-tag_test.sh` | Builds throwaway repos: no tags, non-strict tags, version sort, pre-releases, unmerged tags, an explicit ref, a git failure, and a ref that does not resolve. |
 | `make test-release` | Runs the tests. The tests also run in CI (`release-scripts` job). |

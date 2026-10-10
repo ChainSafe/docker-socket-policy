@@ -162,6 +162,23 @@ else
 	fi
 fi
 
+# ─── bad-ref ─────────────────────────────────────────
+# A REF that does not resolve: git fails, so the script must fail rather than print nothing.
+if r=$(mkrepo bad-ref) && commit_tag "$r" v0.1.0; then
+	run "$r" nonexistent-ref
+	if [ -n "$(unrunnable)" ]; then
+		fail bad-ref "want non-zero exit, got $(unrunnable)"
+	elif [ "$rc" -eq 0 ]; then
+		fail bad-ref "want non-zero exit, got exit 0: '$out'"
+	elif [ -n "$out" ]; then
+		fail bad-ref "want empty stdout, got '$out'"
+	else
+		pass bad-ref
+	fi
+else
+	setup_failed bad-ref
+fi
+
 echo
 echo "$passed passed, $failed failed"
 [ "$failed" -eq 0 ]
