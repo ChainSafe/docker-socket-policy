@@ -291,8 +291,7 @@ describe("Router", () => {
       ["POST", "/containers/%2F/start", Action.Deny],
       // percentGetDeniedTest (#53)
       ["GET", "/containers/%2F", Action.Deny],
-      // #53, language-only: HEAD is outside the model's METHODS, but the rule
-      // covers every method.
+      // #53, language-only: the rule covers every method, HEAD included.
       ["HEAD", "/containers/%2F", Action.Deny],
       // #53: the check runs on the versioned path too.
       ["DELETE", "/v1.45/containers/foo%25", Action.Deny],
@@ -369,5 +368,62 @@ describe("Router", () => {
         assert.equal(r.denyMsg, wantMsg, `route(${method} ${path})`);
       }
     }
+  });
+
+  // Cross-language parity guard for #55. A path with an empty interior segment
+  // (// anywhere in the path) is denied for every method, after the percent
+  // check and before the API-version strip; a single trailing slash is not
+  // interior. HEAD on a named container is routed like GET. Rows mirror the
+  // emptyLeadingExecGetDenied, emptyInteriorGetDenied and
+  // headNamedContainerAllowed runs in spec/router.qnt.
+  it("denies empty interior segments and routes HEAD like GET", () => {
+    const empty = "empty path segment not allowed";
+    const percent = "percent-encoded path not allowed";
+    const exec = "exec is not allowed";
+    const cases: [string, string, Action, string | undefined][] = [
+      // emptyLeadingExecGetDeniedTest (#55): the leading empty segment hid the exec namespace.
+      ["GET", "//exec/abc/json", Action.Deny, empty],
+      // #55: the empty segment after the version prefix hides the exec namespace too.
+      ["GET", "/v1.45//exec/abc/json", Action.Deny, empty],
+      // #55: the check runs before the version strip.
+      ["GET", "//v1.45/exec/abc/json", Action.Deny, empty],
+      // emptyInteriorGetDeniedTest (#55)
+      ["GET", "/containers//json", Action.Deny, empty],
+      // #55: emptyNameStartDeniedTest (#48) is now decided by the empty segment check.
+      ["POST", "/containers//start", Action.Deny, empty],
+      // #55: an empty name followed by a trailing slash.
+      ["DELETE", "/containers//", Action.Deny, empty],
+      // #55: the read-only endpoints are not exempt.
+      ["GET", "//_ping", Action.Deny, empty],
+      // #55: the percent check runs first.
+      ["GET", "//containers/%2F", Action.Deny, percent],
+      // #55 control: a single trailing slash is not an empty interior segment.
+      ["GET", "/containers/", Action.Allow, undefined],
+      // #55 control: the root path.
+      ["GET", "/", Action.Allow, undefined],
+      // headNamedContainerAllowedTest (#55)
+      ["HEAD", "/containers/mycontainer", Action.Allow, undefined],
+      // #55: HEAD on a container subpath.
+      ["HEAD", "/containers/mycontainer/json", Action.Allow, undefined],
+      // #55: the exec check still denies HEAD.
+      ["HEAD", "/containers/mycontainer/exec", Action.Deny, exec],
+      // #55, TS-only: only the TS router receives the query string (Go and Rust
+      // route URL.EscapedPath() / uri.path()). A // in the query is not checked.
+      ["GET", "/containers/json?filters=a//b", Action.Allow, undefined],
+      // #55, TS-only: the TS router receives the raw request target, so an
+      // absolute-form target reaches it as-is. Its "//" after the scheme denies
+      // it; before #55 the first segment "http:" hid exec inspect (v0.3.1-v0.3.3).
+      ["GET", "http://docker/exec/abc/json", Action.Deny, empty],
+    ];
+    const mismatches: string[] = [];
+    for (const [method, path, want, wantMsg] of cases) {
+      const r = router.route(method, path);
+      if (r.action !== want || r.denyMsg !== wantMsg) {
+        mismatches.push(
+          `${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}/${wantMsg ?? "-"}`,
+        );
+      }
+    }
+    assert.deepEqual(mismatches, []);
   });
 });

@@ -508,8 +508,7 @@ allowed_image_prefixes:
 		{"POST", "/containers/%2F/start", ActionDeny},
 		// percentGetDeniedTest (#53)
 		{"GET", "/containers/%2F", ActionDeny},
-		// #53, language-only: HEAD is outside the model's METHODS, but the rule
-		// covers every method.
+		// #53, language-only: the rule covers every method, HEAD included.
 		{"HEAD", "/containers/%2F", ActionDeny},
 		// #53: the check runs on the versioned path too.
 		{"DELETE", "/v1.45/containers/foo%25", ActionDeny},
@@ -603,6 +602,70 @@ allowed_image_prefixes:
 			if tt.wantMsg != "" && got.DenyMsg != tt.wantMsg {
 				t.Fatalf("Route(%s, %s) deny msg = %q, want %q",
 					tt.method, tt.path, got.DenyMsg, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestRouteEmptySegmentsAndHead is the cross-language parity guard for #55.
+//
+// A path with an empty interior segment (// anywhere in the path) is denied
+// for every method, after the percent check and before the API-version strip;
+// a single trailing slash is not interior. HEAD on a named container is routed
+// like GET. Rows mirror the emptyLeadingExecGetDenied, emptyInteriorGetDenied
+// and headNamedContainerAllowed runs in spec/router.qnt.
+func TestRouteEmptySegmentsAndHead(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m)
+	empty := "empty path segment not allowed"
+	percent := "percent-encoded path not allowed"
+	exec := "exec is not allowed"
+
+	tests := []struct {
+		method  string
+		path    string
+		want    Action
+		wantMsg string
+	}{
+		// emptyLeadingExecGetDeniedTest (#55): the leading empty segment hid the exec namespace.
+		{"GET", "//exec/abc/json", ActionDeny, empty},
+		// #55: the empty segment after the version prefix hides the exec namespace too.
+		{"GET", "/v1.45//exec/abc/json", ActionDeny, empty},
+		// #55: the check runs before the version strip.
+		{"GET", "//v1.45/exec/abc/json", ActionDeny, empty},
+		// emptyInteriorGetDeniedTest (#55)
+		{"GET", "/containers//json", ActionDeny, empty},
+		// #55: emptyNameStartDeniedTest (#48) is now decided by the empty segment check.
+		{"POST", "/containers//start", ActionDeny, empty},
+		// #55: an empty name followed by a trailing slash.
+		{"DELETE", "/containers//", ActionDeny, empty},
+		// #55: the read-only endpoints are not exempt.
+		{"GET", "//_ping", ActionDeny, empty},
+		// #55: the percent check runs first.
+		{"GET", "//containers/%2F", ActionDeny, percent},
+		// #55 control: a single trailing slash is not an empty interior segment.
+		{"GET", "/containers/", ActionAllow, ""},
+		// #55 control: the root path.
+		{"GET", "/", ActionAllow, ""},
+		// headNamedContainerAllowedTest (#55)
+		{"HEAD", "/containers/mycontainer", ActionAllow, ""},
+		// #55: HEAD on a container subpath.
+		{"HEAD", "/containers/mycontainer/json", ActionAllow, ""},
+		// #55: the exec check still denies HEAD.
+		{"HEAD", "/containers/mycontainer/exec", ActionDeny, exec},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, nil)
+			if got.Action != tt.want || got.DenyMsg != tt.wantMsg {
+				t.Fatalf("Route(%s, %s) = %v/%q, want %v/%q",
+					tt.method, tt.path, got.Action, got.DenyMsg, tt.want, tt.wantMsg)
 			}
 		})
 	}
