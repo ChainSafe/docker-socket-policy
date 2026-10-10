@@ -332,7 +332,10 @@ module router {
     assert(route("GET", ["containers", "", "json"]) == "deny")
 
   run emptyInteriorSoundTest =
-    assert(emptyInteriorDenied and emptySegmentsHideNoExec)
+    assert(emptyInteriorDenied)
+
+  run emptySegmentsHideNoExecTest =
+    assert(emptySegmentsHideNoExec)
 }
 
 // Rust before #48: `/containers/` and `/containers//start` reach

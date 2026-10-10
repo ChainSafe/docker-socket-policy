@@ -410,6 +410,10 @@ describe("Router", () => {
       // #55, TS-only: only the TS router receives the query string (Go and Rust
       // route URL.EscapedPath() / uri.path()). A // in the query is not checked.
       ["GET", "/containers/json?filters=a//b", Action.Allow, undefined],
+      // #55, TS-only: the TS router receives the raw request target, so an
+      // absolute-form target reaches it as-is. Its "//" after the scheme denies
+      // it; before #55 the first segment "http:" hid exec inspect (v0.3.1-v0.3.3).
+      ["GET", "http://docker/exec/abc/json", Action.Deny, empty],
     ];
     const mismatches: string[] = [];
     for (const [method, path, want, wantMsg] of cases) {
