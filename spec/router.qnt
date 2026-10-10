@@ -204,6 +204,14 @@ module router_model {
       hasEmptyInterior(segs) implies isDenied(route(m, segs))
     ))
 
+  // The security claim behind emptyInteriorDenied: a path that is an exec
+  // path once its empty segments are dropped, as the daemon's redirect to
+  // the clean path does, is denied for every method (#55).
+  pure val emptySegmentsHideNoExec: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      isExecPath(segs.select(s => s != "")) implies isDenied(route(m, segs))
+    ))
+
   // ─── Tests: one run per table row ───────────────────────────────────
   //
   // Rows whose outcome depends on none of ALLOW_EMPTY_NAME, ALLOW_PERCENT
@@ -324,7 +332,7 @@ module router {
     assert(route("GET", ["containers", "", "json"]) == "deny")
 
   run emptyInteriorSoundTest =
-    assert(emptyInteriorDenied)
+    assert(emptyInteriorDenied and emptySegmentsHideNoExec)
 }
 
 // Rust before #48: `/containers/` and `/containers//start` reach
@@ -368,6 +376,7 @@ module router_pre55 {
   run pre55UnsoundTest =
     assert(and {
       not(emptyInteriorDenied),
+      not(emptySegmentsHideNoExec),
       route("GET", ["", "exec", "abc"]) == "allowRead",
     })
 }
