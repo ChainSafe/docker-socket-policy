@@ -4,7 +4,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 QUINT ?= $(shell command -v quint 2>/dev/null || echo node $$HOME/.hermes/node/lib/node_modules/@informalsystems/quint/dist/src/cli.js)
 SPEC ?= spec/docker_socket_policy.qnt
 LISTENER_SPEC ?= spec/listener.qnt
-ROUTER_SPEC := spec/router.qnt
+ROUTER_SPEC ?= spec/router.qnt
 BACKEND ?=
 
 .PHONY: build clean test lint verify typecheck test-spec validate ci-verify release-verify test-release
