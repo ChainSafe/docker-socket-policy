@@ -51,7 +51,7 @@ jobs:
         id: bump
         run: |
           set -euo pipefail
-          LATEST=$(git tag --list --merged HEAD --sort=-v:refname | grep -E -m1 '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          LATEST=$(scripts/release-latest-tag.sh)
           RANGE=${LATEST:+$LATEST..}HEAD
           echo "Latest tag: ${LATEST:-none}; range: $RANGE"
           git log -z --format=%B "$RANGE" | scripts/release-version.sh "$LATEST" | tee -a "$GITHUB_OUTPUT"

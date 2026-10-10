@@ -187,7 +187,7 @@ echo ""
 echo "--- proxy-granted (GID 2001, has group access) ---"
 
 S=$(get_status "$GRANTED_SOCK" "$URL/_ping")
-check "GET /_ping -> 200" "200" "$S"
+check "GET /_ping -> 200 (granted)" "200" "$S"
 
 S=$(get_status "$GRANTED_SOCK" "$URL/version")
 check "GET /version -> 200" "200" "$S"
@@ -211,7 +211,7 @@ echo ""
 echo "--- proxy-default-group (GID 65532, supplementary 2001) ---"
 
 S=$(get_status "$DEFAULT_SOCK" "$URL/_ping")
-check "GET /_ping -> 200" "200" "$S"
+check "GET /_ping -> 200 (default group)" "200" "$S"
 
 # ─── proxy-denied: should return 403 ──────────────────
 
