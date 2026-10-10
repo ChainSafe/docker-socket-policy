@@ -34,6 +34,11 @@ impl Router {
             return deny("percent-encoded path not allowed");
         }
 
+        // An empty interior segment can hide a denied prefix such as /exec (#55).
+        if path.contains("//") {
+            return deny("empty path segment not allowed");
+        }
+
         let path = strip_api_version(path);
 
         // Read-only endpoints
@@ -81,7 +86,7 @@ impl Router {
                 _ if path.ends_with("/rename") && method == "POST" => deny("rename is not allowed"),
                 _ if path.ends_with("/update") && method == "POST" => deny("update is not allowed"),
                 _ if method == "DELETE" => self.route_by_name(name),
-                _ if method == "GET" => allow(),
+                _ if method == "GET" || method == "HEAD" => allow(),
                 _ => deny(&format!("endpoint {} {} is not allowed", method, path)),
             };
         }

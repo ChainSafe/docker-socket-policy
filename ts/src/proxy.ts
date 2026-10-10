@@ -25,6 +25,8 @@ export class Router {
     const cleanPath = qmIdx !== -1 ? path.slice(0, qmIdx) : path;
     // The daemon decodes the path before routing, so deny any escape (#53).
     if (cleanPath.includes("%")) return { action: Action.Deny, denyMsg: "percent-encoded path not allowed" };
+    // An empty interior segment can hide a denied prefix such as /exec (#55).
+    if (cleanPath.includes("//")) return { action: Action.Deny, denyMsg: "empty path segment not allowed" };
     path = stripAPIVersion(cleanPath);
 
     // Read-only endpoints

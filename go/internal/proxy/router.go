@@ -40,6 +40,11 @@ func (r *Router) Route(method, path string, body map[string]interface{}) *RouteR
 		return &RouteResult{Action: ActionDeny, DenyMsg: "percent-encoded path not allowed"}
 	}
 
+	// An empty interior segment can hide a denied prefix such as /exec (#55).
+	if strings.Contains(path, "//") {
+		return &RouteResult{Action: ActionDeny, DenyMsg: "empty path segment not allowed"}
+	}
+
 	path = stripAPIVersion(path)
 
 	if path == "/_ping" || path == "/version" || path == "/info" || strings.HasPrefix(path, "/events") {
