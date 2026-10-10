@@ -17,10 +17,7 @@ describe("Manager", () => {
   });
 
   it("loads policies from YAML files", () => {
-    writeFileSync(
-      join(tmpDir, "test.yaml"),
-      "service_name: test-service\nallowed_image_prefixes:\n  - nginx\n",
-    );
+    writeFileSync(join(tmpDir, "test.yaml"), "service_name: test-service\nallowed_image_prefixes:\n  - nginx\n");
     const m = new Manager(tmpDir);
     assert.equal(m.list().length, 1);
     assert.ok(m.list().includes("test-service"));
@@ -34,10 +31,7 @@ describe("Manager", () => {
   });
 
   it("loads .yml extension", () => {
-    writeFileSync(
-      join(tmpDir, "test.yml"),
-      "service_name: my-service\nallowed_image_prefixes:\n  - busybox\n",
-    );
+    writeFileSync(join(tmpDir, "test.yml"), "service_name: my-service\nallowed_image_prefixes:\n  - busybox\n");
     const m = new Manager(tmpDir);
     assert.equal(m.list().length, 1);
   });
@@ -53,10 +47,7 @@ describe("Manager", () => {
   });
 
   it("get returns policy by service name", () => {
-    writeFileSync(
-      join(tmpDir, "svc.yaml"),
-      "service_name: my-svc\nallowed_image_prefixes:\n  - nginx\n",
-    );
+    writeFileSync(join(tmpDir, "svc.yaml"), "service_name: my-svc\nallowed_image_prefixes:\n  - nginx\n");
     const m = new Manager(tmpDir);
     const p = m.get("my-svc");
     assert.ok(p);
@@ -65,19 +56,13 @@ describe("Manager", () => {
   });
 
   it("get returns undefined for unknown service", () => {
-    writeFileSync(
-      join(tmpDir, "svc.yaml"),
-      "service_name: known\nallowed_image_prefixes:\n  - nginx\n",
-    );
+    writeFileSync(join(tmpDir, "svc.yaml"), "service_name: known\nallowed_image_prefixes:\n  - nginx\n");
     const m = new Manager(tmpDir);
     assert.equal(m.get("unknown"), undefined);
   });
 
   it("getByImage matches exact prefix", () => {
-    writeFileSync(
-      join(tmpDir, "svc.yaml"),
-      "service_name: nginx-svc\nallowed_image_prefixes:\n  - nginx\n",
-    );
+    writeFileSync(join(tmpDir, "svc.yaml"), "service_name: nginx-svc\nallowed_image_prefixes:\n  - nginx\n");
     const m = new Manager(tmpDir);
     const p = m.getByImage("nginx:latest");
     assert.ok(p);
@@ -85,10 +70,7 @@ describe("Manager", () => {
   });
 
   it("getByImage matches prefix with slash", () => {
-    writeFileSync(
-      join(tmpDir, "svc.yaml"),
-      "service_name: my-org\nallowed_image_prefixes:\n  - myorg\n",
-    );
+    writeFileSync(join(tmpDir, "svc.yaml"), "service_name: my-org\nallowed_image_prefixes:\n  - myorg\n");
     const m = new Manager(tmpDir);
     const p = m.getByImage("myorg/web-app:v1");
     assert.ok(p);
@@ -96,10 +78,7 @@ describe("Manager", () => {
   });
 
   it("getByImage returns undefined when no prefix matches", () => {
-    writeFileSync(
-      join(tmpDir, "svc.yaml"),
-      "service_name: svc\nallowed_image_prefixes:\n  - nginx\n",
-    );
+    writeFileSync(join(tmpDir, "svc.yaml"), "service_name: svc\nallowed_image_prefixes:\n  - nginx\n");
     const m = new Manager(tmpDir);
     assert.equal(m.getByImage("redis:latest"), undefined);
   });

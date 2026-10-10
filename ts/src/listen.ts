@@ -24,11 +24,7 @@ import { BIND_UMASK, SOCKET_MODE } from "./flags.js";
  * main always passes the gid chosen by selectSocketGroup; an undefined gid
  * skips the chown and exists only for tests.
  */
-export function listenOnSocket(
-  server: Server,
-  path: string,
-  gid?: number,
-): Promise<void> {
+export function listenOnSocket(server: Server, path: string, gid?: number): Promise<void> {
   return new Promise((resolve, reject) => {
     // umask is process-global. This runs during startup, before any request is
     // served, so nothing else is creating files in the window.

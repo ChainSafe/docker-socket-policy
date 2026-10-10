@@ -18,6 +18,8 @@ deploy/ — Docker Compose + integration tests
 - `make build-go` / `make test-go` / `make lint-go` — Go only
 - `make build-rs` / `make test-rs` / `make lint-rs` — Rust only
 - `make build-ts` / `make test-ts` / `make lint-ts` — TypeScript only
+- `make fmt-all` / `make fmt-go` / `make fmt-rs` / `make fmt-ts` — apply gofmt / rustfmt / prettier (each `lint-*` target checks formatting)
+- `make hooks` — enable `.githooks` (pre-commit format check, pre-push `make lint-all`)
 - `make verify` — Quint spec simulation (request handling + listener)
 - `make test-spec` — Quint `run` tests for `spec/listener.qnt` and `spec/router.qnt`
 - `make test-integration` — Docker Compose integration tests

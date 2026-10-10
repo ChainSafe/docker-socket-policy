@@ -58,7 +58,12 @@ describe("RegistryGate", () => {
   });
 
   it("allows image matching prefix with org", () => {
-    assert.equal(gate.check("POST", "/containers/create", makePolicy({ allowed_image_prefixes: ["myorg"] }), { Image: "myorg/app:v1" }), null);
+    assert.equal(
+      gate.check("POST", "/containers/create", makePolicy({ allowed_image_prefixes: ["myorg"] }), {
+        Image: "myorg/app:v1",
+      }),
+      null,
+    );
   });
 
   it("denies image not in allowed prefixes", () => {
@@ -142,11 +147,22 @@ describe("MountSourceGate", () => {
   });
 
   it("returns null when no volumes in policy", () => {
-    assert.equal(gate.check("POST", "/containers/create", makePolicy(), { HostConfig: { Binds: ["/data:/data"] } }), null);
+    assert.equal(
+      gate.check("POST", "/containers/create", makePolicy(), { HostConfig: { Binds: ["/data:/data"] } }),
+      null,
+    );
   });
 
   it("returns null when no Binds", () => {
-    assert.equal(gate.check("POST", "/containers/create", makePolicy({ volumes: [{ host_path: "/data", container_path: "/data", read_write: true }] }), {}), null);
+    assert.equal(
+      gate.check(
+        "POST",
+        "/containers/create",
+        makePolicy({ volumes: [{ host_path: "/data", container_path: "/data", read_write: true }] }),
+        {},
+      ),
+      null,
+    );
   });
 
   it("allows top-level Volumes in whitelist", () => {

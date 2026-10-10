@@ -28,12 +28,7 @@ impl Router {
         Router { manager }
     }
 
-    pub fn route(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<&HashMap<String, serde_json::Value>>,
-    ) -> RouteResult {
+    pub fn route(&self, method: &str, path: &str, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
         // The daemon decodes the path before routing, so deny any escape (#53).
         if path.contains('%') {
             return deny("percent-encoded path not allowed");
@@ -208,12 +203,7 @@ fn strip_api_version(path: &str) -> &str {
         return path;
     };
     let bytes = rest.as_bytes();
-    let digits = |from: usize| {
-        bytes[from..]
-            .iter()
-            .take_while(|b| b.is_ascii_digit())
-            .count()
-    };
+    let digits = |from: usize| bytes[from..].iter().take_while(|b| b.is_ascii_digit()).count();
     let major = digits(0);
     if major == 0 {
         return path;
@@ -246,7 +236,13 @@ fn extract_container_name(path: &str) -> Option<&str> {
     let path = path.strip_prefix('/').unwrap_or(path);
     let parts: Vec<&str> = path.split('/').collect();
     // An empty segment is not a name, mirroring Go/TS (#48).
-    if parts.len() >= 2 && parts[0] == "containers" && !parts[1].is_empty() && parts[1] != "create" && parts[1] != "json" && parts[1] != "exec" {
+    if parts.len() >= 2
+        && parts[0] == "containers"
+        && !parts[1].is_empty()
+        && parts[1] != "create"
+        && parts[1] != "json"
+        && parts[1] != "exec"
+    {
         Some(parts[1])
     } else {
         None
@@ -348,9 +344,9 @@ mod tests {
     #[test]
     fn test_route_container_create() {
         let router = Router::new(make_manager(vec!["alpine"]));
-        let binding = serde_json::from_value::<HashMap<String, serde_json::Value>>(
-            serde_json::json!({"Image": "alpine:latest"}),
-        ).unwrap();
+        let binding =
+            serde_json::from_value::<HashMap<String, serde_json::Value>>(serde_json::json!({"Image": "alpine:latest"}))
+                .unwrap();
         let body = Some(&binding);
         let result = router.route("POST", "/containers/create", body);
         assert_eq!(result.action, Action::CreateContainer);
@@ -369,9 +365,8 @@ mod tests {
     #[test]
     fn test_route_container_create_no_image() {
         let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"Cmd": ["echo"]}),
-        ).unwrap();
+        let map: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Cmd": ["echo"]})).unwrap();
         let result = router.route("POST", "/containers/create", Some(&map));
         assert_eq!(result.action, Action::Deny);
         assert!(result.deny_msg.unwrap().contains("image"));
@@ -380,9 +375,8 @@ mod tests {
     #[test]
     fn test_route_container_create_image_not_found() {
         let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"Image": "ubuntu:latest"}),
-        ).unwrap();
+        let map: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Image": "ubuntu:latest"})).unwrap();
         let result = router.route("POST", "/containers/create", Some(&map));
         assert_eq!(result.action, Action::Deny);
         assert!(result.deny_msg.unwrap().contains("not allowed by any policy"));
@@ -562,7 +556,12 @@ mod tests {
             // #52: dotted version, container lifecycle start.
             ("POST", "/v1.43/containers/beacon/start", None, Action::Allow),
             // #52: dotted version, create with a policy-allowed image.
-            ("POST", "/v1.43/containers/create", Some(&create_body), Action::CreateContainer),
+            (
+                "POST",
+                "/v1.43/containers/create",
+                Some(&create_body),
+                Action::CreateContainer,
+            ),
             // #52: undotted control — stripped correctly everywhere already.
             ("POST", "/v1/containers/beacon/start", None, Action::Allow),
             // #52: the reserved segment survives the strip (#24 parity).
@@ -678,7 +677,13 @@ mod tests {
             // execNamespacePostDeniedTest (#49)
             ("POST", "/exec/abc/start", None, Action::Deny, exec),
             // createSubpathDeniedTest (#49): an allowed image, so only the path decides.
-            ("POST", "/containers/create/extra", Some(&create_body), Action::Deny, None),
+            (
+                "POST",
+                "/containers/create/extra",
+                Some(&create_body),
+                Action::Deny,
+                None,
+            ),
             // Exec is matched under containers or exec only (#49, language-only).
             ("GET", "/images/exec", None, Action::Allow, None),
             // An allowed image, so only the path decides (#49, language-only).
@@ -694,7 +699,11 @@ mod tests {
         ];
         for (method, path, body, want, want_msg) in cases {
             let got = router.route(method, path, body);
-            assert_eq!(got.action, want, "route({} {}) deny msg = {:?}", method, path, got.deny_msg);
+            assert_eq!(
+                got.action, want,
+                "route({} {}) deny msg = {:?}",
+                method, path, got.deny_msg
+            );
             // Exact match: the default deny for POST /containers/x/exec ends in
             // "exec is not allowed" too, so a substring check passes vacuously.
             if let Some(want_msg) = want_msg {
@@ -713,9 +722,8 @@ mod tests {
     #[test]
     fn test_route_image_pull() {
         let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"fromImage": "alpine"}),
-        ).unwrap();
+        let map: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"fromImage": "alpine"})).unwrap();
         let result = router.route("POST", "/images/create", Some(&map));
         assert_eq!(result.action, Action::Allow);
         assert_eq!(result.image, Some("alpine".into()));
@@ -731,9 +739,8 @@ mod tests {
     #[test]
     fn test_route_image_pull_no_fromimage() {
         let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"tag": "latest"}),
-        ).unwrap();
+        let map: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"tag": "latest"})).unwrap();
         let result = router.route("POST", "/images/create", Some(&map));
         assert_eq!(result.action, Action::Deny);
         assert!(result.deny_msg.unwrap().contains("fromImage"));
@@ -742,9 +749,8 @@ mod tests {
     #[test]
     fn test_route_image_pull_not_found() {
         let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"fromImage": "ubuntu"}),
-        ).unwrap();
+        let map: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"fromImage": "ubuntu"})).unwrap();
         let result = router.route("POST", "/images/create", Some(&map));
         assert_eq!(result.action, Action::Deny);
         assert!(result.deny_msg.unwrap().contains("not allowed by any policy"));
@@ -790,9 +796,8 @@ mod tests {
     #[test]
     fn test_container_create_body_passthrough() {
         let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"Image": "alpine", "Cmd": ["sleep", "100"]}),
-        ).unwrap();
+        let map: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Image": "alpine", "Cmd": ["sleep", "100"]})).unwrap();
         let result = router.route("POST", "/containers/create", Some(&map));
         assert_eq!(result.action, Action::CreateContainer);
         let b = result.body.unwrap();

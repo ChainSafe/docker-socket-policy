@@ -3,11 +3,7 @@
 
 import { readFileSync } from "node:fs";
 
-export function getFlag(
-  args: string[],
-  name: string,
-  defaultVal: string,
-): string {
+export function getFlag(args: string[], name: string, defaultVal: string): string {
   const prefix = name + "=";
   for (let i = 0; i < args.length; i++) {
     if (args[i] === name && i + 1 < args.length) return args[i + 1];
@@ -22,13 +18,7 @@ export function hasFlag(args: string[], name: string): boolean {
 }
 
 // The flags the proxy accepts, for validateFlags.
-export const VALUE_FLAGS = [
-  "--listen-socket",
-  "--docker-host",
-  "--config-dir",
-  "--log-file",
-  "--listen-socket-group",
-];
+export const VALUE_FLAGS = ["--listen-socket", "--docker-host", "--config-dir", "--log-file", "--listen-socket-group"];
 export const BOOL_FLAGS = ["--readonly"];
 
 // Rejects anything not recognised. Go's flag package and Rust's clap both exit
@@ -40,11 +30,7 @@ export const BOOL_FLAGS = ["--readonly"];
 // `valueFlags` take an argument (in either `--name value` or `--name=value`
 // form); `boolFlags` do not, and must not swallow the following argument.
 // Returns an error message, or null when every argument is recognised.
-export function validateFlags(
-  args: string[],
-  valueFlags: string[],
-  boolFlags: string[],
-): string | null {
+export function validateFlags(args: string[], valueFlags: string[], boolFlags: string[]): string | null {
   const known = [...valueFlags, ...boolFlags];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -69,9 +55,7 @@ export function validateFlags(
 // Where the proxy should listen. The proxy listens on a Unix socket only:
 // filesystem ownership on that socket is the access-control boundary, and a
 // TCP listener would carry no peer identity at all.
-export type ListenTarget =
-  | { kind: "path"; path: string }
-  | { kind: "error"; message: string };
+export type ListenTarget = { kind: "path"; path: string } | { kind: "error"; message: string };
 
 // Parses --listen-socket, which must be an absolute filesystem path. Mirrors
 // validateListenSocket in Go and validate_listen_socket in Rust.

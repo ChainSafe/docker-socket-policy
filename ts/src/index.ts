@@ -95,9 +95,7 @@ server.once("listening", () => {
 const path = listenTarget.path;
 openListener(server, path, socketGid).then(
   () => {
-    console.log(
-      `listening on unix socket ${path} (mode ${SOCKET_MODE.toString(8).padStart(4, "0")})`,
-    );
+    console.log(`listening on unix socket ${path} (mode ${SOCKET_MODE.toString(8).padStart(4, "0")})`);
   },
   (err: NodeJS.ErrnoException) => {
     console.error(`failed to listen on ${path}: ${err.message}`);

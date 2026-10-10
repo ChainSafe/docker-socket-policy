@@ -56,16 +56,8 @@ describe("listenOnSocket", () => {
       process.umask(previous);
     }
 
-    assert.equal(
-      modeOf(path),
-      0o660,
-      `socket mode was ${modeOf(path).toString(8)} under umask 0, want 660`,
-    );
-    assert.equal(
-      modeOf(path) & 0o002,
-      0,
-      "socket is world-writable: any local uid could connect",
-    );
+    assert.equal(modeOf(path), 0o660, `socket mode was ${modeOf(path).toString(8)} under umask 0, want 660`);
+    assert.equal(modeOf(path) & 0o002, 0, "socket is world-writable: any local uid could connect");
 
     await new Promise((r) => server.close(r));
     cleanup();
@@ -87,10 +79,7 @@ describe("listenOnSocket", () => {
     const before = process.umask();
     const server = createServer(() => {});
 
-    await assert.rejects(
-      () => listenOnSocket(server, "/nonexistent-dir-xyz/s.sock"),
-      /ENOENT|EACCES/,
-    );
+    await assert.rejects(() => listenOnSocket(server, "/nonexistent-dir-xyz/s.sock"), /ENOENT|EACCES/);
     assert.equal(process.umask(), before, "umask was not restored after a failed bind");
   });
 
@@ -292,16 +281,10 @@ describe("openListener", () => {
         const path = join(dir, `c${i}.sock`);
         const servers = Array.from({ length: racers }, () => createNetServer());
         try {
-          const results = await Promise.allSettled(
-            servers.map((s) => openListener(s, path, process.getegid!())),
-          );
+          const results = await Promise.allSettled(servers.map((s) => openListener(s, path, process.getegid!())));
 
           const winners = results.flatMap((r, j) => (r.status === "fulfilled" ? [j] : []));
-          assert.equal(
-            winners.length,
-            1,
-            `iteration ${i}: ${winners.length} openListener calls succeeded, want 1`,
-          );
+          assert.equal(winners.length, 1, `iteration ${i}: ${winners.length} openListener calls succeeded, want 1`);
           for (const r of results) {
             if (r.status === "rejected") {
               assert.match(

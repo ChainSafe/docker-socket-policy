@@ -8,13 +8,8 @@ pub struct AuditLogger {
 
 impl AuditLogger {
     pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        Ok(AuditLogger {
-            file: Mutex::new(file),
-        })
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(AuditLogger { file: Mutex::new(file) })
     }
 
     pub fn nop() -> Self {
@@ -23,9 +18,7 @@ impl AuditLogger {
             .append(true)
             .open("/dev/null")
             .expect("failed to open /dev/null");
-        AuditLogger {
-            file: Mutex::new(file),
-        }
+        AuditLogger { file: Mutex::new(file) }
     }
 
     pub fn allow(&self, method: &str, uri: &str) {

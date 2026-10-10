@@ -5,8 +5,8 @@ use crate::transport::Transport;
 use crate::transport::TransportError;
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use hyper::{Request, Response, StatusCode, header};
 use http_body_util::Full;
+use hyper::{header, Request, Response, StatusCode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -20,7 +20,12 @@ pub struct Handler {
 
 impl Handler {
     pub fn new(router: Arc<Router>, chain: Chain, audit: AuditLogger, transport: Box<dyn Transport>) -> Self {
-        Handler { router, chain, audit, transport }
+        Handler {
+            router,
+            chain,
+            audit,
+            transport,
+        }
     }
 
     pub async fn handle<B>(&self, req: Request<B>) -> Response<Full<Bytes>>
@@ -130,11 +135,18 @@ mod tests {
     }
 
     impl MockTransport {
-        fn new() -> (Self, Arc<std::sync::Mutex<Option<Bytes>>>, Arc<std::sync::Mutex<Option<hyper::HeaderMap>>>) {
+        fn new() -> (
+            Self,
+            Arc<std::sync::Mutex<Option<Bytes>>>,
+            Arc<std::sync::Mutex<Option<hyper::HeaderMap>>>,
+        ) {
             let captured = Arc::new(std::sync::Mutex::new(None));
             let captured_headers = Arc::new(std::sync::Mutex::new(None));
             (
-                MockTransport { captured_body: captured.clone(), captured_headers: captured_headers.clone() },
+                MockTransport {
+                    captured_body: captured.clone(),
+                    captured_headers: captured_headers.clone(),
+                },
                 captured,
                 captured_headers,
             )
@@ -143,10 +155,7 @@ mod tests {
 
     #[async_trait]
     impl Transport for MockTransport {
-        async fn forward(
-            &self,
-            req: Request<Full<Bytes>>,
-        ) -> Result<Response<Full<Bytes>>, TransportError> {
+        async fn forward(&self, req: Request<Full<Bytes>>) -> Result<Response<Full<Bytes>>, TransportError> {
             *self.captured_headers.lock().unwrap() = Some(req.headers().clone());
             let body = req.into_body();
             let collected = http_body_util::BodyExt::collect(body)
@@ -161,7 +170,11 @@ mod tests {
         }
     }
 
-    fn make_test_handler() -> (Handler, Arc<std::sync::Mutex<Option<Bytes>>>, Arc<std::sync::Mutex<Option<hyper::HeaderMap>>>) {
+    fn make_test_handler() -> (
+        Handler,
+        Arc<std::sync::Mutex<Option<Bytes>>>,
+        Arc<std::sync::Mutex<Option<hyper::HeaderMap>>>,
+    ) {
         use crate::policy::ContainerConfig;
         let mut policies = std::collections::HashMap::new();
         policies.insert(
@@ -213,8 +226,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let captured = captured.lock().unwrap();
-        let captured_body: serde_json::Value =
-            serde_json::from_slice(captured.as_ref().unwrap()).unwrap();
+        let captured_body: serde_json::Value = serde_json::from_slice(captured.as_ref().unwrap()).unwrap();
         assert!(captured_body.get("HostConfig").is_some());
         let hc = captured_body.get("HostConfig").unwrap();
         assert_eq!(hc.get("Privileged"), Some(&serde_json::Value::Bool(false)));
@@ -244,17 +256,14 @@ mod tests {
 
     #[async_trait]
     impl Transport for FailingTransport {
-        async fn forward(
-            &self,
-            _req: Request<Full<Bytes>>,
-        ) -> Result<Response<Full<Bytes>>, TransportError> {
+        async fn forward(&self, _req: Request<Full<Bytes>>) -> Result<Response<Full<Bytes>>, TransportError> {
             match self.kind {
-                FailureKind::SocketPermission => Err(TransportError::SocketPermission(
-                    std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-                )),
-                FailureKind::Other => Err(TransportError::Other(
-                    Box::<dyn std::error::Error + Send + Sync>::from("connection refused"),
-                )),
+                FailureKind::SocketPermission => Err(TransportError::SocketPermission(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                ))),
+                FailureKind::Other => Err(TransportError::Other(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "connection refused",
+                ))),
             }
         }
     }
@@ -373,10 +382,7 @@ mod tests {
 
     #[async_trait]
     impl Transport for UriRecordingTransport {
-        async fn forward(
-            &self,
-            req: Request<Full<Bytes>>,
-        ) -> Result<Response<Full<Bytes>>, TransportError> {
+        async fn forward(&self, req: Request<Full<Bytes>>) -> Result<Response<Full<Bytes>>, TransportError> {
             *self.captured_uri.lock().unwrap() = Some(req.uri().clone());
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -391,7 +397,9 @@ mod tests {
         let chain = Chain::new(false);
         let audit = AuditLogger::new("/dev/null").unwrap();
         let captured_uri = Arc::new(std::sync::Mutex::new(None));
-        let transport = UriRecordingTransport { captured_uri: captured_uri.clone() };
+        let transport = UriRecordingTransport {
+            captured_uri: captured_uri.clone(),
+        };
         (Handler::new(router, chain, audit, Box::new(transport)), captured_uri)
     }
 

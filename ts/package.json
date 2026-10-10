@@ -5,13 +5,15 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "format:check": "prettier --check src"
   },
   "dependencies": {
     "yaml": "^2.7.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "prettier": "3.9.9",
     "typescript": "^5.7.0"
   }
 }

@@ -1,11 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import {
-  Agent,
-  createServer,
-  request as httpRequest,
-  type Server,
-} from "node:http";
+import { Agent, createServer, request as httpRequest, type Server } from "node:http";
 import { connect } from "node:net";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -59,12 +54,7 @@ async function harness(
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(msg)), ms).unref(),
-    ),
-  ]);
+  return Promise.race([p, new Promise<T>((_, reject) => setTimeout(() => reject(new Error(msg)), ms).unref())]);
 }
 
 /** Opens a connection and sends a request, returning the raw reply. */
@@ -105,24 +95,17 @@ describe("createShutdown", () => {
     // client leaves behind between API calls.
     const agent = new Agent({ keepAlive: true });
     await new Promise<void>((resolve, reject) => {
-      const req = httpRequest(
-        { socketPath: h.path, path: "/first", agent },
-        (res) => {
-          res.resume();
-          res.on("end", () => resolve());
-        },
-      );
+      const req = httpRequest({ socketPath: h.path, path: "/first", agent }, (res) => {
+        res.resume();
+        res.on("end", () => resolve());
+      });
       req.on("error", reject);
       req.end();
     });
 
     const started = Date.now();
     h.shutdown("SIGTERM");
-    const code = await withTimeout(
-      h.exited,
-      5_000,
-      "idle keep-alive connection held shutdown open",
-    );
+    const code = await withTimeout(h.exited, 5_000, "idle keep-alive connection held shutdown open");
 
     const elapsed = Date.now() - started;
     assert.equal(code, 0);

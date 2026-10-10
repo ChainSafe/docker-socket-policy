@@ -7,10 +7,7 @@ import { Manager } from "./policy.js";
 import { Action, Router } from "./proxy.js";
 
 function createManager(dir: string) {
-  writeFileSync(
-    join(dir, "nginx.yaml"),
-    "service_name: nginx-svc\nallowed_image_prefixes:\n  - nginx\n",
-  );
+  writeFileSync(join(dir, "nginx.yaml"), "service_name: nginx-svc\nallowed_image_prefixes:\n  - nginx\n");
   writeFileSync(
     join(dir, "redis.yaml"),
     "service_name: redis-svc\nallowed_image_prefixes:\n  - redis\ncontainer_config:\n  network_mode: bridge\nvolumes:\n  - host_path: /data\n    container_path: /data\n    read_write: true\n",

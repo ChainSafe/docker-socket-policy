@@ -116,7 +116,7 @@ make test-all
 # Lint all three
 make lint-all
 
-# Full validation: typecheck + verify + vet + test (Go)
+# Full validation: typecheck + verify + gofmt + vet + test (Go)
 make validate
 ```
 

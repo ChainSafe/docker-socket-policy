@@ -28,10 +28,7 @@ describe("flags", () => {
     });
 
     it("prefers first occurrence", () => {
-      assert.equal(
-        getFlag(["--config-dir=/a", "--config-dir", "/b"], "--config-dir", "d"),
-        "/a",
-      );
+      assert.equal(getFlag(["--config-dir=/a", "--config-dir", "/b"], "--config-dir", "d"), "/a");
     });
 
     it("returns default when absent", () => {
@@ -44,17 +41,11 @@ describe("flags", () => {
     });
 
     it("does not match a different flag's value", () => {
-      assert.equal(
-        getFlag(["--listen-socket", "/run/dsp.sock"], "--config-dir", "d"),
-        "d",
-      );
+      assert.equal(getFlag(["--listen-socket", "/run/dsp.sock"], "--config-dir", "d"), "d");
     });
 
     it("handles --name=value where value contains equals", () => {
-      assert.equal(
-        getFlag(["--log-file=/a=/b"], "--log-file", "d"),
-        "/a=/b",
-      );
+      assert.equal(getFlag(["--log-file=/a=/b"], "--log-file", "d"), "/a=/b");
     });
   });
 
@@ -307,9 +298,7 @@ describe("selectSocketGroup", () => {
 // the expression index.ts uses.
 describe("--listen-socket-group empty vs absent", () => {
   const groupFlag = (args: string[]) =>
-    hasFlag(args, "--listen-socket-group")
-      ? getFlag(args, "--listen-socket-group", "")
-      : undefined;
+    hasFlag(args, "--listen-socket-group") ? getFlag(args, "--listen-socket-group", "") : undefined;
 
   it("absent", () => {
     assert.equal(groupFlag([]), undefined);
