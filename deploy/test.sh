@@ -386,6 +386,14 @@ check "POST /containers/exec-nosuch/start -> 404 (daemon answered, not proxy 403
 S=$(get_status "$PROXY/exec/0000000000000000000000000000000000000000000000000000000000000000/json")
 check "GET /exec/*/json -> 403 (exec inspect denied)" "403" "$S"
 
+# #55: an empty interior segment is denied for every method. Before #55 the
+# empty first segment of //exec/... hid the exec namespace and the GET
+# passthrough forwarded it. --path-as-is stops curl from collapsing the //.
+S=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --path-as-is --unix-socket "$PROXY_SOCK" \
+  "$PROXY//exec/0000000000000000000000000000000000000000000000000000000000000000/json" 2>/dev/null || true)
+S="${S:-000}"
+check "GET //exec/*/json -> 403 (empty segment)" "403" "$S"
+
 # ─── Summary ──────────────────────────────────────────
 
 echo ""
