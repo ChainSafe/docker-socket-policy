@@ -2,16 +2,16 @@
 //
 // How the router extracts a container name from a request path, how the
 // container-lifecycle branch routes on it (#48), the percent-encoded
-// path deny that runs first in the router (#53), and the segment-exact exec
-// deny and POST /containers/create route (#49). Mirrors
+// path deny that runs first in the router (#53), the empty interior segment
+// deny that follows it (#55), and the segment-exact exec deny and
+// POST /containers/create route (#49). Mirrors
 // `extract_container_name` and the lifecycle branch of `Router::route` in
 // rs/src/proxy.rs. This is not the full router: the API-version strip and
 // the other checks that run between the percent check and the lifecycle
 // branch (build, commit, the read-only endpoints, auth) are left out, as is
 // POST /images/create. Go (`extractContainerName`) and
-// TypeScript (`extractContainerName`) have the same lifecycle branch for
-// GET, POST and DELETE. HEAD differs: Go and TypeScript allow it through
-// the passthrough, Rust denies it. HEAD is outside METHODS.
+// TypeScript (`extractContainerName`) have the same lifecycle branch.
+// HEAD is routed like GET in all three (#55).
 //
 // A path is a list of raw (still percent-encoded) segments, with the query
 // string removed: `DELETE /containers/` is ["containers", ""],
@@ -31,6 +31,11 @@
 // on the raw path and let encoded segments through. false models all three
 // after the fix: any `%` in the path is denied, for every method.
 //
+// ALLOW_EMPTY_INTERIOR = true models all three before #55, which let an
+// empty segment before the last one through. false models all three after
+// the fix: a path with `//` in it is denied, for every method. A single
+// trailing slash, as in `/containers/`, is not interior.
+//
 // No instance models Go before #53. Go decoded before routing, which is
 // route(m, decodePath(segs)); with this table that agrees with the daemon
 // by construction, so the property cannot express Go's risk: decoding that
@@ -40,6 +45,7 @@
 module router_model {
   const ALLOW_EMPTY_NAME: bool
   const ALLOW_PERCENT: bool
+  const ALLOW_EMPTY_INTERIOR: bool
 
   // ─── Daemon decoding ────────────────────────────────────────────────
 
@@ -102,15 +108,22 @@ module router_model {
       segs[0] == "containers" and segs.indices().exists(i => i >= 1 and segs[i] == "exec"),
     }
 
+  // An empty segment before the last one, i.e. `//` in the path. A trailing
+  // empty segment (`/containers/`) is not interior.
+  pure def hasEmptyInterior(segs: List[str]): bool =
+    segs.indices().exists(i => i < segs.length() - 1 and segs[i] == "")
+
   pure def isDenied(outcome: str): bool =
     outcome == "deny" or outcome == "denyExec"
 
-  // The percent check (#53) comes first. The exec check (#49) follows, before
+  // The percent check (#53) comes first, then the empty interior segment
+  // check (#55). The exec check (#49) follows, before
   // the create route, the lifecycle branch and the GET passthrough, so it
   // denies every method. POST /containers/create matches only the exact
   // segments; a longer path falls through.
   pure def route(method: str, segs: List[str]): str =
     if (not(ALLOW_PERCENT) and hasEncodedSeg(segs)) "deny"
+    else if (not(ALLOW_EMPTY_INTERIOR) and hasEmptyInterior(segs)) "deny"
     else if (isExecPath(segs)) "denyExec"
     else if (method == "POST" and segs == ["containers", "create"]) "routeCreate"
     else if (hasContainerName(segs)) {
@@ -118,7 +131,7 @@ module router_model {
       if (method == "POST" and BY_NAME_ACTIONS.contains(lastSeg(segs))) routeByName(name)
       else if (method == "POST" and DENIED_ACTIONS.contains(lastSeg(segs))) "deny"
       else if (method == "DELETE") routeByName(name)
-      else if (method == "GET") "allowRead"
+      else if (method == "GET" or method == "HEAD") "allowRead"
       else "deny"
     }
     else if (method == "GET" or method == "HEAD") "allowRead"
@@ -131,7 +144,7 @@ module router_model {
     "%2F", "%2f", "%6A%73%6F%6E", "beacon%2Fstart",
     "exec-runner", "abc", "extra",
   )
-  pure val METHODS = Set("GET", "POST", "DELETE")
+  pure val METHODS = Set("GET", "HEAD", "POST", "DELETE")
 
   pure val PATHS: Set[List[str]] =
     WORDS.map(a => [a])
@@ -184,12 +197,20 @@ module router_model {
       (route(m, segs) == "routeCreate") iff (m == "POST" and segs == ["containers", "create"])
     ))
 
+  // A path with an empty segment before the last one is denied for every
+  // method (#55). Ranges over GET too.
+  pure val emptyInteriorDenied: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      hasEmptyInterior(segs) implies isDenied(route(m, segs))
+    ))
+
   // ─── Tests: one run per table row ───────────────────────────────────
   //
-  // Rows whose outcome depends on neither ALLOW_EMPTY_NAME nor
-  // ALLOW_PERCENT run on every instance. The rows that do and the property
-  // tests (soundTest, percentSoundTest, execSoundTest, execPrefixSoundTest,
-  // createExactSoundTest) live in `router`.
+  // Rows whose outcome depends on none of ALLOW_EMPTY_NAME, ALLOW_PERCENT
+  // and ALLOW_EMPTY_INTERIOR run on every instance. The rows that do and the
+  // property tests (soundTest, percentSoundTest, execSoundTest,
+  // execPrefixSoundTest, createExactSoundTest, emptyInteriorSoundTest) live
+  // in `router`.
 
   run emptyNameGetAllowedTest =
     assert(route("GET", ["containers", ""]) == "allowRead")
@@ -235,14 +256,20 @@ module router_model {
 
   run createSubpathDeniedTest =
     assert(route("POST", ["containers", "create", "extra"]) == "deny")
+
+  // HEAD is routed like GET (#55).
+
+  run headNamedContainerAllowedTest =
+    assert(route("HEAD", ["containers", "mycontainer"]) == "allowRead")
 }
 
 // ─── Instances ──────────────────────────────────────────────────────────
 
-// Go, TypeScript, and Rust after #48, #53 and #49: an empty segment is not a
-// name, and a percent-encoded path is denied.
+// Go, TypeScript, and Rust after #48, #53, #49 and #55: an empty segment is
+// not a name, and a percent-encoded path or one with an empty interior
+// segment is denied.
 module router {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false).*
 
   run emptyNameDeleteDeniedTest =
     assert(route("DELETE", ["containers", ""]) == "deny")
@@ -286,13 +313,27 @@ module router {
 
   run createExactSoundTest =
     assert(createOnlyExact)
+
+  // Empty interior segments (#55). `GET //exec/abc/json`: the leading empty
+  // segment hid the exec namespace from the exec check.
+
+  run emptyLeadingExecGetDeniedTest =
+    assert(route("GET", ["", "exec", "abc"]) == "deny")
+
+  run emptyInteriorGetDeniedTest =
+    assert(route("GET", ["containers", "", "json"]) == "deny")
+
+  run emptyInteriorSoundTest =
+    assert(emptyInteriorDenied)
 }
 
 // Rust before #48: `/containers/` and `/containers//start` reach
 // route_by_name("") and are allowed as an unknown container. The percent
-// check is on, so that this instance isolates #48.
+// check is on, so that this instance isolates #48. The empty interior check
+// is off: with it on, `/containers//start` would be denied before it reached
+// the name branch, and the instance could not show #48.
 module router_pre48 {
-  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false).*
+  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true).*
 
   run pre48UnsoundTest =
     assert(and {
@@ -306,7 +347,7 @@ module router_pre48 {
 // encoded name such as `%2F` counted as an unknown container and the
 // request was forwarded. The daemon decodes it and reads a different path.
 module router_pre53 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true, ALLOW_EMPTY_INTERIOR = false).*
 
   run pre53UnsoundTest =
     assert(and {
@@ -314,5 +355,19 @@ module router_pre53 {
       route("DELETE", ["containers", "%2F"]) == "allowUnknown",
       route("POST", ["containers", "%2F", "start"]) == "allowUnknown",
       route("GET", ["containers", "%2F"]) == "allowRead",
+    })
+}
+
+// All three before #55: an empty interior segment went through. In
+// `GET //exec/abc/json` the first segment is empty, not `exec`, so the exec
+// check missed it and the GET passthrough forwarded it. The daemon answers
+// with a 301 to the clean path, so nothing leaked, but the router allowed it.
+module router_pre55 {
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true).*
+
+  run pre55UnsoundTest =
+    assert(and {
+      not(emptyInteriorDenied),
+      route("GET", ["", "exec", "abc"]) == "allowRead",
     })
 }
