@@ -64,17 +64,6 @@ func testPolicy(overrides map[string]interface{}) *policy.Policy {
 	return p
 }
 
-func TestExecGate_DeniesExec(t *testing.T) {
-	c := NewChain(false)
-	r := testRequest("POST", "/containers/test/exec")
-	body := map[string]interface{}{}
-	p := testPolicy(nil)
-	result := c.Execute(r, p, body)
-	if result.Allowed {
-		t.Fatal("expected exec to be denied")
-	}
-}
-
 func TestChain_ReadonlyDeniesWrites(t *testing.T) {
 	for _, method := range []string{"POST", "PUT", "DELETE", "PATCH"} {
 		c := NewChain(true)
@@ -101,17 +90,6 @@ func TestChain_ReadonlyAllowsReads(t *testing.T) {
 		if !result.Allowed {
 			t.Fatalf("expected %s to be allowed in read-only mode, got: %s", method, result.Reason)
 		}
-	}
-}
-
-func TestExecGate_AllowsNonExec(t *testing.T) {
-	c := NewChain(false)
-	r := testRequest("POST", "/containers/create")
-	body := map[string]interface{}{"Image": "chainsafe/lodestar:next"}
-	p := testPolicy(nil)
-	result := c.Execute(r, p, body)
-	if !result.Allowed {
-		t.Fatalf("expected allow, got: %s", result.Reason)
 	}
 }
 

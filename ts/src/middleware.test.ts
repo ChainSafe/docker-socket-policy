@@ -2,7 +2,6 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   Chain,
-  ExecGate,
   ReadonlyGate,
   RegistryGate,
   MountSourceGate,
@@ -19,20 +18,6 @@ function makePolicy(overrides: Partial<Policy> = {}): Policy {
     ...overrides,
   };
 }
-
-describe("ExecGate", () => {
-  const gate = new ExecGate();
-
-  it("denies paths containing /exec", () => {
-    const result = gate.check("POST", "/containers/foo/exec", makePolicy(), {});
-    assert.notEqual(result, null);
-    assert.ok(result?.includes("shell escape"));
-  });
-
-  it("allows non-exec paths", () => {
-    assert.equal(gate.check("POST", "/containers/create", makePolicy(), {}), null);
-  });
-});
 
 describe("ReadonlyGate", () => {
   const gate = new ReadonlyGate();
@@ -301,13 +286,6 @@ describe("Chain", () => {
     const result = chain.execute("POST", "/containers/create", policy, body);
     assert.ok(result.allowed);
     assert.ok(result.modifiedBody);
-  });
-
-  it("denies exec request", () => {
-    const chain = new Chain(false);
-    const result = chain.execute("POST", "/containers/foo/exec", makePolicy(), {});
-    assert.equal(result.allowed, false);
-    assert.ok(result.reason.includes("exec"));
   });
 
   it("denies readonly mode write request", () => {

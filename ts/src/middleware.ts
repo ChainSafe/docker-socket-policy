@@ -19,7 +19,6 @@ export class Chain {
     if (readonly) {
       this.gates.push(new ReadonlyGate());
     }
-    this.gates.push(new ExecGate());
     this.gates.push(new RegistryGate());
     this.gates.push(new MountSourceGate());
     this.gates.push(new EnvFileGate());
@@ -48,12 +47,6 @@ export class Chain {
 }
 
 const SAFE_CHARSET = /^[A-Za-z0-9._=:/,\-]{1,256}$/;
-
-export class ExecGate implements Gate {
-  check(_method: string, path: string, _policy: Policy, _body: Record<string, unknown>): string | null {
-    return path.includes("/exec") ? "exec is not allowed: docker exec provides a shell escape vector" : null;
-  }
-}
 
 export class ReadonlyGate implements Gate {
   check(method: string, _path: string, _policy: Policy, _body: Record<string, unknown>): string | null {

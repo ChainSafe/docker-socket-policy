@@ -34,7 +34,7 @@ To bypass a hook once, pass `--no-verify` to `git commit` or `git push`. CI runs
 
 All three languages implement the same architecture:
 - `policy/` — Policy types + Manager (loads YAML)
-- `middleware/` — Gate trait + Chain (6 gates + 1 mutator)
+- `middleware/` — Gate trait + Chain (5 gates + 1 mutator: ReadonlyGate, RegistryGate, MountSourceGate, EnvFileGate, CmdGate, ContainerConfigMutator; exec is denied by the router)
 - `proxy/` — Router (default-deny) + Handler + Transport
 
 Changes should be applied to **all three implementations** unless they are language-specific (e.g., CLI flag parsing).
