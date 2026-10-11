@@ -286,6 +286,16 @@ fn bind_unix_listener(addr: &str, gid: Option<u32>) -> io::Result<tokio::net::Un
     unsafe { libc::umask(previous) };
     let listener = listener?;
 
+    if let Err(e) = set_socket_ownership_and_mode(addr, gid) {
+        drop(listener);
+        let _ = std::fs::remove_file(addr);
+        return Err(e);
+    }
+
+    Ok(listener)
+}
+
+fn set_socket_ownership_and_mode(addr: &str, gid: Option<u32>) -> io::Result<()> {
     // Widen from 0600 to SOCKET_MODE only once ownership is correct,
     // so the socket is never reachable by the wrong group.
     if let Some(gid) = gid {
@@ -305,9 +315,7 @@ fn bind_unix_listener(addr: &str, gid: Option<u32>) -> io::Result<tokio::net::Un
         })?;
     }
     std::fs::set_permissions(addr, std::fs::Permissions::from_mode(SOCKET_MODE))
-        .map_err(|e| io::Error::new(e.kind(), format!("setting mode on {}: {}", addr, e)))?;
-
-    Ok(listener)
+        .map_err(|e| io::Error::new(e.kind(), format!("setting mode on {}: {}", addr, e)))
 }
 
 /// Picks the socket's group the way dockerd does

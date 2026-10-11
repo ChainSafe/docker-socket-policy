@@ -35,6 +35,12 @@ impl Handler {
         let (parts, body) = req.into_parts();
         let method = parts.method.to_string();
         let path = parts.uri.path().to_string();
+        let target = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(&path)
+            .to_string();
         let full_uri = parts.uri.to_string();
         let headers = parts.headers.clone();
         let version = parts.version;
@@ -62,7 +68,7 @@ impl Handler {
         if route.action == Action::Deny {
             let msg = route.deny_msg.unwrap_or_default();
             warn!("denied {} {}: {}", method, path, msg);
-            self.audit.deny(&method, &path, &msg);
+            self.audit.deny(&method, &target, &msg);
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Full::new(Bytes::from(msg)))
@@ -74,7 +80,7 @@ impl Handler {
                 let result = self.chain.execute(&method, &path, policy, body);
                 if !result.allowed {
                     warn!("denied by middleware {} {}: {}", method, path, result.reason);
-                    self.audit.deny(&method, &path, &result.reason);
+                    self.audit.deny(&method, &target, &result.reason);
                     return Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .body(Full::new(Bytes::from(result.reason)))
@@ -87,7 +93,7 @@ impl Handler {
         }
 
         info!("allowed {} {}", method, path);
-        self.audit.allow(&method, &path);
+        self.audit.allow(&method, &target);
 
         let mut forwarded = Request::builder()
             .method(method.as_str())
