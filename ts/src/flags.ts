@@ -18,8 +18,14 @@ export function hasFlag(args: string[], name: string): boolean {
 }
 
 // The flags the proxy accepts, for validateFlags.
-export const VALUE_FLAGS = ["--listen-socket", "--docker-host", "--config-dir", "--log-file", "--listen-socket-group"];
-export const BOOL_FLAGS = ["--readonly"];
+export const VALUE_FLAGS = Object.freeze([
+  "--listen-socket",
+  "--docker-host",
+  "--config-dir",
+  "--log-file",
+  "--listen-socket-group",
+] as const);
+export const BOOL_FLAGS = Object.freeze(["--readonly"] as const);
 
 // Rejects anything not recognised. Go's flag package and Rust's clap both exit
 // non-zero on an unrecognised argument; without this the hand-rolled parser
@@ -30,7 +36,11 @@ export const BOOL_FLAGS = ["--readonly"];
 // `valueFlags` take an argument (in either `--name value` or `--name=value`
 // form); `boolFlags` do not, and must not swallow the following argument.
 // Returns an error message, or null when every argument is recognised.
-export function validateFlags(args: string[], valueFlags: string[], boolFlags: string[]): string | null {
+export function validateFlags(
+  args: string[],
+  valueFlags: readonly string[],
+  boolFlags: readonly string[],
+): string | null {
   const known = [...valueFlags, ...boolFlags];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];

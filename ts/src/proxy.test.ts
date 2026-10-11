@@ -197,13 +197,16 @@ describe("Router", () => {
       // reservedInSubpathAllowedTest
       ["GET", "/containers/mycontainer/json", Action.Allow],
     ];
+    const mismatches: string[] = [];
     for (const [method, path, want, wantMsg] of cases) {
       const r = router.route(method, path);
-      assert.equal(r.action, want, `route(${method} ${path})`);
-      if (wantMsg !== undefined) {
-        assert.equal(r.denyMsg, wantMsg, `route(${method} ${path})`);
+      if (r.action !== want || (wantMsg !== undefined && r.denyMsg !== wantMsg)) {
+        mismatches.push(
+          `${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}/${wantMsg ?? "-"}`,
+        );
       }
     }
+    assert.deepEqual(mismatches, []);
   });
 
   // Cross-language parity guard for #48. An empty segment in the name position
@@ -219,10 +222,14 @@ describe("Router", () => {
       // emptyNameGetAllowedTest
       ["GET", "/containers/", Action.Allow],
     ];
+    const mismatches: string[] = [];
     for (const [method, path, want] of cases) {
       const r = router.route(method, path);
-      assert.equal(r.action, want, `route(${method} ${path})`);
+      if (r.action !== want) {
+        mismatches.push(`${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}`);
+      }
     }
+    assert.deepEqual(mismatches, []);
   });
 
   // Cross-language parity guard for #52 and #57. The Docker CLI prefixes every
@@ -265,10 +272,14 @@ describe("Router", () => {
       // #57 sanity row, cannot fail: GET /version is allowed as a read-only request.
       ["GET", "/version", undefined, Action.Allow],
     ];
+    const mismatches: string[] = [];
     for (const [method, path, body, want] of cases) {
       const r = router.route(method, path, body);
-      assert.equal(r.action, want, `route(${method} ${path})`);
+      if (r.action !== want) {
+        mismatches.push(`${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}`);
+      }
     }
+    assert.deepEqual(mismatches, []);
   });
 
   // Cross-language parity guard for #53. The daemon percent-decodes the path
@@ -307,16 +318,17 @@ describe("Router", () => {
       // Non-GET, so the GET passthrough cannot hide a check placed before the split.
       ["DELETE", "/containers/foo?force=%31", Action.Allow],
     ];
+    const mismatches: string[] = [];
     for (const [method, path, want] of cases) {
       const r = router.route(method, path);
-      assert.equal(r.action, want, `route(${method} ${path})`);
-      if (want === Action.Deny) {
-        assert.ok(
-          r.denyMsg?.includes("percent-encoded"),
-          `route(${method} ${path}) deny msg = ${JSON.stringify(r.denyMsg)}`,
+      if (r.action !== want || (want === Action.Deny && !r.denyMsg?.includes("percent-encoded"))) {
+        const wantMsg = want === Action.Deny ? "*percent-encoded*" : "-";
+        mismatches.push(
+          `${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}/${wantMsg}`,
         );
       }
     }
+    assert.deepEqual(mismatches, []);
   });
 
   // Cross-language parity guard for #49. Exec and create are matched on whole
@@ -359,15 +371,18 @@ describe("Router", () => {
       // A top-level name starting with exec is not the exec namespace (#49, language-only).
       ["GET", "/executor", undefined, Action.Allow, undefined],
     ];
+    const mismatches: string[] = [];
     for (const [method, path, body, want, wantMsg] of cases) {
       const r = router.route(method, path, body);
-      assert.equal(r.action, want, `route(${method} ${path}) deny msg = ${JSON.stringify(r.denyMsg)}`);
       // Exact match: the default deny for POST /containers/x/exec ends in
       // "exec is not allowed" too, so a substring check passes vacuously.
-      if (wantMsg !== undefined) {
-        assert.equal(r.denyMsg, wantMsg, `route(${method} ${path})`);
+      if (r.action !== want || (wantMsg !== undefined && r.denyMsg !== wantMsg)) {
+        mismatches.push(
+          `${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}/${wantMsg ?? "-"}`,
+        );
       }
     }
+    assert.deepEqual(mismatches, []);
   });
 
   // Cross-language parity guard for #55. A path with an empty interior segment

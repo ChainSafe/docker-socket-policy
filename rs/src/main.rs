@@ -1262,6 +1262,10 @@ mod tests {
             eprintln!("skipping: root can chown to any group");
             return;
         }
+        if unsafe { libc::getegid() } == 0 {
+            eprintln!("skipping: process's own group is gid 0, so chown to it succeeds");
+            return;
+        }
         // SAFETY: a zero-length query returns the group count; the second
         // call fills a buffer of exactly that size.
         let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };

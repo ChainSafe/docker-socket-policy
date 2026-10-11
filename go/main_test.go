@@ -410,8 +410,8 @@ func TestOpenListenerConcurrent(t *testing.T) {
 				winner = &r
 				continue
 			}
-			if !strings.Contains(r.err.Error(), "is in use by another") {
-				t.Fatalf("iteration %d: loser error = %q, want an in-use error", i, r.err)
+			if want := path + " is in use by another instance (lock " + path + ".lock held)"; r.err.Error() != want {
+				t.Fatalf("iteration %d: loser error = %q, want %q", i, r.err, want)
 			}
 		}
 		if winner == nil {
@@ -474,6 +474,7 @@ func TestLockReleasedOnSIGKILL(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
 
 	ready := make(chan error, 1)
 	go func() {
@@ -489,13 +490,9 @@ func TestLockReleasedOnSIGKILL(t *testing.T) {
 	select {
 	case err := <-ready:
 		if err != nil {
-			cmd.Process.Kill()
-			cmd.Wait()
 			t.Fatal(err)
 		}
 	case <-time.After(10 * time.Second):
-		cmd.Process.Kill()
-		cmd.Wait()
 		t.Fatal("child did not report ready within 10s")
 	}
 
@@ -855,6 +852,9 @@ func ptr(s string) *string { return &s }
 func TestUnixListenerChownEPERMNamesGroup(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can chown to any group")
+	}
+	if os.Getegid() == 0 {
+		t.Skip("process's own group is gid 0, so chown to it succeeds")
 	}
 	if groups, err := os.Getgroups(); err == nil {
 		for _, g := range groups {
