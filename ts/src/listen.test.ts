@@ -229,9 +229,11 @@ describe("listenOnSocket chown EPERM", () => {
   const skip =
     process.geteuid?.() === 0
       ? "root can chown to any group"
-      : process.getgroups?.().includes(0)
-        ? "process is a member of gid 0, so chown to it succeeds"
-        : false;
+      : process.getegid?.() === 0
+        ? "process's own group is gid 0, so chown to it succeeds"
+        : process.getgroups?.().includes(0)
+          ? "process is a member of gid 0, so chown to it succeeds"
+          : false;
 
   it("names the group", { skip }, async () => {
     const { path, cleanup } = tempSocket();

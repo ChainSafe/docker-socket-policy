@@ -501,13 +501,22 @@ mod tests {
             // reservedInSubpathAllowedTest
             ("GET", "/containers/mycontainer/json", Action::Allow, None),
         ];
+        let mut mismatches = Vec::new();
         for (method, path, want, want_msg) in cases {
             let got = router.route(method, path, None);
-            assert_eq!(got.action, want, "route({} {})", method, path);
-            if let Some(want_msg) = want_msg {
-                assert_eq!(got.deny_msg.as_deref(), Some(want_msg), "route({} {})", method, path);
+            if got.action != want || (want_msg.is_some() && got.deny_msg.as_deref() != want_msg) {
+                mismatches.push(format!(
+                    "{} {}: got {:?}/{}, want {:?}/{}",
+                    method,
+                    path,
+                    got.action,
+                    got.deny_msg.as_deref().unwrap_or("-"),
+                    want,
+                    want_msg.unwrap_or("-")
+                ));
             }
         }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
 
     #[test]
@@ -539,10 +548,21 @@ mod tests {
             // emptyNameGetAllowedTest
             ("GET", "/containers/", Action::Allow),
         ];
+        let mut mismatches = Vec::new();
         for (method, path, want) in cases {
             let got = router.route(method, path, None);
-            assert_eq!(got.action, want, "route({} {})", method, path);
+            if got.action != want {
+                mismatches.push(format!(
+                    "{} {}: got {:?}/{}, want {:?}",
+                    method,
+                    path,
+                    got.action,
+                    got.deny_msg.as_deref().unwrap_or("-"),
+                    want
+                ));
+            }
         }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
 
     /// Cross-language parity guard for #52 and #57. The Docker CLI prefixes
@@ -594,10 +614,21 @@ mod tests {
             // #57 sanity row, cannot fail: GET /version is allowed as a read-only request.
             ("GET", "/version", None, Action::Allow),
         ];
+        let mut mismatches = Vec::new();
         for (method, path, body, want) in cases {
             let got = router.route(method, path, body);
-            assert_eq!(got.action, want, "route({} {})", method, path);
+            if got.action != want {
+                mismatches.push(format!(
+                    "{} {}: got {:?}/{}, want {:?}",
+                    method,
+                    path,
+                    got.action,
+                    got.deny_msg.as_deref().unwrap_or("-"),
+                    want
+                ));
+            }
         }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
 
     /// Cross-language parity guard for #53. The daemon percent-decodes the
@@ -634,20 +665,19 @@ mod tests {
             // #53 control: a plain name is still routed as a container.
             ("DELETE", "/containers/foo", Action::Allow),
         ];
+        let mut mismatches = Vec::new();
         for (method, path, want) in cases {
             let got = router.route(method, path, None);
-            assert_eq!(got.action, want, "route({} {})", method, path);
-            if want == Action::Deny {
-                let msg = got.deny_msg.unwrap_or_default();
-                assert!(
-                    msg.contains("percent-encoded"),
-                    "route({} {}) deny msg = {:?}, want it to contain \"percent-encoded\"",
-                    method,
-                    path,
-                    msg
-                );
+            let msg = got.deny_msg.as_deref().unwrap_or("-");
+            if got.action != want || (want == Action::Deny && !msg.contains("percent-encoded")) {
+                let want_msg = if want == Action::Deny { "*percent-encoded*" } else { "-" };
+                mismatches.push(format!(
+                    "{} {}: got {:?}/{}, want {:?}/{}",
+                    method, path, got.action, msg, want, want_msg
+                ));
             }
         }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
 
     /// Cross-language parity guard for #49. Exec and create are matched on
@@ -701,19 +731,24 @@ mod tests {
             // A top-level name starting with exec is not the exec namespace (#49, language-only).
             ("GET", "/executor", None, Action::Allow, None),
         ];
+        let mut mismatches = Vec::new();
         for (method, path, body, want, want_msg) in cases {
             let got = router.route(method, path, body);
-            assert_eq!(
-                got.action, want,
-                "route({} {}) deny msg = {:?}",
-                method, path, got.deny_msg
-            );
             // Exact match: the default deny for POST /containers/x/exec ends in
             // "exec is not allowed" too, so a substring check passes vacuously.
-            if let Some(want_msg) = want_msg {
-                assert_eq!(got.deny_msg.as_deref(), Some(want_msg), "route({} {})", method, path);
+            if got.action != want || (want_msg.is_some() && got.deny_msg.as_deref() != want_msg) {
+                mismatches.push(format!(
+                    "{} {}: got {:?}/{}, want {:?}/{}",
+                    method,
+                    path,
+                    got.action,
+                    got.deny_msg.as_deref().unwrap_or("-"),
+                    want,
+                    want_msg.unwrap_or("-")
+                ));
             }
         }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
 
     /// Cross-language parity guard for #55. A path with an empty interior
