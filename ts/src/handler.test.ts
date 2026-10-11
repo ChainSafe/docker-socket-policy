@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
@@ -185,5 +185,26 @@ describe("Handler", () => {
     assert.notEqual(recorder.statusCode, 403);
     assert.ok(transport.lastRequest, "expected request to be forwarded");
     assert.equal(transport.lastRequest.url, url);
+  });
+
+  // #55: the audit uri is the raw request target, query and escapes included,
+  // for allowed and denied requests alike.
+  it("logs the raw request target as the audit uri", async () => {
+    const dir = makeEnv(defaultConfig);
+    const { handler } = newHandler(dir);
+    const targets = [
+      { method: "GET", target: "/containers/json?all=1", decision: "ALLOW" },
+      { method: "DELETE", target: "/containers/a%2Fb?force=1", decision: "DENY" },
+    ];
+    for (const { method, target } of targets) {
+      await handler.handle(makeRequest(method, target), makeResponse().res);
+    }
+    const lines = readFileSync(join(dir, "audit.log"), "utf-8").trim().split("\n");
+    assert.equal(lines.length, targets.length);
+    targets.forEach(({ method, target, decision }, i) => {
+      const entry = JSON.parse(lines[i]!) as { uri: string; decision: string };
+      assert.equal(entry.decision, decision, `${method} ${target}`);
+      assert.equal(entry.uri, target, `${method} ${target}`);
+    });
   });
 });

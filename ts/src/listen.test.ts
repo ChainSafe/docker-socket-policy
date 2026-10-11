@@ -247,6 +247,7 @@ describe("listenOnSocket chown EPERM", () => {
           `(SupplementaryGroups= / group_add:)`,
       });
       assert.equal(server.listening, false, "server left listening after chown failed");
+      assert.equal(existsSync(path), false, "socket left on disk after chown failed");
     } finally {
       cleanup();
     }

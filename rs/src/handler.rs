@@ -35,6 +35,12 @@ impl Handler {
         let (parts, body) = req.into_parts();
         let method = parts.method.to_string();
         let path = parts.uri.path().to_string();
+        let target = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(&path)
+            .to_string();
         let full_uri = parts.uri.to_string();
         let headers = parts.headers.clone();
         let version = parts.version;
@@ -62,7 +68,7 @@ impl Handler {
         if route.action == Action::Deny {
             let msg = route.deny_msg.unwrap_or_default();
             warn!("denied {} {}: {}", method, path, msg);
-            self.audit.deny(&method, &path, &msg);
+            self.audit.deny(&method, &target, &msg);
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Full::new(Bytes::from(msg)))
@@ -74,7 +80,7 @@ impl Handler {
                 let result = self.chain.execute(&method, &path, policy, body);
                 if !result.allowed {
                     warn!("denied by middleware {} {}: {}", method, path, result.reason);
-                    self.audit.deny(&method, &path, &result.reason);
+                    self.audit.deny(&method, &target, &result.reason);
                     return Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .body(Full::new(Bytes::from(result.reason)))
@@ -87,7 +93,7 @@ impl Handler {
         }
 
         info!("allowed {} {}", method, path);
-        self.audit.allow(&method, &path);
+        self.audit.allow(&method, &target);
 
         let mut forwarded = Request::builder()
             .method(method.as_str())
@@ -448,5 +454,54 @@ mod tests {
         let captured = captured_uri.lock().unwrap();
         let uri = captured.as_ref().expect("expected request to be forwarded");
         assert_eq!(uri.query(), Some(query));
+    }
+
+    /// #55: the audit uri is the raw request target, query and escapes
+    /// included, for allowed and denied requests alike.
+    #[tokio::test]
+    async fn test_handler_audit_uri_is_request_target() {
+        let log_path = std::env::temp_dir().join(format!(
+            "handler-audit-uri-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let manager = Manager::from_map(std::collections::HashMap::new());
+        let router = Arc::new(Router::new(manager));
+        let audit = AuditLogger::new(log_path.to_str().unwrap()).unwrap();
+        let captured_uri = Arc::new(std::sync::Mutex::new(None));
+        let transport = UriRecordingTransport { captured_uri };
+        let handler = Handler::new(router, Chain::new(false), audit, Box::new(transport));
+
+        let targets = [
+            ("GET", "/containers/json?all=1", "ALLOW"),
+            ("DELETE", "/containers/a%2Fb?force=1", "DENY"),
+        ];
+        for (method, target, _) in targets {
+            let req = Request::builder()
+                .method(method)
+                .uri(format!("http://localhost{}", target))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            handler.handle(req).await;
+        }
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let _ = std::fs::remove_file(&log_path);
+        let entries: Vec<serde_json::Value> = contents.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(entries.len(), targets.len(), "audit log:\n{}", contents);
+        let mut mismatches = Vec::new();
+        for ((method, target, decision), entry) in targets.iter().zip(&entries) {
+            if entry["decision"] != *decision || entry["uri"] != *target {
+                mismatches.push(format!(
+                    "{} {}: got {}/{}, want {:?}/{:?}",
+                    method, target, entry["decision"], entry["uri"], decision, target
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 }
