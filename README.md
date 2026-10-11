@@ -193,7 +193,7 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | Middleware | Type | What it checks |
 |------------|------|----------------|
 | ContainerConfigMutator | Mutator | Forces `network_mode`, `user`, `security_options`, `restart_policy` from policy |
-| ReadonlyGate | Gate | Denies all `POST`, `PUT`, `DELETE`, `PATCH` (optional `--readonly` flag) |
+| ReadonlyGate | Gate | Denies `POST`, `PUT`, `DELETE`, `PATCH` (optional `--readonly` flag). Like every gate it runs only on container create, so lifecycle actions and `DELETE` are not blocked yet ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)) |
 | RegistryGate | Gate | Validates image ref against `allowed_image_prefixes` |
 | MountSourceGate | Gate | Validates volume binds against whitelist |
 | EnvFileGate | Gate | Strips `Env` field from create body; env must come from locked `env_file` |
@@ -439,7 +439,7 @@ not at the socket.
 
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)) and exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 7 properties are checked exhaustively over every method and every path of 1 to 3 segments; exec is denied by the router, not by a middleware gate.
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)) and exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 7 properties are checked exhaustively over the methods `GET`, `HEAD`, `POST`, `DELETE` and every path of 1 to 3 segments over the model's word set; exec is denied by the router, not by a middleware gate.
 
 The CI pipeline runs verification on every push and PR. A violation blocks the build.
 
