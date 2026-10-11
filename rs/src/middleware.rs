@@ -37,7 +37,6 @@ impl Chain {
         if readonly {
             gates.push(Box::new(ReadonlyGate));
         }
-        gates.push(Box::new(ExecGate));
         gates.push(Box::new(RegistryGate));
         gates.push(Box::new(MountSourceGate));
         gates.push(Box::new(EnvFileGate));
@@ -84,22 +83,6 @@ fn charset_check(s: &str) -> bool {
     s.len() <= 256
         && s.chars()
             .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '=' | ':' | '/' | ',' | '-'))
-}
-
-pub struct ExecGate;
-impl Gate for ExecGate {
-    fn check(
-        &self,
-        _method: &str,
-        path: &str,
-        _policy: &Policy,
-        _body: &HashMap<String, serde_json::Value>,
-    ) -> std::result::Result<(), String> {
-        if path.contains("/exec") {
-            return Err("exec is not allowed: docker exec provides a shell escape vector".into());
-        }
-        Ok(())
-    }
 }
 
 pub struct ReadonlyGate;
@@ -388,32 +371,6 @@ fn body_from_json(json: serde_json::Value) -> HashMap<String, serde_json::Value>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_exec_gate_allows_normal_create() {
-        let gate = ExecGate;
-        let policy = make_policy("test", vec!["alpine"]);
-        let body = body_from_json(serde_json::json!({"Image": "alpine"}));
-        assert!(gate.check("POST", "/containers/create", &policy, &body).is_ok());
-    }
-
-    #[test]
-    fn test_exec_gate_denies_exec_path() {
-        let gate = ExecGate;
-        let policy = make_policy("test", vec!["alpine"]);
-        let body = HashMap::new();
-        assert!(gate.check("POST", "/containers/test/exec", &policy, &body).is_err());
-    }
-
-    #[test]
-    fn test_exec_gate_denies_exec_endpoint() {
-        let gate = ExecGate;
-        let policy = make_policy("test", vec!["alpine"]);
-        let body = HashMap::new();
-        let result = gate.check("POST", "/exec/abc123/start", &policy, &body);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("exec"));
-    }
 
     #[test]
     fn test_readonly_gate_allows_get() {
@@ -709,16 +666,6 @@ mod tests {
         let result = chain.execute("POST", "/containers/create", &policy, &body);
         assert!(result.allowed);
         assert_eq!(result.reason, "container create allowed");
-    }
-
-    #[test]
-    fn test_chain_execute_denies_exec_via_gate() {
-        let chain = Chain::new(false);
-        let policy = make_policy("test", vec!["alpine"]);
-        let body = HashMap::new();
-        let result = chain.execute("POST", "/containers/test/exec", &policy, &body);
-        assert!(!result.allowed);
-        assert!(result.reason.contains("exec"));
     }
 
     #[test]
