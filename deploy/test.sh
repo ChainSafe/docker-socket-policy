@@ -1,6 +1,7 @@
 #!/bin/sh
 # Integration tests for docker-socket-policy.
-# Sends HTTP requests directly to the proxy's Docker API and checks status codes.
+# Sends HTTP requests directly to the proxy's Docker API and checks status codes,
+# and the deny message on every expected proxy 403.
 # The proxy's ReadonlyGate, RegistryGate, MountSourceGate, EnvFileGate,
 # CmdGate, ExecGate, and ContainerConfigMutator are all exercised.
 
@@ -54,22 +55,30 @@ echo ""
 # curl still prints %{http_code} when it exits non-zero, so the fallback only
 # applies when it produced nothing at all. Overwriting unconditionally would
 # discard a real status on a mid-response error and report it as 000.
+# The response body goes to $BODY for check_denied. It is truncated first, so a
+# request that gets no body cannot pass on the previous request's body.
+BODY=$(mktemp)
+trap 'rm -f "$BODY"' EXIT
 get_status() {
-  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" "$1" 2>/dev/null || true)
+  : >"$BODY"
+  out=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" "$1" 2>/dev/null || true)
   echo "${out:-000}"
 }
 post_json() {
-  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+  : >"$BODY"
+  out=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
     -X POST -H "Content-Type: application/json" -d "$1" "$2" 2>/dev/null || true)
   echo "${out:-000}"
 }
 post_empty() {
-  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+  : >"$BODY"
+  out=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
     -X POST -H "Content-Type: application/json" -d "" "$1" 2>/dev/null || true)
   echo "${out:-000}"
 }
 delete_status() {
-  out=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+  : >"$BODY"
+  out=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
     -X DELETE "$1" 2>/dev/null || true)
   echo "${out:-000}"
 }
@@ -85,6 +94,28 @@ check() {
     echo "  FAIL: $desc (expected $expected, got $actual)"
     FAIL=$((FAIL+1))
   fi
+}
+
+# check_denied DESC ACTUAL_STATUS BODY_FILE WANT_SUBSTRING [WANT_SUBSTRING...]
+# Passes only on a 403 whose body contains one of the WANT_SUBSTRINGs, so a
+# 403 from the daemon (or a different proxy deny) cannot pass for the one the
+# check is about. The proxy's body is its plain-text deny message.
+check_denied() {
+  desc="$1"
+  actual="$2"
+  body_file="$3"
+  shift 3
+  if [ "$actual" = "403" ]; then
+    for want in "$@"; do
+      if grep -qF -- "$want" "$body_file"; then
+        echo "  PASS: $desc"
+        PASS=$((PASS+1))
+        return 0
+      fi
+    done
+  fi
+  echo "  FAIL: $desc (expected 403 with \"$*\", got $actual: $(head -c 200 "$body_file"))"
+  FAIL=$((FAIL+1))
 }
 
 echo ""
@@ -151,19 +182,19 @@ echo ""
 echo "--- Denied endpoints ---"
 
 S=$(post_empty "$PROXY/containers/test/exec")
-check "POST /containers/*/exec -> 403" "403" "$S"
+check_denied "POST /containers/*/exec -> 403" "$S" "$BODY" 'exec is not allowed'
 
 S=$(post_empty "$PROXY/exec/abc123/start")
-check "POST /exec/*/start -> 403" "403" "$S"
+check_denied "POST /exec/*/start -> 403" "$S" "$BODY" 'exec is not allowed'
 
 S=$(post_empty "$PROXY/build")
-check "POST /build -> 403" "403" "$S"
+check_denied "POST /build -> 403" "$S" "$BODY" 'build is not allowed'
 
 S=$(post_empty "$PROXY/commit")
-check "POST /commit -> 403" "403" "$S"
+check_denied "POST /commit -> 403" "$S" "$BODY" 'commit is not allowed'
 
 S=$(post_empty "$PROXY/auth")
-check "POST /auth -> 403" "403" "$S"
+check_denied "POST /auth -> 403" "$S" "$BODY" 'auth endpoint is not allowed'
 
 # ─── Container create — image validation ───────────────────
 
@@ -182,7 +213,7 @@ else
 fi
 
 S=$(post_json '{"Image":"alpine:latest","Cmd":["sh"]}' "$PROXY/containers/create")
-check "create with unlisted image -> 403" "403" "$S"
+check_denied "create with unlisted image -> 403" "$S" "$BODY" 'image alpine:latest not allowed by any policy'
 
 # Another allowed image prefix
 S=$(post_json '{"Image":"ethpandaops/lodestar:latest","Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/containers/create")
@@ -195,7 +226,7 @@ else
 fi
 
 S=$(post_json '{"Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/containers/create")
-check "create with no image -> 403" "403" "$S"
+check_denied "create with no image -> 403" "$S" "$BODY" 'image field is required'
 
 # ─── Container create — privileged mode ──────────────────
 
@@ -228,7 +259,7 @@ else
 fi
 
 S=$(post_json '{"Image":"chainsafe/lodestar:beacon","HostConfig":{"Binds":["/tmp:/tmp"]},"Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/containers/create")
-check "create with unlisted volume -> 403" "403" "$S"
+check_denied "create with unlisted volume -> 403" "$S" "$BODY" 'volume mount "/tmp" is not in the whitelist'
 
 # ─── Inline env vars (env_file is set in policy) ─────────
 
@@ -236,7 +267,7 @@ echo ""
 echo "--- Inline environment variables ---"
 
 S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Env":["VALIDATOR_KEY=secret"],"Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/containers/create")
-check "create with inline env -> 403" "403" "$S"
+check_denied "create with inline env -> 403" "$S" "$BODY" 'inline environment variables are not allowed for service'
 
 # ─── CLI flag validation ────────────────────────────────
 
@@ -245,7 +276,7 @@ echo "--- CLI flag validation ---"
 
 # --privileged is in denied_flags -> proxy denies
 S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--privileged","--rcConfig","/data/config.yml"]}' "$PROXY/containers/create")
-check "create with --privileged flag -> 403" "403" "$S"
+check_denied "create with --privileged flag -> 403" "$S" "$BODY" 'flag "--privileged" is denied for service'
 
 # Allowed flags, request passes through to Docker
 S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml","--logLevel","info"]}' "$PROXY/containers/create")
@@ -280,12 +311,12 @@ fi
 
 # Unlisted image pull -> proxy denies
 S=$(post_json '{"fromImage":"alpine:latest"}' "$PROXY/images/create")
-check "pull unlisted image -> 403" "403" "$S"
+check_denied "pull unlisted image -> 403" "$S" "$BODY" 'image alpine:latest not allowed by any policy'
 
 # Real container lifecycle with busybox (image that exists)
 # Step 1: Pull busybox through proxy (should be denied — not in policy)
 S=$(post_json '{"fromImage":"busybox:latest"}' "$PROXY/images/create")
-check "pull busybox (unlisted) -> 403" "403" "$S"
+check_denied "pull busybox (unlisted) -> 403" "$S" "$BODY" 'image busybox:latest not allowed by any policy'
 
 # ─── Endpoint completeness ─────────────────────────────
 
@@ -293,23 +324,23 @@ echo ""
 echo "--- Unrecognized endpoints ---"
 
 S=$(post_empty "$PROXY/networks/create")
-check "POST /networks/create -> 403" "403" "$S"
+check_denied "POST /networks/create -> 403" "$S" "$BODY" 'endpoint POST /networks/create is not allowed'
 
 S=$(post_empty "$PROXY/volumes/create")
-check "POST /volumes/create -> 403" "403" "$S"
+check_denied "POST /volumes/create -> 403" "$S" "$BODY" 'endpoint POST /volumes/create is not allowed'
 
 S=$(post_empty "$PROXY/containers/test")
-check "PATCH /containers/test -> 403" "403" "$S"
+check_denied "POST /containers/test -> 403 (no action segment)" "$S" "$BODY" 'endpoint POST /containers/test is not allowed'
 
 # Reserved path segments (#24). /containers/json is the list endpoint, not a
 # container called "json". Treating it as a container name sent the request
 # down the lifecycle path, where an unknown container is allowed through, so Go
 # allowed this while Rust and TypeScript denied it.
 S=$(delete_status "$PROXY/containers/json")
-check "DELETE /containers/json -> 403 (reserved, not a container)" "403" "$S"
+check_denied "DELETE /containers/json -> 403 (reserved, not a container)" "$S" "$BODY" 'endpoint DELETE /containers/json is not allowed'
 
 S=$(delete_status "$PROXY/containers/create")
-check "DELETE /containers/create -> 403 (reserved, not a container)" "403" "$S"
+check_denied "DELETE /containers/create -> 403 (reserved, not a container)" "$S" "$BODY" 'endpoint DELETE /containers/create is not allowed'
 
 # Listing must still work: it reaches the GET/HEAD passthrough instead.
 S=$(get_status "$PROXY/containers/json")
@@ -320,10 +351,10 @@ check "GET /containers/json -> 200 (still the list endpoint)" "200" "$S"
 # path, where an unknown container is allowed through, so Rust forwarded these
 # while Go and TypeScript denied them.
 S=$(delete_status "$PROXY/containers/")
-check "DELETE /containers/ -> 403 (empty name, not a container)" "403" "$S"
+check_denied "DELETE /containers/ -> 403 (empty name, not a container)" "$S" "$BODY" 'endpoint DELETE /containers/ is not allowed'
 
 S=$(post_empty "$PROXY/containers//start")
-check "POST /containers//start -> 403 (empty name, not a container)" "403" "$S"
+check_denied "POST /containers//start -> 403 (empty name, not a container)" "$S" "$BODY" 'empty path segment not allowed'
 
 # Dotted API-version prefix (#52). The Docker CLI versions every request
 # (/v1.45/containers/...). The proxy must strip the prefix and route the rest
@@ -334,12 +365,12 @@ S=$(post_empty "$PROXY/v1.45/containers/no-such-container/start")
 check "POST /v1.45/containers/*/start -> 404 (daemon answered, not proxy 403)" "404" "$S"
 
 S=$(delete_status "$PROXY/v1.45/containers/json")
-check "DELETE /v1.45/containers/json -> 403 (reserved survives version strip)" "403" "$S"
+check_denied "DELETE /v1.45/containers/json -> 403 (reserved survives version strip)" "$S" "$BODY" 'endpoint DELETE /containers/json is not allowed'
 
 # #57: /volumes/ is not an API-version prefix. The daemon would run a volume
 # removal; the proxy must not classify it as a container delete.
 S=$(delete_status "$PROXY/volumes/containers/no-such-container")
-check "DELETE /volumes/containers/no-such-container -> 403 (not a version prefix)" "403" "$S"
+check_denied "DELETE /volumes/containers/no-such-container -> 403 (not a version prefix)" "$S" "$BODY" 'endpoint DELETE /volumes/containers/no-such-container is not allowed'
 
 # #52: versioned create, the `docker run` path. Mirrors the unversioned
 # allowed-image create above: the daemon answers 201, or 404 when the image is
@@ -359,10 +390,10 @@ fi
 # %XX, and there are no dot segments to squash). The query string is never
 # inspected: an encoded filter, as `docker ps --filter` sends, still passes.
 S=$(delete_status "$PROXY/containers/no-such%20x")
-check "DELETE /containers/no-such%20x -> 403 (percent-encoded path)" "403" "$S"
+check_denied "DELETE /containers/no-such%20x -> 403 (percent-encoded path)" "$S" "$BODY" 'percent-encoded path not allowed'
 
 S=$(delete_status "$PROXY/containers/%2F")
-check "DELETE /containers/%2F -> 403 (percent-encoded path)" "403" "$S"
+check_denied "DELETE /containers/%2F -> 403 (percent-encoded path)" "$S" "$BODY" 'percent-encoded path not allowed'
 
 # The handler tests prove the query reaches the daemon unchanged; this check
 # proves an encoded query is not denied.
@@ -375,34 +406,39 @@ check "GET /v1.45/containers/json?filters=<encoded> -> 200 (query not inspected)
 # daemon (404, no such container — not a proxy 403). A create path with extra
 # segments is not the create endpoint, even with an allowed image.
 S=$(delete_status "$PROXY/containers/no-such/exec")
-check "DELETE /containers/*/exec -> 403 (exec subpath, any method)" "403" "$S"
+check_denied "DELETE /containers/*/exec -> 403 (exec subpath, any method)" "$S" "$BODY" 'exec is not allowed'
 
 S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/containers/create/extra")
-check "POST /containers/create/extra -> 403 (not the create endpoint)" "403" "$S"
+check_denied "POST /containers/create/extra -> 403 (not the create endpoint)" "$S" "$BODY" 'endpoint POST /containers/create/extra is not allowed'
 
 S=$(post_empty "$PROXY/containers/exec-nosuch/start")
 check "POST /containers/exec-nosuch/start -> 404 (daemon answered, not proxy 403)" "404" "$S"
 
 S=$(get_status "$PROXY/exec/0000000000000000000000000000000000000000000000000000000000000000/json")
-check "GET /exec/*/json -> 403 (exec inspect denied)" "403" "$S"
+check_denied "GET /exec/*/json -> 403 (exec inspect denied)" "$S" "$BODY" 'exec is not allowed'
 
 # #55: an empty interior segment is denied for every method. Before #55 the
 # empty first segment of //exec/... hid the exec namespace and the GET
 # passthrough forwarded it. --path-as-is stops curl from collapsing the //.
-S=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --path-as-is --unix-socket "$PROXY_SOCK" \
+: >"$BODY"
+S=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --path-as-is --unix-socket "$PROXY_SOCK" \
   "$PROXY//exec/0000000000000000000000000000000000000000000000000000000000000000/json" 2>/dev/null || true)
 S="${S:-000}"
-check "GET //exec/*/json -> 403 (empty segment)" "403" "$S"
+check_denied "GET //exec/*/json -> 403 (empty segment)" "$S" "$BODY" 'empty path segment not allowed'
 
 # #55: an absolute-form request target. Before #55 the TypeScript router saw
 # the raw target, whose first segment is "http:", and forwarded exec inspect;
 # the daemon answered 404 for this unknown ID (200 with the command line for a
-# real one). Go and Rust route on the parsed path.
-S=$(curl -s -o /dev/null -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+# real one). Go and Rust route on the parsed path, /exec/..., and deny it as
+# exec; TypeScript routes the raw target and denies its "//" as an empty
+# segment. Either proxy deny passes; a daemon 403 does not.
+: >"$BODY"
+S=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
   --request-target "http://docker/exec/0000000000000000000000000000000000000000000000000000000000000000/json" \
   "$PROXY/" 2>/dev/null || true)
 S="${S:-000}"
-check "GET http://docker/exec/*/json -> 403 (absolute-form target)" "403" "$S"
+check_denied "GET http://docker/exec/*/json -> 403 (absolute-form target)" "$S" "$BODY" \
+  'exec is not allowed' 'empty path segment not allowed'
 
 # ─── Summary ──────────────────────────────────────────
 
