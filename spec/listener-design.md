@@ -246,7 +246,8 @@ Unit, in all three languages, same cases:
 - `fd://3` rejected as a non-path value.
 - `--listen-socket-mode` rejected as unknown.
 - Group table: default missing → own gid + warning; explicit missing → error;
-  `""` → own gid, no warning; explicit numeric → that gid.
+  `""` → own gid, no warning; explicit numeric → that gid (digits only,
+  `0-4294967294`; larger exits 2).
 - Existing path: stale socket replaced at `0660`; live socket refused and
   left in place (same inode, first listener still answers); non-socket
   refused.

@@ -10,9 +10,9 @@ A validating Docker API proxy that enforces **per-service container policies** t
 Key features:
 
 - **Policy-driven**: Per-service YAML policies, selected by image name, control images, volumes, flags, and env vars. The listening socket is the trust boundary: every caller of a socket can use every policy behind it (see [Trust model](#trust-model))
-- **Middleware pipeline**: 6 validation gates + 1 config mutator chain
+- **Middleware pipeline**: 5 validation gates + 1 config mutator chain
 - **Default-deny router**: Only explicitly allowed endpoints pass through
-- **Formally verified**: [Quint](https://quint-lang.org/) specification with 9 security invariants
+- **Formally verified**: [Quint](https://quint-lang.org/) specification: 9 request-handling invariants, 6 listener invariants, and router properties for percent-encoded paths, empty segments, exec and the container lifecycle
 - **Audit logging**: JSON-structured logs for all requests and decisions
 - **Three implementations**: [Go](go/), [Rust](rs/), [TypeScript](ts/) — equal peer languages
 - **Minimal dependencies**: Zero external deps for Go, crate-based for Rust, npm for TypeScript
@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 108 unit + 43 integration | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 145 unit | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 162 unit (1 skipped) | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 108 unit + 45 integration + 15 socket | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 143 unit + 45 integration + 15 socket | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 161 unit (1 skipped) + 45 integration + 15 socket | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -193,7 +193,6 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | Middleware | Type | What it checks |
 |------------|------|----------------|
 | ContainerConfigMutator | Mutator | Forces `network_mode`, `user`, `security_options`, `restart_policy` from policy |
-| ExecGate | Gate | Denies `POST /containers/*/exec` and `POST /exec/*/start` |
 | ReadonlyGate | Gate | Denies all `POST`, `PUT`, `DELETE`, `PATCH` (optional `--readonly` flag) |
 | RegistryGate | Gate | Validates image ref against `allowed_image_prefixes` |
 | MountSourceGate | Gate | Validates volume binds against whitelist |
@@ -440,7 +439,7 @@ not at the socket.
 
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models container-name extraction and the router's container-lifecycle routing branch only, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)).
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)) and exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 7 properties are checked exhaustively over every method and every path of 1 to 3 segments; exec is denied by the router, not by a middleware gate.
 
 The CI pipeline runs verification on every push and PR. A violation blocks the build.
 

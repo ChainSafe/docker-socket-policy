@@ -3,7 +3,7 @@
 # Sends HTTP requests directly to the proxy's Docker API and checks status codes,
 # and the deny message on every expected proxy 403.
 # The proxy's ReadonlyGate, RegistryGate, MountSourceGate, EnvFileGate,
-# CmdGate, ExecGate, and ContainerConfigMutator are all exercised.
+# CmdGate, and ContainerConfigMutator are all exercised; exec is denied by the router.
 
 set -e
 

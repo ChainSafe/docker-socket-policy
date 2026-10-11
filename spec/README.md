@@ -93,8 +93,9 @@ A path is a list of raw, still percent-encoded segments with the query string re
 - `execPrefixNamesRoute` holds when renaming `exec-runner` to the plain unknown name `mycontainer`, wherever it appears in the path, never changes the outcome.
 - `createOnlyExact` holds when `routeCreate` is the outcome for exactly `POST /containers/create`.
 - `emptyInteriorDenied` holds when every path with an empty segment before the last one is denied.
+- `emptySegmentsHideNoExec` holds when every path that is an exec path once its empty segments are dropped is denied.
 
-On `router`, `soundTest` asserts `lifecycleOnlyTargetsRealNames`, `percentSoundTest` asserts `routerSeesWhatDaemonSees`, `execSoundTest` asserts `execNeverAllowed`, `execPrefixSoundTest` asserts `execPrefixNamesRoute`, `createExactSoundTest` asserts `createOnlyExact` `emptyInteriorSoundTest` asserts `emptyInteriorDenied` and `emptySegmentsHideNoExecTest` asserts `emptySegmentsHideNoExec`.
+On `router`, `soundTest` asserts `lifecycleOnlyTargetsRealNames`, `percentSoundTest` asserts `routerSeesWhatDaemonSees`, `execSoundTest` asserts `execNeverAllowed`, `execPrefixSoundTest` asserts `execPrefixNamesRoute`, `createExactSoundTest` asserts `createOnlyExact`, `emptyInteriorSoundTest` asserts `emptyInteriorDenied` and `emptySegmentsHideNoExecTest` asserts `emptySegmentsHideNoExec`.
 
 | Row (`run <row>Test`) | Request | Outcome | Instances |
 |-----|---------|---------|-----------|
