@@ -449,4 +449,53 @@ mod tests {
         let uri = captured.as_ref().expect("expected request to be forwarded");
         assert_eq!(uri.query(), Some(query));
     }
+
+    /// #55: the audit uri is the raw request target, query and escapes
+    /// included, for allowed and denied requests alike.
+    #[tokio::test]
+    async fn test_handler_audit_uri_is_request_target() {
+        let log_path = std::env::temp_dir().join(format!(
+            "handler-audit-uri-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let manager = Manager::from_map(std::collections::HashMap::new());
+        let router = Arc::new(Router::new(manager));
+        let audit = AuditLogger::new(log_path.to_str().unwrap()).unwrap();
+        let captured_uri = Arc::new(std::sync::Mutex::new(None));
+        let transport = UriRecordingTransport { captured_uri };
+        let handler = Handler::new(router, Chain::new(false), audit, Box::new(transport));
+
+        let targets = [
+            ("GET", "/containers/json?all=1", "ALLOW"),
+            ("DELETE", "/containers/a%2Fb?force=1", "DENY"),
+        ];
+        for (method, target, _) in targets {
+            let req = Request::builder()
+                .method(method)
+                .uri(format!("http://localhost{}", target))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            handler.handle(req).await;
+        }
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let _ = std::fs::remove_file(&log_path);
+        let entries: Vec<serde_json::Value> = contents.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(entries.len(), targets.len(), "audit log:\n{}", contents);
+        let mut mismatches = Vec::new();
+        for ((method, target, decision), entry) in targets.iter().zip(&entries) {
+            if entry["decision"] != *decision || entry["uri"] != *target {
+                mismatches.push(format!(
+                    "{} {}: got {}/{}, want {:?}/{:?}",
+                    method, target, entry["decision"], entry["uri"], decision, target
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
 }

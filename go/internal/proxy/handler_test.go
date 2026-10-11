@@ -160,6 +160,56 @@ func TestHandler_ForwardsPercentEncodedQuery(t *testing.T) {
 	}
 }
 
+// #55: the audit uri is the raw request target, query and escapes included,
+// for allowed and denied requests alike.
+func TestHandlerAuditURIIsRequestTarget(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "default.yaml"), []byte("service_name: default\nallowed_image_prefixes:\n  - scratch\n"), 0644)
+	policyManager, err := policy.NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "audit.log")
+	auditLog, err := audit.NewLogger(logPath)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+	defer auditLog.Close()
+	h := NewHandler(NewRouter(policyManager), middleware.NewChain(false), auditLog, &recorderTransport{})
+
+	targets := []struct{ method, target, decision string }{
+		{"GET", "/containers/json?all=1", "ALLOW"},
+		{"DELETE", "/containers/a%2Fb?force=1", "DENY"},
+	}
+	for _, tc := range targets {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(tc.method, tc.target, nil))
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading audit log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != len(targets) {
+		t.Fatalf("audit log has %d lines, want %d:\n%s", len(lines), len(targets), data)
+	}
+	for i, tc := range targets {
+		var entry struct {
+			URI      string `json:"uri"`
+			Decision string `json:"decision"`
+		}
+		if err := json.Unmarshal([]byte(lines[i]), &entry); err != nil {
+			t.Fatalf("line %d: %v", i, err)
+		}
+		if entry.Decision != tc.decision {
+			t.Errorf("%s %s: decision = %q, want %q", tc.method, tc.target, entry.Decision, tc.decision)
+		}
+		if entry.URI != tc.target {
+			t.Errorf("%s %s: audit uri = %q, want %q", tc.method, tc.target, entry.URI, tc.target)
+		}
+	}
+}
+
 func TestHandler_CreateContainerValid(t *testing.T) {
 	rec := &recorderTransport{}
 	h := newTestHandler(t, map[string]string{

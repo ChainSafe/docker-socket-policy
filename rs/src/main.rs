@@ -1283,6 +1283,12 @@ mod tests {
             err.to_string(),
             want
         );
+        let meta = std::fs::symlink_metadata(&path);
+        assert!(
+            matches!(&meta, Err(e) if e.kind() == io::ErrorKind::NotFound),
+            "socket left on disk after chown failed: symlink_metadata = {:?}",
+            meta
+        );
     }
 
     /// A clean shutdown must not leave the socket file on disk, matching Go

@@ -879,4 +879,7 @@ func TestUnixListenerChownEPERMNamesGroup(t *testing.T) {
 	if want := "the proxy's user must be a member of it"; !strings.Contains(err.Error(), want) {
 		t.Fatalf("error = %q, want it to contain %q", err, want)
 	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket left on disk after chown failed: Lstat err = %v", err)
+	}
 }
