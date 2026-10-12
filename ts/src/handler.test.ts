@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { createServer, request, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { Handler } from "./handler.js";
 import { Chain } from "./middleware.js";
 import { Router } from "./proxy.js";
@@ -41,11 +42,19 @@ function makeResponse(): { res: ServerResponse; recorder: RecorderRes } {
   return { res, recorder };
 }
 
-function makeRequest(method: string, url: string, body?: string): IncomingMessage {
+function makeRequest(
+  method: string,
+  url: string,
+  body?: string,
+  headers: Record<string, string> = {},
+): IncomingMessage {
   const stream = Readable.from(body ? [Buffer.from(body)] : []);
   (stream as IncomingMessage).method = method;
   (stream as IncomingMessage).url = url;
-  (stream as IncomingMessage).headers = body ? { "content-length": String(Buffer.byteLength(body)) } : {};
+  (stream as IncomingMessage).headers = {
+    ...(body ? { "content-length": String(Buffer.byteLength(body)) } : {}),
+    ...headers,
+  };
   return stream as IncomingMessage;
 }
 
@@ -220,5 +229,79 @@ describe("Handler", () => {
       assert.equal(entry.decision, decision, `${method} ${target}`);
       assert.equal(entry.uri, target, `${method} ${target}`);
     });
+  });
+
+  // #76: any protocol upgrade is refused before the body is read and before
+  // routing, so the transport never sees it. Before #76 a websocket attach
+  // went through the GET passthrough to the daemon.
+  it("refuses a protocol upgrade", async () => {
+    const dir = makeEnv(defaultConfig);
+    const { handler, transport } = newHandler(dir);
+    const refused = "protocol upgrade not allowed";
+    const cases: [string, string, Record<string, string>][] = [
+      ["websocket", "/containers/json", { upgrade: "websocket", connection: "Upgrade" }],
+      ["connection token only", "/_ping", { connection: "keep-alive, Upgrade" }],
+      ["upgrade header only", "/_ping", { upgrade: "h2c" }],
+    ];
+    const mismatches: string[] = [];
+    for (const [name, target, headers] of cases) {
+      const { res, recorder } = makeResponse();
+      await handler.handle(makeRequest("GET", target, undefined, headers), res);
+      if (recorder.statusCode !== 403 || recorder.body !== refused) {
+        mismatches.push(`${name}: got ${recorder.statusCode} ${JSON.stringify(recorder.body)}`);
+      }
+      if (transport.lastRequest) mismatches.push(`${name}: forwarded`);
+      transport.lastRequest = undefined;
+    }
+    await handler.handle(makeRequest("GET", "/containers/json"), makeResponse().res);
+    if (!transport.lastRequest) mismatches.push("plain GET /containers/json: not forwarded");
+
+    const first = JSON.parse(readFileSync(join(dir, "audit.log"), "utf-8").split("\n")[0]!) as Record<string, string>;
+    if (
+      first.method !== "GET" ||
+      first.uri !== "/containers/json" ||
+      first.decision !== "DENY" ||
+      first.reason !== refused
+    ) {
+      mismatches.push(`audit entry: ${JSON.stringify(first)}`);
+    }
+    assert.deepEqual(mismatches, []);
+  });
+
+  // #76, TS-only: Node's http.Server routes a request with Upgrade and
+  // Connection: Upgrade to the "upgrade" event when it has a listener. The
+  // proxy registers none, so the request reaches the handler, which refuses it.
+  it("refuses a protocol upgrade through a real http.Server", async () => {
+    const dir = makeEnv(defaultConfig);
+    const { handler, transport } = newHandler(dir);
+    const server = createServer((req, res) => void handler.handle(req, res));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      const got = await new Promise<string>((resolve, reject) => {
+        const req = request(
+          {
+            host: "127.0.0.1",
+            port,
+            path: "/containers/mycontainer/attach/ws?stdin=1&stream=1",
+            headers: { Upgrade: "websocket", Connection: "Upgrade" },
+          },
+          (res) => {
+            let body = "";
+            res.on("data", (c: Buffer) => (body += c.toString()));
+            res.on("end", () => resolve(`${res.statusCode} ${body}`));
+          },
+        );
+        req.on("upgrade", (res) => resolve(`upgraded ${res.statusCode}`));
+        req.on("error", reject);
+        req.setTimeout(2000, () => req.destroy(new Error("no response within 2s")));
+        req.end();
+      });
+      assert.equal(got, "403 protocol upgrade not allowed");
+      assert.equal(transport.lastRequest, undefined);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 });

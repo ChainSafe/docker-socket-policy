@@ -71,6 +71,10 @@ func (r *Router) Route(method, path string, body map[string]interface{}) *RouteR
 		return &RouteResult{Action: ActionDeny, DenyMsg: "exec is not allowed"}
 	}
 
+	if isAttachPath(path) {
+		return &RouteResult{Action: ActionDeny, DenyMsg: "attach is not allowed"}
+	}
+
 	if strings.HasPrefix(path, "/build") {
 		return &RouteResult{Action: ActionDeny, DenyMsg: "build is not allowed"}
 	}
@@ -214,6 +218,13 @@ func scanDigits(s string, i int) int {
 func isExecPath(path string) bool {
 	segs := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	return segs[0] == "exec" || (segs[0] == "containers" && slices.Contains(segs[1:], "exec"))
+}
+
+// isAttachPath matches attach on whole segments after /containers, so a name
+// like attach-runner is not attach (#76).
+func isAttachPath(path string) bool {
+	segs := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	return segs[0] == "containers" && slices.Contains(segs[1:], "attach")
 }
 
 // reservedContainerSegments are Docker endpoints that sit where a container

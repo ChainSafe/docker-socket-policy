@@ -502,4 +502,41 @@ describe("Router", () => {
     }
     assert.deepEqual(mismatches, []);
   });
+
+  // Cross-language parity guard for #76. attach as a whole segment after
+  // /containers/{name} is denied for every method, right after the exec
+  // check. Before #76 GET .../attach/ws fell through to the GET passthrough.
+  // Rows mirror the attach* runs in spec/router.qnt.
+  it("denies attach for every method", () => {
+    const attach = "attach is not allowed";
+    const cases: [string, string, Action, string | undefined][] = [
+      // attachGetDeniedTest (#76): the websocket attach endpoint.
+      ["GET", "/containers/mycontainer/attach/ws", Action.Deny, attach],
+      // #76, TS-only: the TS router receives the raw target, query included.
+      ["GET", "/containers/mycontainer/attach/ws?stdin=1&stream=1", Action.Deny, attach],
+      // attachPostDeniedTest (#76)
+      ["POST", "/containers/mycontainer/attach", Action.Deny, attach],
+      // attachHeadDeniedTest (#76)
+      ["HEAD", "/containers/mycontainer/attach", Action.Deny, attach],
+      // #76: the check runs after the API-version strip.
+      ["GET", "/v1.45/containers/mycontainer/attach/ws", Action.Deny, attach],
+      // #76: every method.
+      ["DELETE", "/containers/mycontainer/attach", Action.Deny, attach],
+      // #76 control: attach-runner is a name like any other.
+      ["GET", "/containers/attach-runner/json", Action.Allow, undefined],
+      // #76 control: other container reads stay allowed.
+      ["GET", "/containers/mycontainer/logs", Action.Allow, undefined],
+      ["GET", "/containers/json", Action.Allow, undefined],
+    ];
+    const mismatches: string[] = [];
+    for (const [method, path, want, wantMsg] of cases) {
+      const r = router.route(method, path);
+      if (r.action !== want || r.denyMsg !== wantMsg) {
+        mismatches.push(
+          `${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}/${wantMsg ?? "-"}`,
+        );
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
 });

@@ -45,6 +45,18 @@ impl Handler {
         let headers = parts.headers.clone();
         let version = parts.version;
 
+        // Refuse protocol upgrades before anything else: forwarding one would
+        // hand the caller a raw stream to the daemon (#76).
+        if is_upgrade_request(&headers) {
+            let msg = "protocol upgrade not allowed";
+            warn!("denied {} {}: {}", method, path, msg);
+            self.audit.deny(&method, &target, msg);
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Full::new(Bytes::from(msg)))
+                .unwrap();
+        }
+
         let mut body_bytes = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(_) => {
@@ -124,6 +136,16 @@ impl Handler {
             }
         }
     }
+}
+
+/// An Upgrade header, or a Connection header that lists the upgrade token.
+fn is_upgrade_request(headers: &hyper::HeaderMap) -> bool {
+    headers.contains_key(header::UPGRADE)
+        || headers.get_all(header::CONNECTION).iter().any(|v| {
+            v.as_bytes()
+                .split(|&b| b == b',')
+                .any(|tok| tok.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
+        })
 }
 
 #[cfg(test)]
@@ -529,5 +551,80 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// #76: any protocol upgrade is refused before the body is read and
+    /// before routing, so the transport never sees it. Before #76 a websocket
+    /// attach went through the GET passthrough to the daemon.
+    #[tokio::test]
+    async fn test_handler_refuses_protocol_upgrade() {
+        let log_path = std::env::temp_dir().join(format!(
+            "handler-upgrade-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let manager = Manager::from_map(std::collections::HashMap::new());
+        let router = Arc::new(Router::new(manager));
+        let audit = AuditLogger::new(log_path.to_str().unwrap()).unwrap();
+        let captured_uri = Arc::new(std::sync::Mutex::new(None));
+        let transport = UriRecordingTransport {
+            captured_uri: captured_uri.clone(),
+        };
+        let handler = Handler::new(router, Chain::new(), audit, Box::new(transport));
+        let refused = "protocol upgrade not allowed";
+
+        let cases: [(&str, &str, &[(&str, &str)]); 3] = [
+            (
+                "websocket",
+                "/containers/json",
+                &[("Upgrade", "websocket"), ("Connection", "Upgrade")],
+            ),
+            (
+                "connection token only",
+                "/_ping",
+                &[("Connection", "keep-alive, Upgrade")],
+            ),
+            ("upgrade header only", "/_ping", &[("Upgrade", "h2c")]),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, target, headers) in cases {
+            let mut req = Request::get(format!("http://localhost{}", target));
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            let resp = handler.handle(req.body(Full::new(Bytes::new())).unwrap()).await;
+            let status = resp.status();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            if status != StatusCode::FORBIDDEN || body != refused {
+                mismatches.push(format!("{}: got {} {:?}", name, status, String::from_utf8_lossy(&body)));
+            }
+            if captured_uri.lock().unwrap().take().is_some() {
+                mismatches.push(format!("{}: forwarded", name));
+            }
+        }
+
+        let req = Request::get("http://localhost/containers/json")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        if resp.status() != StatusCode::OK || captured_uri.lock().unwrap().is_none() {
+            mismatches.push("plain GET /containers/json: not forwarded".to_string());
+        }
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let _ = std::fs::remove_file(&log_path);
+        let first: serde_json::Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        if first["method"] != "GET"
+            || first["uri"] != "/containers/json"
+            || first["decision"] != "DENY"
+            || first["reason"] != refused
+        {
+            mismatches.push(format!("audit entry: {}", first));
+        }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
 }

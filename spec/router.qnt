@@ -3,8 +3,9 @@
 // How the router extracts a container name from a request path, how the
 // container-lifecycle branch routes on it (#48), the percent-encoded
 // path deny that runs first in the router (#53), the empty interior segment
-// deny that follows it (#55), and the segment-exact exec deny and
-// POST /containers/create route (#49). Mirrors
+// deny that follows it (#55), the segment-exact exec deny and
+// POST /containers/create route (#49), and the segment-exact attach deny
+// (#76). Mirrors
 // `extract_container_name` and the lifecycle branch of `Router::route` in
 // rs/src/proxy.rs. This is not the full router: the API-version strip and
 // the other checks that run between the percent check and the lifecycle
@@ -42,6 +43,12 @@
 // the middleware chain, which runs on the create route alone; that was
 // handler wiring, not routing, so no instance models it.
 //
+// ALLOW_ATTACH = true models all three before #76, where attach fell
+// through to the GET passthrough (and, for other methods, the lifecycle
+// branch's default deny). false models all three after the fix: a path
+// whose first segment is `containers` with `attach` as any later segment
+// is denied, for every method, right after the exec check.
+//
 // No instance models Go before #53. Go decoded before routing, which is
 // route(m, decodePath(segs)); with this table that agrees with the daemon
 // by construction, so the property cannot express Go's risk: decoding that
@@ -53,6 +60,7 @@ module router_model {
   const ALLOW_PERCENT: bool
   const ALLOW_EMPTY_INTERIOR: bool
   const READONLY: bool
+  const ALLOW_ATTACH: bool
 
   // ─── Daemon decoding ────────────────────────────────────────────────
 
@@ -115,6 +123,13 @@ module router_model {
       segs[0] == "containers" and segs.indices().exists(i => i >= 1 and segs[i] == "exec"),
     }
 
+  // Attach matches whole segments only (#76), as exec does under
+  // `containers`: `attach` anywhere after `containers`. A segment such as
+  // `attach-runner` is a name like any other.
+  pure def isAttachPath(segs: List[str]): bool =
+    if (segs.length() == 0) false
+    else segs[0] == "containers" and segs.indices().exists(i => i >= 1 and segs[i] == "attach")
+
   // An empty segment before the last one, i.e. `//` in the path. A trailing
   // empty segment (`/containers/`) is not interior.
   pure def hasEmptyInterior(segs: List[str]): bool =
@@ -125,7 +140,7 @@ module router_model {
 
   // The read-only check (#75) comes first, then the percent check (#53),
   // then the empty interior segment check (#55). The exec check (#49)
-  // follows, before
+  // and the attach check (#76) follow, before
   // the create route, the lifecycle branch and the GET passthrough, so it
   // denies every method. POST /containers/create matches only the exact
   // segments; a longer path falls through.
@@ -134,6 +149,7 @@ module router_model {
     else if (not(ALLOW_PERCENT) and hasEncodedSeg(segs)) "deny"
     else if (not(ALLOW_EMPTY_INTERIOR) and hasEmptyInterior(segs)) "deny"
     else if (isExecPath(segs)) "denyExec"
+    else if (not(ALLOW_ATTACH) and isAttachPath(segs)) "deny"
     else if (method == "POST" and segs == ["containers", "create"]) "routeCreate"
     else if (hasContainerName(segs)) {
       val name = containerNameOf(segs)
@@ -151,7 +167,7 @@ module router_model {
   pure val WORDS = Set(
     "containers", "", "json", "create", "exec", "mycontainer", "beacon", "start", "stop",
     "%2F", "%2f", "%6A%73%6F%6E", "beacon%2Fstart",
-    "exec-runner", "abc", "extra",
+    "exec-runner", "abc", "extra", "attach", "ws",
   )
   pure val METHODS = Set("GET", "HEAD", "POST", "DELETE")
 
@@ -188,6 +204,16 @@ module router_model {
         segs[i] == "exec",
         i == 0 or segs[0] == "containers",
       }) implies isDenied(route(m, segs))
+    ))
+
+  // A path whose first segment is `containers` with `attach` at some later
+  // segment is denied for every method (#76). Ranges over GET too. Written
+  // out rather than taken from isAttachPath, as execNeverAllowed is.
+  pure val attachNeverAllowed: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      (segs.length() > 0 and segs[0] == "containers"
+        and segs.indices().exists(i => i >= 1 and segs[i] == "attach"))
+        implies isDenied(route(m, segs))
     ))
 
   // `exec-runner` only starts with `exec`. Renaming it to the plain unknown
@@ -232,11 +258,13 @@ module router_model {
 
   // ─── Tests: one run per table row ───────────────────────────────────
   //
-  // Rows whose outcome depends on none of ALLOW_EMPTY_NAME, ALLOW_PERCENT
-  // and ALLOW_EMPTY_INTERIOR run on every READONLY = false instance. The rows
+  // Rows whose outcome depends on none of ALLOW_EMPTY_NAME, ALLOW_PERCENT,
+  // ALLOW_EMPTY_INTERIOR and ALLOW_ATTACH run on every READONLY = false
+  // instance. The rows
   // that do and the
   // property tests (soundTest, percentSoundTest, execSoundTest,
-  // execPrefixSoundTest, createExactSoundTest, emptyInteriorSoundTest) live
+  // execPrefixSoundTest, createExactSoundTest, emptyInteriorSoundTest,
+  // attachSoundTest) live
   // in `router`. `router_readonly` runs only its own `readonly*` tests
   // (`--match`): with READONLY = true the write rows here are denied.
 
@@ -293,11 +321,11 @@ module router_model {
 
 // ─── Instances ──────────────────────────────────────────────────────────
 
-// Go, TypeScript, and Rust after #48, #53, #49 and #55: an empty segment is
-// not a name, and a percent-encoded path or one with an empty interior
-// segment is denied.
+// Go, TypeScript, and Rust after #48, #53, #49, #55 and #76: an empty
+// segment is not a name, a percent-encoded path or one with an empty
+// interior segment is denied, and attach is denied.
 module router {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false).*
 
   run emptyNameDeleteDeniedTest =
     assert(route("DELETE", ["containers", ""]) == "deny")
@@ -356,6 +384,29 @@ module router {
 
   run emptySegmentsHideNoExecTest =
     assert(emptySegmentsHideNoExec)
+
+  // Attach is denied for every method (#76). The model has at most three
+  // segments, so `/containers/mycontainer/attach/ws` is not expressible;
+  // `/containers/mycontainer/attach` stands for it.
+
+  run attachGetDeniedTest =
+    assert(route("GET", ["containers", "mycontainer", "attach"]) == "deny")
+
+  // A pin, not a discriminator: with ALLOW_ATTACH = true the lifecycle
+  // branch still denies it, since `attach` is not an action.
+  run attachPostDeniedTest =
+    assert(route("POST", ["containers", "mycontainer", "attach"]) == "deny")
+
+  run attachHeadDeniedTest =
+    assert(route("HEAD", ["containers", "mycontainer", "attach"]) == "deny")
+
+  // A container literally named `attach` is denied too, as
+  // `/containers/exec/...` is for exec.
+  run attachNamedContainerDeniedTest =
+    assert(route("GET", ["containers", "attach", "ws"]) == "deny")
+
+  run attachSoundTest =
+    assert(attachNeverAllowed)
 }
 
 // Rust before #48: `/containers/` and `/containers//start` reach
@@ -364,7 +415,7 @@ module router {
 // is off: with it on, `/containers//start` would be denied before it reached
 // the name branch, and the instance could not show #48.
 module router_pre48 {
-  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false).*
+  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false).*
 
   run pre48UnsoundTest =
     assert(and {
@@ -378,7 +429,7 @@ module router_pre48 {
 // encoded name such as `%2F` counted as an unknown container and the
 // request was forwarded. The daemon decodes it and reads a different path.
 module router_pre53 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true, ALLOW_EMPTY_INTERIOR = false, READONLY = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false).*
 
   run pre53UnsoundTest =
     assert(and {
@@ -394,7 +445,7 @@ module router_pre53 {
 // check missed it and the GET passthrough forwarded it. The daemon answers
 // with a 301 to the clean path, so nothing leaked, but the router allowed it.
 module router_pre55 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false).*
 
   run pre55UnsoundTest =
     assert(and {
@@ -408,7 +459,7 @@ module router_pre55 {
 // `--match='^readonly.*Test$'`; the shared write rows in router_model assume the
 // flag is off.
 module router_readonly {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = true).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = true, ALLOW_ATTACH = false).*
 
   run readonlySoundTest =
     assert(readonlyAllowsOnlyReads)
@@ -427,4 +478,18 @@ module router_readonly {
 
   run readonlyHeadAllowedTest =
     assert(route("HEAD", ["containers", "mycontainer"]) == "allowRead")
+}
+
+// All three before #76: attach fell through to the GET passthrough, so
+// `GET /containers/{name}/attach/ws` with `Upgrade: websocket` was forwarded
+// and Go relayed the 101, giving the caller the container's stdin. Other
+// flags as `router`.
+module router_pre76 {
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = true).*
+
+  run pre76UnsoundTest =
+    assert(and {
+      not(attachNeverAllowed),
+      route("GET", ["containers", "mycontainer", "attach"]) == "allowRead",
+    })
 }
