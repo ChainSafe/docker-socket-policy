@@ -9,7 +9,7 @@ This directory contains a [Quint](https://quint-lang.org/) formal specification 
 | `docker_socket_policy.qnt` | Request-handling spec: policy types, state machine, endpoint routing table, 9 invariants (6 P0 / 3 P1), 6 attack scenario simulations |
 | `listener.qnt` | Listening-socket startup: flag/group selection, existing-path checks, single-instance lock, 6 invariants, one `run` test per design-table row. Instances `listener_locked` (Go, Rust) and `listener_unlocked` (TypeScript) |
 | `listener-design.md` | Design of the listening socket (dockerd parity) that `listener.qnt` models |
-| `router.qnt` | The percent-encoded path deny, the empty interior segment deny, the segment-exact exec deny and `POST /containers/create` route, container-name extraction and the container-lifecycle branch of the router only, not the full router. The daemon's percent-decoding as a fixed table. One `run` test per table row. Instances `router` (Go, TypeScript, and Rust after #48, #53, #49 and #55), `router_pre48` (Rust's extraction rule before #48), `router_pre53` (Rust and TypeScript before #53, routing on the raw path) and `router_pre55` (all three before #55, letting empty interior segments through). Every instance includes the #49 exec and create rule, so the pre instances isolate one earlier rule each rather than being full snapshots |
+| `router.qnt` | The percent-encoded path deny, the empty interior segment deny, the segment-exact exec deny and `POST /containers/create` route, container-name extraction and the container-lifecycle branch of the router only, not the full router. The daemon's percent-decoding as a fixed table. One `run` test per table row. Instances `router` (Go, TypeScript, and Rust after #48, #53, #49 and #55), `router_pre48` (Rust's extraction rule before #48), `router_pre53` (Rust and TypeScript before #53, routing on the raw path) , `router_pre55` (all three before #55, letting empty interior segments through) and `router_readonly` (as `router`, with `--readonly`, #75). Every instance includes the #49 exec and create rule, so the pre instances isolate one earlier rule each rather than being full snapshots |
 
 ## How to Run
 
@@ -34,12 +34,13 @@ quint run spec/listener.qnt --main=listener_locked --max-steps=30 --invariant al
 quint test spec/listener.qnt --main=listener_locked
 quint test spec/listener.qnt --main=listener_unlocked
 
-# Router model: typecheck, run the table tests on all four instances
+# Router model: typecheck, run the table tests on all five instances
 quint typecheck spec/router.qnt
 quint test spec/router.qnt --main=router
 quint test spec/router.qnt --main=router_pre48
 quint test spec/router.qnt --main=router_pre53
 quint test spec/router.qnt --main=router_pre55
+quint test spec/router.qnt --main=router_readonly --match='^readonly.*Test$'
 
 # Formal model-checking via Apalache (exhaustive, requires Java)
 quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy.qnt
@@ -94,6 +95,7 @@ A path is a list of raw, still percent-encoded segments with the query string re
 - `createOnlyExact` holds when `routeCreate` is the outcome for exactly `POST /containers/create`.
 - `emptyInteriorDenied` holds when every path with an empty segment before the last one is denied.
 - `emptySegmentsHideNoExec` holds when every path that is an exec path once its empty segments are dropped is denied.
+- `readonlyAllowsOnlyReads` holds when every request whose method is not `GET` or `HEAD` is denied, for every path. It is the read-only claim and holds only with `READONLY = true`; the router's read-only check, which runs before every other check, denies such requests (#75).
 
 On `router`, `soundTest` asserts `lifecycleOnlyTargetsRealNames`, `percentSoundTest` asserts `routerSeesWhatDaemonSees`, `execSoundTest` asserts `execNeverAllowed`, `execPrefixSoundTest` asserts `execPrefixNamesRoute`, `createExactSoundTest` asserts `createOnlyExact`, `emptyInteriorSoundTest` asserts `emptyInteriorDenied` and `emptySegmentsHideNoExecTest` asserts `emptySegmentsHideNoExec`.
 
@@ -140,6 +142,18 @@ Rows for empty interior segments and HEAD ([#55](https://github.com/ChainSafe/do
 | `emptyInteriorGetDenied` | `GET /containers//json` | deny | `router` |
 | `headNamedContainerAllowed` | `HEAD /containers/mycontainer` | allow (read) | all |
 
+Rows for `--readonly` ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)), all on `router_readonly`, which also runs `readonlySoundTest` (asserts `readonlyAllowsOnlyReads`). The implementations deny these with `read-only mode: <METHOD> requests are not allowed`:
+
+| Row (`run <row>Test`) | Request | Outcome |
+|-----|---------|---------|
+| `readonlyLifecycleStopDenied` | `POST /containers/mycontainer/stop` | deny |
+| `readonlyDeleteDenied` | `DELETE /containers/mycontainer` | deny |
+| `readonlyCreateDenied` | `POST /containers/create` | deny |
+| `readonlyGetAllowed` | `GET /containers/json` | allow (read) |
+| `readonlyHeadAllowed` | `HEAD /containers/mycontainer` | allow (read) |
+
+The rows marked "all" above run on every `READONLY = false` instance; `router_readonly` runs only its own `readonly*` tests (`--match='^readonly.*Test$'`), since with the flag on the shared write rows are denied.
+
 Each implementation's router tests use the same row names in comments (added with the #48, #53, #49 and #55 fixes). `router_pre48` runs `pre48UnsoundTest`, which asserts that `lifecycleOnlyTargetsRealNames` fails and that both `emptyName*Denied` requests are allowed as an unknown container ([#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). `router_pre53` runs `pre53UnsoundTest`, which asserts that `routerSeesWhatDaemonSees` fails, that `DELETE /containers/%2F` and `POST /containers/%2F/start` are allowed as an unknown container, and that `GET /containers/%2F` is allowed through the passthrough. `router_pre55` runs `pre55UnsoundTest`, which asserts that `emptyInteriorDenied` fails and that `GET //exec/abc` is allowed through the passthrough: its first segment is empty, not `exec`, so the exec check misses it.
 
 ### Modeling Notes
@@ -162,6 +176,7 @@ Two invariants are structurally tautological within the Quint model — they can
 - **The #49 properties are not vacuous.** None of them is shown on a separate instance; replacing the rule in `route` makes them fail. With a substring-style rule (a segment that starts with `exec`, modeled as the set `exec`, `exec-runner`), `execPrefixSoundTest` and the three `execPrefixName*Allowed` rows fail. With Go's rule before #49 (`exec` only as the second segment under `containers`), `execSoundTest` and the four `exec*Denied` rows fail. `execSubpathPostDenied` and `execNamespacePostDenied` fail there only because the outcome is the default `deny`, not `denyExec`: the request is still refused, as before #49, but not by the exec check. With Go's prefix match for create, `createExactSoundTest` and `createSubpathDenied` fail. `execNeverAllowed` writes out the exec positions itself instead of calling `isExecPath`, so that a narrower `isExecPath` cannot narrow the property with it.
 - **HEAD is routed like GET (#55).** `METHODS` is `GET`, `HEAD`, `POST`, `DELETE`. Before #55 the lifecycle branches disagreed on `HEAD /containers/x`: Go and TypeScript fell through to the GET/HEAD passthrough and allowed it, while Rust denied it. All three now allow it like `GET`, and the model's lifecycle branch allows `GET` and `HEAD` alike.
 - **Empty interior segments are denied (#55).** Before #55, `GET //exec/<id>/json` (and `/v1.45//exec/…`) had an empty first segment, so the exec check did not match and the GET passthrough forwarded it. A live daemon answers such paths with a `301` to the clean path, so nothing leaked, but the router had allowed an exec path. `emptyInteriorDenied` states the rule, and on `router` it is close to a tautology, because `route` tests `hasEmptyInterior` directly. `emptySegmentsHideNoExec` states the security claim: a path that is an exec path once its empty segments are dropped, as the daemon's redirect does, is denied for every method. Both fail on `router_pre55`, and setting `router`'s `ALLOW_EMPTY_INTERIOR` to `true` makes `emptyInteriorSoundTest`, `emptySegmentsHideNoExecTest`, `emptyLeadingExecGetDenied` and `emptyInteriorGetDenied` fail. `router_pre48` keeps the rule off: with it on, `POST /containers//start` is denied before it reaches the name branch, and the instance could no longer show the #48 extraction bug. For the same reason, on `router` the empty-segment check now decides `emptyNameStartDenied`; the #48 extraction stays covered there by `emptyNameDeleteDenied` (a trailing slash) and on `router_pre48`. Dot segments (`/./exec/…`, `/x/../exec/…`) are not modelled and not denied yet (#70); the daemon redirects them to the clean path as it does for `//`. The implementations check for `//` in the path without its query, so `GET /containers/json?filters=a//b` is still forwarded; that is pinned by the TypeScript router test, since Go and Rust route on the path alone.
+- **`--readonly` is a router rule (#75).** Before #75 the flag reached only the middleware chain, and the handler runs the chain only on the create route, so lifecycle `POST`s, `DELETE /containers/{name}` and `POST /images/create` were forwarded in read-only mode. That was handler wiring, not routing, so there is no `pre75` instance: the `READONLY = false` instances are the behaviour without the flag, which before the fix was also the behaviour with it for every route but create. `readonlyAllowsOnlyReads` does not mention `READONLY`, so it is not vacuous: setting `router_readonly`'s `READONLY` to `false` makes `readonlySoundTest` and the three `readonly*Denied` rows fail. `METHODS` has no `PUT`; the implementations' tests cover it.
 - **Listener fault bias.** `step` crashes an instance on 1 in 10 draws instead of half of all steps, so random runs actually interleave live instances. Every crash stays reachable from every phase, so the reachable state space is unchanged.
 
 ### Attack Scenarios Prevented by Invariants
