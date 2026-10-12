@@ -12,7 +12,7 @@ Key features:
 - **Policy-driven**: Per-service YAML policies, selected by image name, control images, volumes, flags, and env vars. The listening socket is the trust boundary: every caller of a socket can use every policy behind it (see [Trust model](#trust-model))
 - **Middleware pipeline**: 4 validation gates + 1 config mutator chain
 - **Default-deny router**: Only explicitly allowed endpoints pass through
-- **Formally verified**: [Quint](https://quint-lang.org/) specification: 9 request-handling invariants, 6 listener invariants, and router properties for percent-encoded paths, empty segments, exec and the container lifecycle
+- **Formally verified**: [Quint](https://quint-lang.org/) specification: 9 request-handling invariants, 6 listener invariants, and router properties for `--readonly`, percent-encoded paths, empty segments, exec and the container lifecycle
 - **Audit logging**: JSON-structured logs for all requests and decisions
 - **Three implementations**: [Go](go/), [Rust](rs/), [TypeScript](ts/) — equal peer languages
 - **Minimal dependencies**: Zero external deps for Go, crate-based for Rust, npm for TypeScript
@@ -198,7 +198,7 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | EnvFileGate | Gate | Strips `Env` field from create body; env must come from locked `env_file` |
 | CmdGate | Gate | Validates each CLI flag in `Cmd` array against allowlist + denylist |
 
-The chain runs only on container create. `--readonly` is not a gate: the router denies every request that is not `GET` or `HEAD`, on every path, before any other check ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)).
+The chain runs only on container create. `--readonly` is not a gate: the router denies every request that is not `GET` or `HEAD`, on every path, before any other check ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)). A websocket attach (`GET /containers/{name}/attach/ws` with `Upgrade`) is a `GET` and is not denied yet; the Go proxy lets it write to a container's stdin ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)).
 
 ## Endpoint Access
 

@@ -457,6 +457,8 @@ check_denied "GET http://docker/exec/*/json -> 403 (absolute-form target)" "$S" 
 echo ""
 echo "--- Read-only mode ---"
 
+# The request helpers read PROXY_SOCK, so this switches every check below to
+# the read-only proxy. Keep this section last.
 PROXY_SOCK="$PROXY_RO_SOCK"
 
 S=$(get_status "$PROXY/_ping")

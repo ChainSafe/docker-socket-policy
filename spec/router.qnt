@@ -405,7 +405,7 @@ module router_pre55 {
 }
 
 // `--readonly` (#75): as `router`, plus the read-only check. Run with
-// `--match=^readonly`; the shared write rows in router_model assume the
+// `--match='^readonly.*Test$'`; the shared write rows in router_model assume the
 // flag is off.
 module router_readonly {
   import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = true).*
