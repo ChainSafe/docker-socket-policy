@@ -12,13 +12,10 @@ export class Chain {
   private gates: Gate[];
   private mutators: Mutator[];
 
-  constructor(readonly: boolean) {
+  constructor() {
     this.gates = [];
     this.mutators = [new ContainerConfigMutator()];
 
-    if (readonly) {
-      this.gates.push(new ReadonlyGate());
-    }
     this.gates.push(new RegistryGate());
     this.gates.push(new MountSourceGate());
     this.gates.push(new EnvFileGate());
@@ -47,14 +44,6 @@ export class Chain {
 }
 
 const SAFE_CHARSET = /^[A-Za-z0-9._=:/,\-]{1,256}$/;
-
-export class ReadonlyGate implements Gate {
-  check(method: string, _path: string, _policy: Policy, _body: Record<string, unknown>): string | null {
-    return ["POST", "PUT", "DELETE", "PATCH"].includes(method)
-      ? `read-only mode: ${method} requests are not allowed`
-      : null;
-  }
-}
 
 export class RegistryGate implements Gate {
   check(_method: string, _path: string, policy: Policy, body: Record<string, unknown>): string | null {

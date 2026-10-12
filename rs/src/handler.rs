@@ -210,7 +210,7 @@ mod tests {
         );
         let manager = Manager::from_map(policies);
         let router = Arc::new(Router::new(manager));
-        let chain = Chain::new(false);
+        let chain = Chain::new();
         let audit = AuditLogger::new("/dev/null").unwrap();
         let (mock_transport, captured, captured_headers) = MockTransport::new();
         let handler = Handler::new(router, chain, audit, Box::new(mock_transport));
@@ -304,7 +304,7 @@ mod tests {
         );
         let manager = Manager::from_map(policies);
         let router = Arc::new(Router::new(manager));
-        let chain = Chain::new(false);
+        let chain = Chain::new();
         let audit = AuditLogger::new("/dev/null").unwrap();
         let transport = FailingTransport { kind };
         Handler::new(router, chain, audit, Box::new(transport))
@@ -360,7 +360,7 @@ mod tests {
         );
         let manager = Manager::from_map(policies);
         let router = Arc::new(Router::new(manager));
-        let chain = Chain::new(false);
+        let chain = Chain::new();
         let audit = AuditLogger::new("/dev/null").unwrap();
         let (mock_transport, captured, _captured_headers) = MockTransport::new();
         let handler = Handler::new(router, chain, audit, Box::new(mock_transport));
@@ -400,13 +400,39 @@ mod tests {
     fn make_uri_recording_handler() -> (Handler, Arc<std::sync::Mutex<Option<hyper::Uri>>>) {
         let manager = Manager::from_map(std::collections::HashMap::new());
         let router = Arc::new(Router::new(manager));
-        let chain = Chain::new(false);
+        let chain = Chain::new();
         let audit = AuditLogger::new("/dev/null").unwrap();
         let captured_uri = Arc::new(std::sync::Mutex::new(None));
         let transport = UriRecordingTransport {
             captured_uri: captured_uri.clone(),
         };
         (Handler::new(router, chain, audit, Box::new(transport)), captured_uri)
+    }
+
+    /// #75: --readonly is enforced in the router, so a delete never reaches
+    /// the daemon. Before #75 the flag only reached the chain, which runs on
+    /// create.
+    #[tokio::test]
+    async fn test_handler_readonly_denies_delete() {
+        let manager = Manager::from_map(std::collections::HashMap::new());
+        let router = Arc::new(Router::new(manager).with_readonly(true));
+        let audit = AuditLogger::new("/dev/null").unwrap();
+        let captured_uri = Arc::new(std::sync::Mutex::new(None));
+        let transport = UriRecordingTransport {
+            captured_uri: captured_uri.clone(),
+        };
+        let handler = Handler::new(router, Chain::new(), audit, Box::new(transport));
+        let req = Request::delete("http://localhost/containers/mycontainer")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "read-only mode: DELETE requests are not allowed"
+        );
+        assert!(captured_uri.lock().unwrap().is_none(), "expected no forward");
     }
 
     /// #53: Rust routed on the raw name and forwarded it; the daemon decodes
@@ -474,7 +500,7 @@ mod tests {
         let audit = AuditLogger::new(log_path.to_str().unwrap()).unwrap();
         let captured_uri = Arc::new(std::sync::Mutex::new(None));
         let transport = UriRecordingTransport { captured_uri };
-        let handler = Handler::new(router, Chain::new(false), audit, Box::new(transport));
+        let handler = Handler::new(router, Chain::new(), audit, Box::new(transport));
 
         let targets = [
             ("GET", "/containers/json?all=1", "ALLOW"),

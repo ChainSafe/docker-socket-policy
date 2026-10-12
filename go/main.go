@@ -36,7 +36,7 @@ func main() {
 	logFile := flag.String("log-file", "/var/log/docker-socket-policy.log",
 		"Audit log file (JSON)")
 	readonly := flag.Bool("readonly", false,
-		"Enable read-only mode (deny all POST/PUT/DELETE)")
+		"Enable read-only mode (deny every request that is not GET or HEAD)")
 	// The value is read with flagValueIfSet, never through the returned
 	// pointer: absent (default group) and "" (own group) must stay distinct.
 	flag.String("listen-socket-group", "",
@@ -78,8 +78,8 @@ func main() {
 	}
 	slog.Info("loaded policies", "count", len(policyManager.List()), "config_dir", *configDir)
 
-	router := proxy.NewRouter(policyManager)
-	chain := middleware.NewChain(*readonly)
+	router := proxy.NewRouter(policyManager).WithReadonly(*readonly)
+	chain := middleware.NewChain()
 	transport := proxy.NewTransport(*dockerHost)
 	handler := proxy.NewHandler(router, chain, auditLog, transport)
 

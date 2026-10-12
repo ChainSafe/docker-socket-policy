@@ -102,8 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy_manager = policy::Manager::new(&cli.config_dir)?;
     tracing::info!("loaded {} policies", policy_manager.list().len());
 
-    let router = Arc::new(proxy::Router::new(policy_manager));
-    let chain = middleware::Chain::new(cli.readonly);
+    let router = Arc::new(proxy::Router::new(policy_manager).with_readonly(cli.readonly));
+    let chain = middleware::Chain::new();
     let audit = match audit::AuditLogger::new(&cli.log_file) {
         Ok(logger) => logger,
         Err(e) => {
@@ -1050,7 +1050,7 @@ mod tests {
     fn test_handler(delay: std::time::Duration) -> Arc<handler::Handler> {
         let manager = policy::Manager::from_map(std::collections::HashMap::new());
         let router = Arc::new(proxy::Router::new(manager));
-        let chain = middleware::Chain::new(false);
+        let chain = middleware::Chain::new();
         let audit = audit::AuditLogger::new("/dev/null").unwrap();
         Arc::new(handler::Handler::new(
             router,

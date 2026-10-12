@@ -18,9 +18,21 @@ export interface RouteResult {
 }
 
 export class Router {
+  private readonlyMode = false;
+
   constructor(private manager: Manager) {}
 
+  // Sets read-only mode (--readonly) and returns the router.
+  withReadonly(readonly: boolean): this {
+    this.readonlyMode = readonly;
+    return this;
+  }
+
   route(method: string, path: string, body?: Record<string, unknown>): RouteResult {
+    // Read-only mode denies every write, for every path (#75).
+    if (this.readonlyMode && method !== "GET" && method !== "HEAD") {
+      return { action: Action.Deny, denyMsg: `read-only mode: ${method} requests are not allowed` };
+    }
     const qmIdx = path.indexOf("?");
     const cleanPath = qmIdx !== -1 ? path.slice(0, qmIdx) : path;
     // The daemon decodes the path before routing, so deny any escape (#53).

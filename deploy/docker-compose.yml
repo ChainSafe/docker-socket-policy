@@ -16,14 +16,33 @@ services:
       - --config-dir=/etc/docker-socket-policy/services
       - --log-file=/tmp/docker-socket-policy.log
 
+  # The same proxy with --readonly (#75), on its own socket in the shared volume.
+  proxy-readonly:
+    build:
+      context: ../${IMPL:-go}
+      dockerfile: Dockerfile
+    user: "0:0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config:/etc/docker-socket-policy/services:ro
+      - proxy-sock:/sock
+    command:
+      - --docker-host=/var/run/docker.sock
+      - --listen-socket=/sock/readonly.sock
+      - --config-dir=/etc/docker-socket-policy/services
+      - --log-file=/tmp/docker-socket-policy-readonly.log
+      - --readonly
+
   test:
     build:
       context: .
       dockerfile: Dockerfile.test
     depends_on:
       - proxy
+      - proxy-readonly
     environment:
       PROXY_SOCK: /sock/proxy.sock
+      PROXY_RO_SOCK: /sock/readonly.sock
       # Hostname the proxy would have been reachable on when it still had a
       # TCP listener, so the suite can assert that it no longer is.
       PROXY_HOST: proxy

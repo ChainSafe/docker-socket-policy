@@ -36,6 +36,12 @@
 // the fix: a path with `//` in it is denied, for every method. A single
 // trailing slash, as in `/containers/`, is not interior.
 //
+// READONLY = true models `--readonly` (#75): every request whose method is
+// not GET or HEAD is denied, for every path, before any other check.
+// false models the proxy without the flag. Before #75 the flag only reached
+// the middleware chain, which runs on the create route alone; that was
+// handler wiring, not routing, so no instance models it.
+//
 // No instance models Go before #53. Go decoded before routing, which is
 // route(m, decodePath(segs)); with this table that agrees with the daemon
 // by construction, so the property cannot express Go's risk: decoding that
@@ -46,6 +52,7 @@ module router_model {
   const ALLOW_EMPTY_NAME: bool
   const ALLOW_PERCENT: bool
   const ALLOW_EMPTY_INTERIOR: bool
+  const READONLY: bool
 
   // ─── Daemon decoding ────────────────────────────────────────────────
 
@@ -116,13 +123,15 @@ module router_model {
   pure def isDenied(outcome: str): bool =
     outcome == "deny" or outcome == "denyExec"
 
-  // The percent check (#53) comes first, then the empty interior segment
-  // check (#55). The exec check (#49) follows, before
+  // The read-only check (#75) comes first, then the percent check (#53),
+  // then the empty interior segment check (#55). The exec check (#49)
+  // follows, before
   // the create route, the lifecycle branch and the GET passthrough, so it
   // denies every method. POST /containers/create matches only the exact
   // segments; a longer path falls through.
   pure def route(method: str, segs: List[str]): str =
-    if (not(ALLOW_PERCENT) and hasEncodedSeg(segs)) "deny"
+    if (READONLY and not(method == "GET" or method == "HEAD")) "deny"
+    else if (not(ALLOW_PERCENT) and hasEncodedSeg(segs)) "deny"
     else if (not(ALLOW_EMPTY_INTERIOR) and hasEmptyInterior(segs)) "deny"
     else if (isExecPath(segs)) "denyExec"
     else if (method == "POST" and segs == ["containers", "create"]) "routeCreate"
@@ -140,7 +149,7 @@ module router_model {
   // ─── Path universe ──────────────────────────────────────────────────
 
   pure val WORDS = Set(
-    "containers", "", "json", "create", "exec", "mycontainer", "beacon", "start",
+    "containers", "", "json", "create", "exec", "mycontainer", "beacon", "start", "stop",
     "%2F", "%2f", "%6A%73%6F%6E", "beacon%2Fstart",
     "exec-runner", "abc", "extra",
   )
@@ -212,13 +221,24 @@ module router_model {
       isExecPath(segs.select(s => s != "")) implies isDenied(route(m, segs))
     ))
 
+  // Every request that is not GET or HEAD is denied, for every path (#75).
+  // The read-only claim: it holds only on `router_readonly`. It does not
+  // mention READONLY, so that the instance with the flag off fails it
+  // rather than passing it vacuously.
+  pure val readonlyAllowsOnlyReads: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      not(m == "GET" or m == "HEAD") implies isDenied(route(m, segs))
+    ))
+
   // ─── Tests: one run per table row ───────────────────────────────────
   //
   // Rows whose outcome depends on none of ALLOW_EMPTY_NAME, ALLOW_PERCENT
-  // and ALLOW_EMPTY_INTERIOR run on every instance. The rows that do and the
+  // and ALLOW_EMPTY_INTERIOR run on every READONLY = false instance. The rows
+  // that do and the
   // property tests (soundTest, percentSoundTest, execSoundTest,
   // execPrefixSoundTest, createExactSoundTest, emptyInteriorSoundTest) live
-  // in `router`.
+  // in `router`. `router_readonly` runs only its own `readonly*` tests
+  // (`--match`): with READONLY = true the write rows here are denied.
 
   run emptyNameGetAllowedTest =
     assert(route("GET", ["containers", ""]) == "allowRead")
@@ -277,7 +297,7 @@ module router_model {
 // not a name, and a percent-encoded path or one with an empty interior
 // segment is denied.
 module router {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false).*
 
   run emptyNameDeleteDeniedTest =
     assert(route("DELETE", ["containers", ""]) == "deny")
@@ -344,7 +364,7 @@ module router {
 // is off: with it on, `/containers//start` would be denied before it reached
 // the name branch, and the instance could not show #48.
 module router_pre48 {
-  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true).*
+  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false).*
 
   run pre48UnsoundTest =
     assert(and {
@@ -358,7 +378,7 @@ module router_pre48 {
 // encoded name such as `%2F` counted as an unknown container and the
 // request was forwarded. The daemon decodes it and reads a different path.
 module router_pre53 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true, ALLOW_EMPTY_INTERIOR = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true, ALLOW_EMPTY_INTERIOR = false, READONLY = false).*
 
   run pre53UnsoundTest =
     assert(and {
@@ -374,7 +394,7 @@ module router_pre53 {
 // check missed it and the GET passthrough forwarded it. The daemon answers
 // with a 301 to the clean path, so nothing leaked, but the router allowed it.
 module router_pre55 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false).*
 
   run pre55UnsoundTest =
     assert(and {
@@ -382,4 +402,29 @@ module router_pre55 {
       not(emptySegmentsHideNoExec),
       route("GET", ["", "exec", "abc"]) == "allowRead",
     })
+}
+
+// `--readonly` (#75): as `router`, plus the read-only check. Run with
+// `--match='^readonly.*Test$'`; the shared write rows in router_model assume the
+// flag is off.
+module router_readonly {
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = true).*
+
+  run readonlySoundTest =
+    assert(readonlyAllowsOnlyReads)
+
+  run readonlyLifecycleStopDeniedTest =
+    assert(route("POST", ["containers", "mycontainer", "stop"]) == "deny")
+
+  run readonlyDeleteDeniedTest =
+    assert(route("DELETE", ["containers", "mycontainer"]) == "deny")
+
+  run readonlyCreateDeniedTest =
+    assert(route("POST", ["containers", "create"]) == "deny")
+
+  run readonlyGetAllowedTest =
+    assert(route("GET", ["containers", "json"]) == "allowRead")
+
+  run readonlyHeadAllowedTest =
+    assert(route("HEAD", ["containers", "mycontainer"]) == "allowRead")
 }

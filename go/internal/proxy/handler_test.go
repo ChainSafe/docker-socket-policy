@@ -67,7 +67,7 @@ allowed_image_prefixes:
 	t.Cleanup(func() { auditLog.Close() })
 
 	router := NewRouter(policyManager)
-	chain := middleware.NewChain(false)
+	chain := middleware.NewChain()
 
 	return NewHandler(router, chain, auditLog, transport)
 }
@@ -175,7 +175,7 @@ func TestHandlerAuditURIIsRequestTarget(t *testing.T) {
 		t.Fatalf("NewLogger failed: %v", err)
 	}
 	defer auditLog.Close()
-	h := NewHandler(NewRouter(policyManager), middleware.NewChain(false), auditLog, &recorderTransport{})
+	h := NewHandler(NewRouter(policyManager), middleware.NewChain(), auditLog, &recorderTransport{})
 
 	targets := []struct{ method, target, decision string }{
 		{"GET", "/containers/json?all=1", "ALLOW"},
@@ -207,6 +207,28 @@ func TestHandlerAuditURIIsRequestTarget(t *testing.T) {
 		if entry.URI != tc.target {
 			t.Errorf("%s %s: audit uri = %q, want %q", tc.method, tc.target, entry.URI, tc.target)
 		}
+	}
+}
+
+// #75: --readonly is enforced in the router, so a delete never reaches the
+// daemon. Before #75 the flag only reached the chain, which runs on create.
+func TestHandler_ReadonlyDeniesDelete(t *testing.T) {
+	rec := &recorderTransport{}
+	h := newTestHandler(t, nil, rec)
+	h.router = h.router.WithReadonly(true)
+
+	req := httptest.NewRequest("DELETE", "/containers/mycontainer", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != "read-only mode: DELETE requests are not allowed" {
+		t.Fatalf("deny reason = %q", got)
+	}
+	if rec.lastRequest != nil {
+		t.Fatal("expected no forward in read-only mode")
 	}
 }
 

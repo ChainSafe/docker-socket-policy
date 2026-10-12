@@ -2,8 +2,9 @@
 # Integration tests for docker-socket-policy.
 # Sends HTTP requests directly to the proxy's Docker API and checks status codes,
 # and the deny message on every expected proxy 403.
-# The proxy's ReadonlyGate, RegistryGate, MountSourceGate, EnvFileGate,
-# CmdGate, and ContainerConfigMutator are all exercised; exec is denied by the router.
+# The proxy's RegistryGate, MountSourceGate, EnvFileGate, CmdGate, and
+# ContainerConfigMutator are all exercised; exec is denied by the router, and so
+# is every write on a second proxy run with --readonly (#75).
 
 set -e
 
@@ -29,24 +30,31 @@ fi
 # instead of failing it — and the readiness counter below would never advance.
 TIMEOUT="--max-time 10 --connect-timeout 2"
 
-# Wait for the proxy to create and serve its socket.
-echo "Waiting for proxy at ${PROXY_SOCK}..."
-i=0
-while [ $i -lt 30 ]; do
-  if curl -sf $TIMEOUT --unix-socket "$PROXY_SOCK" "$PROXY/_ping" >/dev/null 2>&1; then
-    echo "Proxy ready."
-    break
+# The --readonly proxy (#75) serves the same config on its own socket.
+PROXY_RO_SOCK="${PROXY_RO_SOCK:-/sock/readonly.sock}"
+
+# Wait for a proxy to create and serve its socket.
+wait_for_sock() {
+  echo "Waiting for proxy at $1..."
+  i=0
+  while [ $i -lt 30 ]; do
+    if curl -sf $TIMEOUT --unix-socket "$1" "$PROXY/_ping" >/dev/null 2>&1; then
+      echo "Proxy ready."
+      break
+    fi
+    printf "."
+    sleep 1
+    i=$((i + 1))
+  done
+  if [ $i -eq 30 ]; then
+    echo ""
+    echo "ERROR: Proxy at $1 failed to respond within 30s"
+    exit 1
   fi
-  printf "."
-  sleep 1
-  i=$((i + 1))
-done
-if [ $i -eq 30 ]; then
   echo ""
-  echo "ERROR: Proxy failed to respond within 30s"
-  exit 1
-fi
-echo ""
+}
+wait_for_sock "$PROXY_SOCK"
+wait_for_sock "$PROXY_RO_SOCK"
 
 # Helpers: report the HTTP status code of a request sent over the Unix socket.
 # curl exits non-zero when it cannot connect at all, which under `set -e` would
@@ -439,6 +447,34 @@ S=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
 S="${S:-000}"
 check_denied "GET http://docker/exec/*/json -> 403 (absolute-form target)" "$S" "$BODY" \
   'exec is not allowed' 'empty path segment not allowed'
+
+# ─── Read-only mode (#75) ────────────────────────────────
+
+# The same config behind --readonly. Every request whose method is not GET or
+# HEAD is denied by the router. Before #75 the flag only reached the gate
+# chain, which runs on create alone, so these reached the daemon (a 404 for
+# the unknown container below, i.e. a leak, not a proxy 403).
+echo ""
+echo "--- Read-only mode ---"
+
+# The request helpers read PROXY_SOCK, so this switches every check below to
+# the read-only proxy. Keep this section last.
+PROXY_SOCK="$PROXY_RO_SOCK"
+
+S=$(get_status "$PROXY/_ping")
+check "GET /_ping -> 200 (read-only)" "200" "$S"
+
+S=$(post_empty "$PROXY/containers/no-such-container/stop")
+check_denied "POST /containers/*/stop -> 403 (read-only)" "$S" "$BODY" 'read-only mode: POST requests are not allowed'
+
+S=$(delete_status "$PROXY/containers/no-such-container")
+check_denied "DELETE /containers/* -> 403 (read-only)" "$S" "$BODY" 'read-only mode: DELETE requests are not allowed'
+
+S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/containers/create")
+check_denied "POST /containers/create with allowed image -> 403 (read-only)" "$S" "$BODY" 'read-only mode: POST requests are not allowed'
+
+S=$(post_empty "$PROXY/images/create?fromImage=chainsafe/lodestar&tag=beacon")
+check_denied "POST /images/create?fromImage=chainsafe/lodestar -> 403 (read-only)" "$S" "$BODY" 'read-only mode: POST requests are not allowed'
 
 # ─── Summary ──────────────────────────────────────────
 

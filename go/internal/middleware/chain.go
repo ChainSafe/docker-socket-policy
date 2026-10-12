@@ -26,12 +26,9 @@ type Chain struct {
 	mutators []Mutator
 }
 
-func NewChain(readonly bool) *Chain {
+func NewChain() *Chain {
 	c := &Chain{}
 
-	if readonly {
-		c.gates = append(c.gates, &ReadonlyGate{})
-	}
 	c.gates = append(c.gates, &RegistryGate{})
 	c.gates = append(c.gates, &MountSourceGate{})
 	c.gates = append(c.gates, &EnvFileGate{})

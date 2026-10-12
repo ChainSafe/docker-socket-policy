@@ -60,7 +60,7 @@ function makeEnv(configFiles: Record<string, string>) {
 function newHandler(dir: string) {
   const manager = new Manager(dir);
   const router = new Router(manager);
-  const chain = new Chain(false);
+  const chain = new Chain();
   const audit = new AuditLogger(join(dir, "audit.log"));
   const transport = new FakeTransport();
   return { handler: new Handler(router, chain, audit, transport), transport };
@@ -93,6 +93,20 @@ describe("Handler", () => {
     await handler.handle(makeRequest("POST", "/build"), res);
     assert.equal(recorder.statusCode, 403);
     assert.ok(recorder.body.includes("build"));
+  });
+
+  // #75: --readonly is enforced in the router, so a delete never reaches the
+  // daemon. Before #75 the flag only reached the chain, which runs on create.
+  it("denies a delete in read-only mode without forwarding it", async () => {
+    const dir = makeEnv(defaultConfig);
+    const router = new Router(new Manager(dir)).withReadonly(true);
+    const transport = new FakeTransport();
+    const handler = new Handler(router, new Chain(), new AuditLogger(join(dir, "audit.log")), transport);
+    const { res, recorder } = makeResponse();
+    await handler.handle(makeRequest("DELETE", "/containers/mycontainer"), res);
+    assert.equal(recorder.statusCode, 403);
+    assert.equal(recorder.body, "read-only mode: DELETE requests are not allowed");
+    assert.equal(transport.lastRequest, undefined);
   });
 
   it("forwards a valid container create with the modified body", async () => {

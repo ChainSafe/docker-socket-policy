@@ -441,4 +441,65 @@ describe("Router", () => {
     }
     assert.deepEqual(mismatches, []);
   });
+
+  // Cross-language parity guard for #75. With --readonly, every request whose
+  // method is not GET or HEAD is denied first in the router, for every path.
+  // Before #75 the flag only reached the middleware chain, which runs on the
+  // create route alone, so lifecycle POSTs, DELETE /containers/{name} and
+  // image pulls were forwarded. Rows mirror the readonly* runs in
+  // spec/router.qnt.
+  it("denies every write in read-only mode", () => {
+    writeFileSync(
+      join(tmpDir, "beacon.yaml"),
+      "service_name: beacon\nallowed_image_prefixes:\n  - chainsafe/lodestar\n",
+    );
+    const m = new Manager(tmpDir);
+    const ro = new Router(m).withReadonly(true);
+    const post = "read-only mode: POST requests are not allowed";
+    const createBody = { Image: "chainsafe/lodestar:latest" };
+    const pullBody = { fromImage: "chainsafe/lodestar", tag: "latest" };
+    const cases: [string, string, Record<string, unknown> | undefined, Action, string | undefined][] = [
+      // readonlyGetAllowedTest (#75)
+      ["GET", "/containers/json", undefined, Action.Allow, undefined],
+      // readonlyHeadAllowedTest (#75)
+      ["HEAD", "/containers/mycontainer", undefined, Action.Allow, undefined],
+      // #75: the read-only endpoints stay allowed.
+      ["GET", "/_ping", undefined, Action.Allow, undefined],
+      // readonlyLifecycleStopDeniedTest (#75)
+      ["POST", "/containers/mycontainer/stop", undefined, Action.Deny, post],
+      // #75: the other lifecycle actions too.
+      ["POST", "/containers/mycontainer/start", undefined, Action.Deny, post],
+      // readonlyDeleteDeniedTest (#75)
+      ["DELETE", "/containers/mycontainer", undefined, Action.Deny, "read-only mode: DELETE requests are not allowed"],
+      // #75: an image pull of an allowed image.
+      ["POST", "/images/create?fromImage=chainsafe/lodestar&tag=latest", pullBody, Action.Deny, post],
+      // readonlyCreateDeniedTest (#75): an allowed image, so only the flag decides.
+      ["POST", "/containers/create", createBody, Action.Deny, post],
+      // #75: methods outside the spec's universe.
+      [
+        "PUT",
+        "/containers/mycontainer/archive",
+        undefined,
+        Action.Deny,
+        "read-only mode: PUT requests are not allowed",
+      ],
+      // #75: the check runs before the API-version strip.
+      ["POST", "/v1.45/containers/mycontainer/stop", undefined, Action.Deny, post],
+    ];
+    const mismatches: string[] = [];
+    for (const [method, path, body, want, wantMsg] of cases) {
+      const r = ro.route(method, path, body);
+      if (r.action !== want || r.denyMsg !== wantMsg) {
+        mismatches.push(
+          `${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}/${wantMsg ?? "-"}`,
+        );
+      }
+    }
+    // #75: the flag gates the rule; without it a lifecycle POST is routed as before.
+    const off = new Router(m).route("POST", "/containers/mycontainer/stop");
+    if (off.denyMsg === post) {
+      mismatches.push("POST /containers/mycontainer/stop without --readonly: got the read-only deny");
+    }
+    assert.deepEqual(mismatches, []);
+  });
 });

@@ -1,14 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import {
-  Chain,
-  ReadonlyGate,
-  RegistryGate,
-  MountSourceGate,
-  EnvFileGate,
-  CmdGate,
-  ContainerConfigMutator,
-} from "./middleware.js";
+import { Chain, RegistryGate, MountSourceGate, EnvFileGate, CmdGate, ContainerConfigMutator } from "./middleware.js";
 import type { Policy } from "./policy.js";
 
 function makePolicy(overrides: Partial<Policy> = {}): Policy {
@@ -18,22 +10,6 @@ function makePolicy(overrides: Partial<Policy> = {}): Policy {
     ...overrides,
   };
 }
-
-describe("ReadonlyGate", () => {
-  const gate = new ReadonlyGate();
-
-  for (const method of ["POST", "PUT", "DELETE", "PATCH"]) {
-    it(`denies ${method} requests`, () => {
-      const result = gate.check(method, "/containers/create", makePolicy(), {});
-      assert.notEqual(result, null);
-      assert.ok(result?.includes("read-only"));
-    });
-  }
-
-  it("allows GET requests", () => {
-    assert.equal(gate.check("GET", "/containers/json", makePolicy(), {}), null);
-  });
-});
 
 describe("RegistryGate", () => {
   const gate = new RegistryGate();
@@ -280,18 +256,11 @@ describe("ContainerConfigMutator", () => {
 
 describe("Chain", () => {
   it("allows valid create container request", () => {
-    const chain = new Chain(false);
+    const chain = new Chain();
     const policy = makePolicy({ allowed_cli_flags: ["--port"] });
     const body: Record<string, unknown> = { Image: "nginx:latest" };
     const result = chain.execute("POST", "/containers/create", policy, body);
     assert.ok(result.allowed);
     assert.ok(result.modifiedBody);
-  });
-
-  it("denies readonly mode write request", () => {
-    const chain = new Chain(true);
-    const result = chain.execute("POST", "/containers/create", makePolicy(), { Image: "nginx:latest" });
-    assert.equal(result.allowed, false);
-    assert.ok(result.reason.includes("read-only"));
   });
 });
