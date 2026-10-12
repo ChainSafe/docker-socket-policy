@@ -592,4 +592,50 @@ describe("Router", () => {
     }
     assert.deepEqual(mismatches, []);
   });
+
+  // Cross-language parity guard for #70. A path with a segment that is
+  // exactly . or .. is denied for every method, right after the // check and
+  // before the API-version strip. Before #70 GET /./exec/<id>/json had a
+  // first segment of ".", so the exec check missed it and the GET passthrough
+  // forwarded it. Rows mirror the dot* runs in spec/router.qnt.
+  it("denies dot path segments", () => {
+    const dot = "dot path segment not allowed";
+    const cases: [string, string, Action, string | undefined][] = [
+      // dotLeadingExecGetDeniedTest (#70): the leading . hid the exec namespace.
+      ["GET", "/./exec/abc/json", Action.Deny, dot],
+      // dotDotExecGetDeniedTest (#70)
+      ["GET", "/x/../exec/abc/json", Action.Deny, dot],
+      // dotInContainerPathDeniedTest (#70)
+      ["GET", "/containers/x/./exec", Action.Deny, dot],
+      // #70: .. climbing out of the container path.
+      ["GET", "/containers/x/../../exec/abc/json", Action.Deny, dot],
+      // #70: the check runs before the version strip.
+      ["GET", "/v1.45/./_ping", Action.Deny, dot],
+      // #70: every method.
+      ["DELETE", "/containers/..", Action.Deny, dot],
+      ["POST", "/containers/x/./start", Action.Deny, dot],
+      // #70: the dot hid the attach deny too.
+      ["GET", "/containers/./x/attach/ws", Action.Deny, dot],
+      // #70 control: names with dots are names.
+      ["GET", "/containers/.hidden/json", Action.Allow, undefined],
+      ["GET", "/containers/a.b/json", Action.Allow, undefined],
+      ["GET", "/containers/.../json", Action.Allow, undefined],
+      // #70: the // check runs first.
+      ["GET", "//./_ping", Action.Deny, "empty path segment not allowed"],
+      // #70: an encoded dot is denied by the percent check (#53).
+      ["GET", "/containers/%2e/json", Action.Deny, "percent-encoded path not allowed"],
+      // #70, TS-only: the TS router receives the raw target; the query is not inspected.
+      ["GET", "/containers/json?filters=a/./b", Action.Allow, undefined],
+    ];
+    const mismatches: string[] = [];
+    for (const [method, path, want, wantMsg] of cases) {
+      const r = router.route(method, path);
+      if (r.action !== want || r.denyMsg !== wantMsg) {
+        mismatches.push(
+          `${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}/${wantMsg ?? "-"}`,
+        );
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
 });

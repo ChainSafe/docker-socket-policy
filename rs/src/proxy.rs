@@ -1045,6 +1045,64 @@ mod tests {
         assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
 
+    /// Cross-language parity guard for #70. A path with a segment that is
+    /// exactly . or .. is denied for every method, right after the // check
+    /// and before the API-version strip. Before #70 GET /./exec/<id>/json
+    /// had a first segment of ".", so the exec check missed it and the GET
+    /// passthrough forwarded it. Rows mirror the dot* runs in
+    /// spec/router.qnt.
+    #[test]
+    fn test_route_dot_segments() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let dot = Some("dot path segment not allowed");
+        let cases = [
+            // dotLeadingExecGetDeniedTest (#70): the leading . hid the exec namespace.
+            ("GET", "/./exec/abc/json", Action::Deny, dot),
+            // dotDotExecGetDeniedTest (#70)
+            ("GET", "/x/../exec/abc/json", Action::Deny, dot),
+            // dotInContainerPathDeniedTest (#70)
+            ("GET", "/containers/x/./exec", Action::Deny, dot),
+            // #70: .. climbing out of the container path.
+            ("GET", "/containers/x/../../exec/abc/json", Action::Deny, dot),
+            // #70: the check runs before the version strip.
+            ("GET", "/v1.45/./_ping", Action::Deny, dot),
+            // #70: every method.
+            ("DELETE", "/containers/..", Action::Deny, dot),
+            ("POST", "/containers/x/./start", Action::Deny, dot),
+            // #70: the dot hid the attach deny too.
+            ("GET", "/containers/./x/attach/ws", Action::Deny, dot),
+            // #70 control: names with dots are names.
+            ("GET", "/containers/.hidden/json", Action::Allow, None),
+            ("GET", "/containers/a.b/json", Action::Allow, None),
+            ("GET", "/containers/.../json", Action::Allow, None),
+            // #70: the // check runs first.
+            ("GET", "//./_ping", Action::Deny, Some("empty path segment not allowed")),
+            // #70: an encoded dot is denied by the percent check (#53).
+            (
+                "GET",
+                "/containers/%2e/json",
+                Action::Deny,
+                Some("percent-encoded path not allowed"),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (method, path, want, want_msg) in cases {
+            let got = router.route(method, path, None);
+            if got.action != want || got.deny_msg.as_deref() != want_msg {
+                mismatches.push(format!(
+                    "{} {}: got {:?}/{}, want {:?}/{}",
+                    method,
+                    path,
+                    got.action,
+                    got.deny_msg.as_deref().unwrap_or("-"),
+                    want,
+                    want_msg.unwrap_or("-")
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
+    }
+
     #[test]
     fn test_extract_container_name_skips_empty_segment() {
         for path in ["/containers/", "/containers//start"] {
