@@ -160,11 +160,9 @@ module router_model {
     outcome == "deny" or outcome == "denyExec"
 
   // The read-only check (#75) comes first, then the percent check (#53),
-  // then the empty interior segment check (#55), then the dot segment
-  // check (#70). Before #78 the read
-  // endpoints were allowed next, for every method. The exec check (#49)
-  // and the attach check (#76) follow, before
-  // the create route, the lifecycle branch and the GET passthrough, so it
+  // then the empty interior segment check (#55), then the dot segment check
+  // (#70). Before #78 the read endpoints were allowed next, for every method.
+  // The exec check (#49) and the attach check (#76) follow, before the create route, the lifecycle branch and the GET passthrough, so it
   // denies every method. POST /containers/create matches only the exact
   // segments; a longer path falls through.
   pure def route(method: str, segs: List[str]): str =
@@ -619,5 +617,7 @@ module router_pre70 {
       not(dotSegmentsDenied),
       not(dotSegmentsHideNoExec),
       route("GET", [".", "exec", "abc"]) == "allowRead",
+      // The attach half of dotSegmentsHideNoExec, witnessed on its own.
+      route("GET", [".", "containers", "attach"]) == "allowRead",
     })
 }

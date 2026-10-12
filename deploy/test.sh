@@ -516,9 +516,9 @@ check "GET /events (bounded) -> 200" "200" "$S"
 # the clean path. --path-as-is stops curl from resolving the dots.
 dot_get() {
   : >"$BODY"
-  s=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --path-as-is --unix-socket "$PROXY_SOCK" \
+  out=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --path-as-is --unix-socket "$PROXY_SOCK" \
     "$1" 2>/dev/null || true)
-  echo "${s:-000}"
+  echo "${out:-000}"
 }
 
 S=$(dot_get "$PROXY/./exec/0000000000000000000000000000000000000000000000000000000000000000/json")
