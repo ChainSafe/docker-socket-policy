@@ -49,6 +49,7 @@ export class Router {
     // Denied endpoints
     if (path.startsWith("/auth")) return { action: Action.Deny, denyMsg: "auth endpoint is not allowed" };
     if (isExecPath(path)) return { action: Action.Deny, denyMsg: "exec is not allowed" };
+    if (isAttachPath(path)) return { action: Action.Deny, denyMsg: "attach is not allowed" };
     if (path.startsWith("/build")) return { action: Action.Deny, denyMsg: "build is not allowed" };
     if (path.startsWith("/commit")) return { action: Action.Deny, denyMsg: "commit is not allowed" };
 
@@ -143,6 +144,13 @@ function stripAPIVersion(path: string): string {
 function isExecPath(path: string): boolean {
   const [first, ...rest] = path.replace(/^\//, "").split("/");
   return first === "exec" || (first === "containers" && rest.includes("exec"));
+}
+
+// Attach is matched on whole segments after /containers, so a name like
+// attach-runner is not attach (#76).
+function isAttachPath(path: string): boolean {
+  const [first, ...rest] = path.replace(/^\//, "").split("/");
+  return first === "containers" && rest.includes("attach");
 }
 
 function extractContainerName(path: string): string | undefined {

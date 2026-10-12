@@ -18,6 +18,18 @@ export class Handler {
     const method = req.method ?? "GET";
     const path = req.url ?? "/";
 
+    // Refuse protocol upgrades before anything else: forwarding one would
+    // hand the caller a raw stream to the daemon (#76). The server registers
+    // no "upgrade" listener, so Node delivers these requests here.
+    if (isUpgradeRequest(req)) {
+      const msg = "protocol upgrade not allowed";
+      console.warn(`[${requestId}] DENIED ${method} ${path}: ${msg}`);
+      this.audit.deny(method, path, msg);
+      res.writeHead(403);
+      res.end(msg);
+      return;
+    }
+
     const bodyBytes = await readBody(req);
     let bodyJSON: Record<string, unknown> | undefined;
 
@@ -60,6 +72,13 @@ export class Handler {
     this.audit.allow(method, path);
     await this.transport.forward(req, res, bodyBytes.length > 0 ? bodyBytes : undefined);
   }
+}
+
+// An Upgrade header, or a Connection header that lists the upgrade token.
+function isUpgradeRequest(req: IncomingMessage): boolean {
+  if (req.headers.upgrade !== undefined) return true;
+  const connection = req.headers.connection ?? "";
+  return connection.split(",").some((tok) => tok.trim().toLowerCase() === "upgrade");
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {

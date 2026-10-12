@@ -76,6 +76,9 @@ impl Router {
         if is_exec_path(path) {
             return deny("exec is not allowed");
         }
+        if is_attach_path(path) {
+            return deny("attach is not allowed");
+        }
         if path.starts_with("/build") {
             return deny("build is not allowed");
         }
@@ -250,6 +253,13 @@ fn is_exec_path(path: &str) -> bool {
         Some("containers") => segs.any(|s| s == "exec"),
         _ => false,
     }
+}
+
+// Attach is matched on whole segments after /containers, so a name like
+// attach-runner is not attach (#76).
+fn is_attach_path(path: &str) -> bool {
+    let mut segs = path.strip_prefix('/').unwrap_or(path).split('/');
+    segs.next() == Some("containers") && segs.any(|s| s == "attach")
 }
 
 fn extract_container_name(path: &str) -> Option<&str> {

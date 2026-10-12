@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/ChainSafe/docker-socket-policy/go/internal/audit"
 	"github.com/ChainSafe/docker-socket-policy/go/internal/middleware"
@@ -32,6 +33,16 @@ func NewHandler(router *Router, chain *middleware.Chain, auditLog *audit.Logger,
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Refuse protocol upgrades before anything else: the reverse proxy would
+	// relay a 101 and hand the caller a raw stream to the daemon (#76).
+	if isUpgradeRequest(r.Header) {
+		const msg = "protocol upgrade not allowed"
+		slog.Warn("denied", "method", r.Method, "path", r.URL.EscapedPath(), "reason", msg)
+		h.auditLog.Deny(r.Method, r.RequestURI, msg, map[string]interface{}{"method": r.Method, "path": r.URL.EscapedPath()})
+		http.Error(w, msg, http.StatusForbidden)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		slog.Warn("failed to read request body", "error", err)
@@ -95,4 +106,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.auditLog.Allow(r.Method, r.RequestURI, "request allowed", extra)
 
 	h.transport.ServeHTTP(w, r)
+}
+
+// isUpgradeRequest reports an Upgrade header, or a Connection header that
+// lists the upgrade token.
+func isUpgradeRequest(h http.Header) bool {
+	if _, ok := h["Upgrade"]; ok {
+		return true
+	}
+	for _, v := range h.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }

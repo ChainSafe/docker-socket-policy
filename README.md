@@ -12,7 +12,7 @@ Key features:
 - **Policy-driven**: Per-service YAML policies, selected by image name, control images, volumes, flags, and env vars. The listening socket is the trust boundary: every caller of a socket can use every policy behind it (see [Trust model](#trust-model))
 - **Middleware pipeline**: 4 validation gates + 1 config mutator chain
 - **Default-deny router**: Only explicitly allowed endpoints pass through
-- **Formally verified**: [Quint](https://quint-lang.org/) specification: 9 request-handling invariants, 6 listener invariants, and router properties for `--readonly`, percent-encoded paths, empty segments, exec and the container lifecycle
+- **Formally verified**: [Quint](https://quint-lang.org/) specification: 9 request-handling invariants, 6 listener invariants, and router properties for `--readonly`, percent-encoded paths, empty segments, exec, attach and the container lifecycle
 - **Audit logging**: JSON-structured logs for all requests and decisions
 - **Three implementations**: [Go](go/), [Rust](rs/), [TypeScript](ts/) — equal peer languages
 - **Minimal dependencies**: Zero external deps for Go, crate-based for Rust, npm for TypeScript
@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 108 unit + 50 integration + 15 socket | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 140 unit + 50 integration + 15 socket | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 157 unit (1 skipped) + 50 integration + 15 socket | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 110 unit + 53 integration + 15 socket | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 142 unit + 53 integration + 15 socket | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 160 unit (1 skipped) + 53 integration + 15 socket | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -198,13 +198,14 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | EnvFileGate | Gate | Strips `Env` field from create body; env must come from locked `env_file` |
 | CmdGate | Gate | Validates each CLI flag in `Cmd` array against allowlist + denylist |
 
-The chain runs only on container create. `--readonly` is not a gate: the router denies every request that is not `GET` or `HEAD`, on every path, before any other check ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)). A websocket attach (`GET /containers/{name}/attach/ws` with `Upgrade`) is a `GET` and is not denied yet; the Go proxy lets it write to a container's stdin ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)).
+The chain runs only on container create. `--readonly` is not a gate: the router denies every request that is not `GET` or `HEAD`, on every path, before any other check ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)). Attach is denied by the router for every method, so a websocket attach (`GET /containers/{name}/attach/ws`) cannot reach a container's stdin, with or without `--readonly` ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)).
 
 ## Endpoint Access
 
 | HTTP Method | Path | Action |
 |-------------|------|--------|
-| Not GET/HEAD | Any (with `--readonly`) | **DENIED** (checked first) |
+| Any | Request with an `Upgrade` header, or `Connection: upgrade` | **DENIED** (checked before routing) |
+| Not GET/HEAD | Any (with `--readonly`) | **DENIED** (checked first in the router) |
 | Any | Path containing `%` | **DENIED** (see below) |
 | Any | Path containing `//` | **DENIED** |
 | POST | `/containers/create` | Validated by middleware chain |
@@ -212,6 +213,7 @@ The chain runs only on container create. `--readonly` is not a gate: the router 
 | DELETE | `/containers/{name}` | Allowed on known containers |
 | Any | `/containers/…/exec` (an `exec` segment anywhere under `/containers`) | **DENIED** |
 | Any | `/exec/*` | **DENIED** |
+| Any | `/containers/{name}/attach…` (an `attach` segment anywhere under `/containers`) | **DENIED** |
 | POST | `/containers/{name}/rename\|update` | **DENIED** |
 | POST | `/images/create` | Validated by registry gate |
 | POST | `/auth` | **DENIED** |
@@ -223,6 +225,8 @@ The chain runs only on container create. `--readonly` is not a gate: the router 
 Any request whose path contains a percent-encoded byte (`%`) is denied with 403 for every method, GET and HEAD included, because the daemon decodes the path before routing. The query string is not inspected, so filters such as `docker ps --filter …` still work. The Go implementation also denies paths that contain raw characters it must re-encode, such as non-ASCII bytes or `{`; the Docker CLI never sends these. A consequence is that networks whose names need percent-encoding (for example a space or `%`) cannot be inspected by name through the proxy; inspecting them by ID still works, and other network operations are denied regardless.
 
 Exec is matched on whole path segments, so containers named like `exec-runner` work normally, and exec inspect (`GET /exec/{id}/json`) is denied too. A path with an empty segment (`//`, as in `//exec/{id}/json`) is denied for every method, so an empty segment cannot hide the exec namespace; a single trailing slash is fine, and `//` in the query string is not inspected. Absolute-form request targets (`GET http://host/…`) never reach exec: Go and Rust route them on the parsed path, so exec is denied and other paths are routed as usual, while the TypeScript proxy sees the raw target and denies every absolute-form request (its `//` after the scheme is an empty segment). The Docker CLI never sends absolute form.
+
+Attach is matched the same way: an `attach` segment under `/containers` is denied for every method, so `attach-runner` is an ordinary name, while a container literally named `attach` cannot be reached by name. Protocol upgrades are refused outright: any request with an `Upgrade` header, or a `Connection` header that lists `upgrade`, gets 403 `protocol upgrade not allowed` before it is routed, whatever its path ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)). Forwarding one would hand the caller a raw stream to the daemon. Every Docker endpoint that upgrades (attach, exec start, the build session) is denied anyway; the refusal keeps any path the router allows from becoming one.
 
 ## Configuration
 
@@ -441,7 +445,7 @@ not at the socket.
 
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for writes under `--readonly` ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)), percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)) and exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 8 properties are checked exhaustively over the methods `GET`, `HEAD`, `POST`, `DELETE` and every path of 1 to 3 segments over the model's word set; exec is denied by the router, not by a middleware gate.
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for writes under `--readonly` ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)), percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)), exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)) and attach ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 9 properties are checked exhaustively over the methods `GET`, `HEAD`, `POST`, `DELETE` and every path of 1 to 3 segments over the model's word set; exec is denied by the router, not by a middleware gate.
 
 The CI pipeline runs verification on every push and PR. A violation blocks the build.
 

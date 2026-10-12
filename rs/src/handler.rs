@@ -45,6 +45,18 @@ impl Handler {
         let headers = parts.headers.clone();
         let version = parts.version;
 
+        // Refuse protocol upgrades before anything else: forwarding one would
+        // hand the caller a raw stream to the daemon (#76).
+        if is_upgrade_request(&headers) {
+            let msg = "protocol upgrade not allowed";
+            warn!("denied {} {}: {}", method, path, msg);
+            self.audit.deny(&method, &target, msg);
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Full::new(Bytes::from(msg)))
+                .unwrap();
+        }
+
         let mut body_bytes = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(_) => {
@@ -124,6 +136,16 @@ impl Handler {
             }
         }
     }
+}
+
+/// An Upgrade header, or a Connection header that lists the upgrade token.
+fn is_upgrade_request(headers: &hyper::HeaderMap) -> bool {
+    headers.contains_key(header::UPGRADE)
+        || headers.get_all(header::CONNECTION).iter().any(|v| {
+            v.as_bytes()
+                .split(|&b| b == b',')
+                .any(|tok| tok.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
+        })
 }
 
 #[cfg(test)]
