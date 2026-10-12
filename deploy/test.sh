@@ -2,8 +2,9 @@
 # Integration tests for docker-socket-policy.
 # Sends HTTP requests directly to the proxy's Docker API and checks status codes,
 # and the deny message on every expected proxy 403.
-# The proxy's ReadonlyGate, RegistryGate, MountSourceGate, EnvFileGate,
-# CmdGate, and ContainerConfigMutator are all exercised; exec is denied by the router.
+# The proxy's RegistryGate, MountSourceGate, EnvFileGate, CmdGate, and
+# ContainerConfigMutator are all exercised; exec is denied by the router, and so
+# is every write on a second proxy run with --readonly (#75).
 
 set -e
 

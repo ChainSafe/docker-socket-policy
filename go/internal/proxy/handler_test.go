@@ -67,7 +67,7 @@ allowed_image_prefixes:
 	t.Cleanup(func() { auditLog.Close() })
 
 	router := NewRouter(policyManager)
-	chain := middleware.NewChain(false)
+	chain := middleware.NewChain()
 
 	return NewHandler(router, chain, auditLog, transport)
 }
@@ -175,7 +175,7 @@ func TestHandlerAuditURIIsRequestTarget(t *testing.T) {
 		t.Fatalf("NewLogger failed: %v", err)
 	}
 	defer auditLog.Close()
-	h := NewHandler(NewRouter(policyManager), middleware.NewChain(false), auditLog, &recorderTransport{})
+	h := NewHandler(NewRouter(policyManager), middleware.NewChain(), auditLog, &recorderTransport{})
 
 	targets := []struct{ method, target, decision string }{
 		{"GET", "/containers/json?all=1", "ALLOW"},

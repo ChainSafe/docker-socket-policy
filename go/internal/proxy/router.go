@@ -27,14 +27,26 @@ type RouteResult struct {
 }
 
 type Router struct {
-	manager *policy.Manager
+	manager  *policy.Manager
+	readonly bool
 }
 
 func NewRouter(manager *policy.Manager) *Router {
 	return &Router{manager: manager}
 }
 
+// WithReadonly sets read-only mode (--readonly) and returns the router.
+func (r *Router) WithReadonly(readonly bool) *Router {
+	r.readonly = readonly
+	return r
+}
+
 func (r *Router) Route(method, path string, body map[string]interface{}) *RouteResult {
+	// Read-only mode denies every write, for every path (#75).
+	if r.readonly && method != "GET" && method != "HEAD" {
+		return &RouteResult{Action: ActionDeny, DenyMsg: fmt.Sprintf("read-only mode: %s requests are not allowed", method)}
+	}
+
 	// The daemon decodes the path before routing, so deny any escape (#53).
 	if strings.Contains(path, "%") {
 		return &RouteResult{Action: ActionDeny, DenyMsg: "percent-encoded path not allowed"}

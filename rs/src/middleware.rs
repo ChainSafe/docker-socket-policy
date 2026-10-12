@@ -32,11 +32,8 @@ pub struct GateResult {
 }
 
 impl Chain {
-    pub fn new(readonly: bool) -> Self {
+    pub fn new() -> Self {
         let mut gates: Vec<Box<dyn Gate>> = Vec::new();
-        if readonly {
-            gates.push(Box::new(ReadonlyGate));
-        }
         gates.push(Box::new(RegistryGate));
         gates.push(Box::new(MountSourceGate));
         gates.push(Box::new(EnvFileGate));
@@ -83,22 +80,6 @@ fn charset_check(s: &str) -> bool {
     s.len() <= 256
         && s.chars()
             .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '=' | ':' | '/' | ',' | '-'))
-}
-
-pub struct ReadonlyGate;
-impl Gate for ReadonlyGate {
-    fn check(
-        &self,
-        method: &str,
-        _path: &str,
-        _policy: &Policy,
-        _body: &HashMap<String, serde_json::Value>,
-    ) -> std::result::Result<(), String> {
-        match method {
-            "POST" | "PUT" | "DELETE" | "PATCH" => Err(format!("read-only mode: {} requests are not allowed", method)),
-            _ => Ok(()),
-        }
-    }
 }
 
 pub struct RegistryGate;
@@ -373,40 +354,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_readonly_gate_allows_get() {
-        let gate = ReadonlyGate;
-        let policy = make_policy("test", vec!["alpine"]);
-        let body = HashMap::new();
-        assert!(gate.check("GET", "/containers/json", &policy, &body).is_ok());
-    }
-
-    #[test]
-    fn test_readonly_gate_denies_post() {
-        let gate = ReadonlyGate;
-        let policy = make_policy("test", vec!["alpine"]);
-        let body = HashMap::new();
-        let result = gate.check("POST", "/containers/create", &policy, &body);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("read-only"));
-    }
-
-    #[test]
-    fn test_readonly_gate_denies_put() {
-        let gate = ReadonlyGate;
-        let policy = make_policy("test", vec!["alpine"]);
-        let body = HashMap::new();
-        assert!(gate.check("PUT", "/some/path", &policy, &body).is_err());
-    }
-
-    #[test]
-    fn test_readonly_gate_denies_delete() {
-        let gate = ReadonlyGate;
-        let policy = make_policy("test", vec!["alpine"]);
-        let body = HashMap::new();
-        assert!(gate.check("DELETE", "/containers/x", &policy, &body).is_err());
-    }
-
-    #[test]
     fn test_registry_gate_allows_allowed_image() {
         let gate = RegistryGate;
         let policy = make_policy("test", vec!["alpine", "ubuntu"]);
@@ -660,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_chain_execute_allows() {
-        let chain = Chain::new(false);
+        let chain = Chain::new();
         let policy = make_policy("test", vec!["alpine"]);
         let body = body_from_json(serde_json::json!({"Image": "alpine"}));
         let result = chain.execute("POST", "/containers/create", &policy, &body);
@@ -670,7 +617,7 @@ mod tests {
 
     #[test]
     fn test_chain_execute_denies_unknown_image_via_registry_gate() {
-        let chain = Chain::new(false);
+        let chain = Chain::new();
         let policy = make_policy("test", vec!["alpine"]);
         let body = body_from_json(serde_json::json!({"Image": "ubuntu"}));
         let result = chain.execute("POST", "/containers/create", &policy, &body);
@@ -679,18 +626,8 @@ mod tests {
     }
 
     #[test]
-    fn test_chain_execute_readonly_denies_post() {
-        let chain = Chain::new(true);
-        let policy = make_policy("test", vec!["alpine"]);
-        let body = body_from_json(serde_json::json!({"Image": "alpine"}));
-        let result = chain.execute("POST", "/containers/create", &policy, &body);
-        assert!(!result.allowed);
-        assert!(result.reason.contains("read-only"));
-    }
-
-    #[test]
     fn test_chain_execute_with_mutator_sets_hostconfig() {
-        let chain = Chain::new(false);
+        let chain = Chain::new();
         let mut policy = make_policy("test", vec!["alpine"]);
         policy.container_config = Some(ContainerConfig {
             network_mode: Some("bridge".into()),

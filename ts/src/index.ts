@@ -63,8 +63,8 @@ console.log(`loading policies from ${configDir}...`);
 const policyManager = new Manager(configDir);
 console.log(`loaded ${policyManager.list().length} policies`);
 
-const router = new Router(policyManager);
-const chain = new Chain(readonly);
+const router = new Router(policyManager).withReadonly(readonly);
+const chain = new Chain();
 const audit = new AuditLogger(logFile);
 const transport = new Transport(dockerHost);
 const handler = new Handler(router, chain, audit, transport);

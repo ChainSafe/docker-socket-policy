@@ -60,7 +60,7 @@ function makeEnv(configFiles: Record<string, string>) {
 function newHandler(dir: string) {
   const manager = new Manager(dir);
   const router = new Router(manager);
-  const chain = new Chain(false);
+  const chain = new Chain();
   const audit = new AuditLogger(join(dir, "audit.log"));
   const transport = new FakeTransport();
   return { handler: new Handler(router, chain, audit, transport), transport };
@@ -101,7 +101,7 @@ describe("Handler", () => {
     const dir = makeEnv(defaultConfig);
     const router = new Router(new Manager(dir)).withReadonly(true);
     const transport = new FakeTransport();
-    const handler = new Handler(router, new Chain(false), new AuditLogger(join(dir, "audit.log")), transport);
+    const handler = new Handler(router, new Chain(), new AuditLogger(join(dir, "audit.log")), transport);
     const { res, recorder } = makeResponse();
     await handler.handle(makeRequest("DELETE", "/containers/mycontainer"), res);
     assert.equal(recorder.statusCode, 403);

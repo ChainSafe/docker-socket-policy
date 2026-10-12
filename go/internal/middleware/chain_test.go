@@ -64,37 +64,8 @@ func testPolicy(overrides map[string]interface{}) *policy.Policy {
 	return p
 }
 
-func TestChain_ReadonlyDeniesWrites(t *testing.T) {
-	for _, method := range []string{"POST", "PUT", "DELETE", "PATCH"} {
-		c := NewChain(true)
-		r := testRequest(method, "/containers/create")
-		body := map[string]interface{}{"Image": "chainsafe/lodestar:next"}
-		p := testPolicy(nil)
-		result := c.Execute(r, p, body)
-		if result.Allowed {
-			t.Fatalf("expected %s to be denied in read-only mode", method)
-		}
-		if !strings.Contains(result.Reason, "read-only") {
-			t.Fatalf("expected read-only reason, got: %s", result.Reason)
-		}
-	}
-}
-
-func TestChain_ReadonlyAllowsReads(t *testing.T) {
-	c := NewChain(true)
-	for _, method := range []string{"GET", "HEAD"} {
-		r := testRequest(method, "/containers/json")
-		body := map[string]interface{}{}
-		p := testPolicy(nil)
-		result := c.Execute(r, p, body)
-		if !result.Allowed {
-			t.Fatalf("expected %s to be allowed in read-only mode, got: %s", method, result.Reason)
-		}
-	}
-}
-
 func TestRegistryGate_ValidImage(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{"Image": "chainsafe/lodestar:next"}
 	p := testPolicy(nil)
@@ -105,7 +76,7 @@ func TestRegistryGate_ValidImage(t *testing.T) {
 }
 
 func TestRegistryGate_DeniedImage(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{"Image": "ubuntu:latest"}
 	p := testPolicy(nil)
@@ -116,7 +87,7 @@ func TestRegistryGate_DeniedImage(t *testing.T) {
 }
 
 func TestRegistryGate_ValidDigest(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{"Image": "chainsafe/lodestar@sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}
 	p := testPolicy(nil)
@@ -127,7 +98,7 @@ func TestRegistryGate_ValidDigest(t *testing.T) {
 }
 
 func TestRegistryGate_DigestNotAllowed(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{"Image": "chainsafe/lodestar@sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}
 	p := testPolicy(map[string]interface{}{
@@ -141,7 +112,7 @@ func TestRegistryGate_DigestNotAllowed(t *testing.T) {
 }
 
 func TestMountSourceGate_AllowedVolume(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -157,7 +128,7 @@ func TestMountSourceGate_AllowedVolume(t *testing.T) {
 }
 
 func TestMountSourceGate_DeniedVolume(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -173,7 +144,7 @@ func TestMountSourceGate_DeniedVolume(t *testing.T) {
 }
 
 func TestEnvFileGate_RejectsInlineEnv(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -187,7 +158,7 @@ func TestEnvFileGate_RejectsInlineEnv(t *testing.T) {
 }
 
 func TestEnvFileGate_AllowsNoEnv(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -200,7 +171,7 @@ func TestEnvFileGate_AllowsNoEnv(t *testing.T) {
 }
 
 func TestEnvFileGate_SkipsWhenNoEnvFile(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -214,7 +185,7 @@ func TestEnvFileGate_SkipsWhenNoEnvFile(t *testing.T) {
 }
 
 func TestCmdGate_AllowsAllowedFlag(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -228,7 +199,7 @@ func TestCmdGate_AllowsAllowedFlag(t *testing.T) {
 }
 
 func TestCmdGate_DeniesDeniedFlag(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -242,7 +213,7 @@ func TestCmdGate_DeniesDeniedFlag(t *testing.T) {
 }
 
 func TestCmdGate_DeniesNotAllowedFlag(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -256,7 +227,7 @@ func TestCmdGate_DeniesNotAllowedFlag(t *testing.T) {
 }
 
 func TestCmdGate_ValidatesFlagValue(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -270,7 +241,7 @@ func TestCmdGate_ValidatesFlagValue(t *testing.T) {
 }
 
 func TestCmdGate_RejectsInvalidFlagValue(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -284,7 +255,7 @@ func TestCmdGate_RejectsInvalidFlagValue(t *testing.T) {
 }
 
 func TestCmdGate_SafeCharset(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -298,7 +269,7 @@ func TestCmdGate_SafeCharset(t *testing.T) {
 }
 
 func TestContainerConfigMutator_SetsNetworkMode(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -314,7 +285,7 @@ func TestContainerConfigMutator_SetsNetworkMode(t *testing.T) {
 }
 
 func TestContainerConfigMutator_OverridesHostConfig(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -331,7 +302,7 @@ func TestContainerConfigMutator_OverridesHostConfig(t *testing.T) {
 }
 
 func TestChain_MutatorRunsBeforeGates(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -347,7 +318,7 @@ func TestChain_MutatorRunsBeforeGates(t *testing.T) {
 }
 
 func TestRegistryGate_RejectsInvalidDigestFormat(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{"Image": "chainsafe/lodestar@sha256:xyz"}
 	p := testPolicy(nil)
@@ -358,7 +329,7 @@ func TestRegistryGate_RejectsInvalidDigestFormat(t *testing.T) {
 }
 
 func TestRegistryGate_RejectsOversizedTag(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	longTag := strings.Repeat("a", 129)
 	body := map[string]interface{}{"Image": "chainsafe/lodestar:" + longTag}
@@ -370,7 +341,7 @@ func TestRegistryGate_RejectsOversizedTag(t *testing.T) {
 }
 
 func TestRegistryGate_RejectsTagOutsidePattern(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{"Image": "chainsafe/lodestar:2.1"}
 	p := testPolicy(nil)
@@ -382,7 +353,7 @@ func TestRegistryGate_RejectsTagOutsidePattern(t *testing.T) {
 }
 
 func TestCmdGate_ValidatesInlineFlagValue(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -396,7 +367,7 @@ func TestCmdGate_ValidatesInlineFlagValue(t *testing.T) {
 }
 
 func TestCmdGate_RejectsInvalidInlineFlagValue(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -410,7 +381,7 @@ func TestCmdGate_RejectsInvalidInlineFlagValue(t *testing.T) {
 }
 
 func TestEnvFileGate_RejectsHostConfigEnv(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",
@@ -426,7 +397,7 @@ func TestEnvFileGate_RejectsHostConfigEnv(t *testing.T) {
 }
 
 func TestMountSourceGate_DeniesTopLevelVolumes(t *testing.T) {
-	c := NewChain(false)
+	c := NewChain()
 	r := testRequest("POST", "/containers/create")
 	body := map[string]interface{}{
 		"Image": "chainsafe/lodestar:next",

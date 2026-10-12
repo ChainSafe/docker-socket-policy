@@ -21,14 +21,29 @@ pub struct RouteResult {
 
 pub struct Router {
     manager: Manager,
+    readonly: bool,
 }
 
 impl Router {
     pub fn new(manager: Manager) -> Self {
-        Router { manager }
+        Router {
+            manager,
+            readonly: false,
+        }
+    }
+
+    /// Sets read-only mode (--readonly) and returns the router.
+    pub fn with_readonly(mut self, readonly: bool) -> Self {
+        self.readonly = readonly;
+        self
     }
 
     pub fn route(&self, method: &str, path: &str, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
+        // Read-only mode denies every write, for every path (#75).
+        if self.readonly && method != "GET" && method != "HEAD" {
+            return deny(&format!("read-only mode: {} requests are not allowed", method));
+        }
+
         // The daemon decodes the path before routing, so deny any escape (#53).
         if path.contains('%') {
             return deny("percent-encoded path not allowed");
