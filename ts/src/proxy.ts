@@ -39,6 +39,8 @@ export class Router {
     if (cleanPath.includes("%")) return { action: Action.Deny, denyMsg: "percent-encoded path not allowed" };
     // An empty interior segment can hide a denied prefix such as /exec (#55).
     if (cleanPath.includes("//")) return { action: Action.Deny, denyMsg: "empty path segment not allowed" };
+    // A . or .. segment can hide a denied prefix the same way (#70).
+    if (hasDotSegment(cleanPath)) return { action: Action.Deny, denyMsg: "dot path segment not allowed" };
     path = stripAPIVersion(cleanPath);
 
     // Denied endpoints
@@ -133,6 +135,12 @@ function stripAPIVersion(path: string): string {
   // Accepts /v<major> and /v<major>.<minor> (the Docker CLI sends /v1.43/) (#52).
   const match = path.match(/^\/v\d+(\.\d+)?\//);
   return match ? path.slice(match[0].length - 1) : path;
+}
+
+// A segment that is exactly . or ..; names such as .hidden or a.b are not
+// dot segments (#70).
+function hasDotSegment(path: string): boolean {
+  return path.split("/").some((s) => s === "." || s === "..");
 }
 
 // Exec is matched on whole segments, so a name like exec-runner is not exec (#49).

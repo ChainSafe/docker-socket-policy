@@ -54,6 +54,11 @@ impl Router {
             return deny("empty path segment not allowed");
         }
 
+        // A . or .. segment can hide a denied prefix the same way (#70).
+        if has_dot_segment(path) {
+            return deny("dot path segment not allowed");
+        }
+
         let path = strip_api_version(path);
 
         // Denied endpoints
@@ -230,6 +235,12 @@ fn strip_api_version(path: &str) -> &str {
         return &rest[i..];
     }
     path
+}
+
+// A segment that is exactly . or ..; names such as .hidden or a.b are not
+// dot segments (#70).
+fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|s| s == "." || s == "..")
 }
 
 // Exec is matched on whole segments, so a name like exec-runner is not exec (#49).
