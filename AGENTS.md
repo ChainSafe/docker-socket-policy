@@ -43,7 +43,7 @@ deploy/ — Docker Compose + integration tests
 - Rust: 144 unit tests (main/listener: 23, policy: 15, middleware: 41, proxy: 48, handler: 11, audit: 4, transport: 2)
 - TypeScript: 163 unit tests, 1 skipped (flags: 44, listen: 13 incl. 1 skipped concurrency test (#46), middleware: 32, proxy: 35, policy: 10, handler: 15, shutdown: 5, transport: 5, audit: 4)
 - Integration, per implementation: 60 tests via deploy/test.sh and 15 socket tests via deploy/test-sock.sh (docker-compose)
-- Quint: `make test-spec` runs the `spec/listener.qnt` `run` tests (instances `listener_locked`, `listener_unlocked`) and the `spec/router.qnt` `run` tests (instances `router`, `router_pre48`, `router_pre53`, `router_pre55`, `router_readonly`, whose `readonly*` tests run with `--match`, `router_pre76` and `router_pre78`)
+- Quint: `make test-spec` runs the `spec/listener.qnt` `run` tests (instances `listener_locked`, `listener_unlocked`) and the `spec/router.qnt` `run` tests (instances `router`, `router_pre48`, `router_pre53`, `router_pre55`, `router_readonly`, whose `readonly*` tests run with `--match`, `router_pre76`, `router_pre78` and `router_pre70`)
 
 ## Test Conventions
 - Go: stdlib `testing` package, `go test ./...`
