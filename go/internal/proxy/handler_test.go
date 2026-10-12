@@ -377,3 +377,79 @@ container_config:
 		t.Fatalf("ContentLength %d does not match body size %d", rec.lastRequest.ContentLength, len(forwardedBody))
 	}
 }
+
+// #76: any protocol upgrade is refused before the body is read and before
+// routing, so the transport never sees it. Before #76 a websocket attach went
+// through the GET passthrough and Go relayed the daemon's 101.
+func TestHandlerRefusesProtocolUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "default.yaml"), []byte("service_name: default\nallowed_image_prefixes:\n  - scratch\n"), 0644)
+	policyManager, err := policy.NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "audit.log")
+	auditLog, err := audit.NewLogger(logPath)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+	defer auditLog.Close()
+	const refused = "protocol upgrade not allowed"
+
+	tests := []struct {
+		name    string
+		target  string
+		headers map[string]string
+	}{
+		{"websocket", "/containers/json", map[string]string{"Upgrade": "websocket", "Connection": "Upgrade"}},
+		{"connection token only", "/_ping", map[string]string{"Connection": "keep-alive, Upgrade"}},
+		{"upgrade header only", "/_ping", map[string]string{"Upgrade": "h2c"}},
+	}
+	var mismatches []string
+	for _, tt := range tests {
+		rec := &recorderTransport{}
+		h := NewHandler(NewRouter(policyManager), middleware.NewChain(), auditLog, rec)
+		req := httptest.NewRequest("GET", tt.target, nil)
+		for k, v := range tt.headers {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if got := strings.TrimSpace(w.Body.String()); w.Code != http.StatusForbidden || got != refused {
+			mismatches = append(mismatches, tt.name+": "+http.StatusText(w.Code)+" "+got)
+		}
+		if rec.lastRequest != nil {
+			mismatches = append(mismatches, tt.name+": forwarded")
+		}
+	}
+
+	rec := &recorderTransport{}
+	h := NewHandler(NewRouter(policyManager), middleware.NewChain(), auditLog, rec)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/containers/json", nil))
+	if w.Code != http.StatusOK || rec.lastRequest == nil {
+		mismatches = append(mismatches, "plain GET /containers/json: not forwarded")
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading audit log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var entry struct {
+		Method   string `json:"method"`
+		URI      string `json:"uri"`
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("audit line 0: %v", err)
+	}
+	if entry.Method != "GET" || entry.URI != "/containers/json" || entry.Decision != "DENY" || entry.Reason != refused {
+		mismatches = append(mismatches, "audit entry: "+lines[0])
+	}
+
+	if len(mismatches) > 0 {
+		t.Fatalf("protocol upgrade mismatches:\n%s", strings.Join(mismatches, "\n"))
+	}
+}

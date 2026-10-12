@@ -896,6 +896,49 @@ mod tests {
         assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
 
+    /// Cross-language parity guard for #76. attach as a whole segment after
+    /// /containers/{name} is denied for every method, right after the exec
+    /// check. Before #76 GET .../attach/ws fell through to the GET
+    /// passthrough. Rows mirror the attach* runs in spec/router.qnt.
+    #[test]
+    fn test_route_attach() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let attach = Some("attach is not allowed");
+        let cases = [
+            // attachGetDeniedTest (#76): the websocket attach endpoint.
+            ("GET", "/containers/mycontainer/attach/ws", Action::Deny, attach),
+            // attachPostDeniedTest (#76)
+            ("POST", "/containers/mycontainer/attach", Action::Deny, attach),
+            // attachHeadDeniedTest (#76)
+            ("HEAD", "/containers/mycontainer/attach", Action::Deny, attach),
+            // #76: the check runs after the API-version strip.
+            ("GET", "/v1.45/containers/mycontainer/attach/ws", Action::Deny, attach),
+            // #76: every method.
+            ("DELETE", "/containers/mycontainer/attach", Action::Deny, attach),
+            // #76 control: attach-runner is a name like any other.
+            ("GET", "/containers/attach-runner/json", Action::Allow, None),
+            // #76 control: other container reads stay allowed.
+            ("GET", "/containers/mycontainer/logs", Action::Allow, None),
+            ("GET", "/containers/json", Action::Allow, None),
+        ];
+        let mut mismatches = Vec::new();
+        for (method, path, want, want_msg) in cases {
+            let got = router.route(method, path, None);
+            if got.action != want || got.deny_msg.as_deref() != want_msg {
+                mismatches.push(format!(
+                    "{} {}: got {:?}/{}, want {:?}/{}",
+                    method,
+                    path,
+                    got.action,
+                    got.deny_msg.as_deref().unwrap_or("-"),
+                    want,
+                    want_msg.unwrap_or("-")
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
+    }
+
     #[test]
     fn test_extract_container_name_skips_empty_segment() {
         for path in ["/containers/", "/containers//start"] {

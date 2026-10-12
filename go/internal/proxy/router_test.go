@@ -745,3 +745,53 @@ allowed_image_prefixes:
 		}
 	})
 }
+
+// TestRouteAttach is the cross-language parity guard for #76.
+//
+// attach as a whole segment after /containers/{name} is denied for every
+// method, right after the exec check. Before #76 GET .../attach/ws fell
+// through to the GET passthrough, and the 101 upgrade gave the caller the
+// container's stdin. Rows mirror the attach* runs in spec/router.qnt.
+func TestRouteAttach(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m)
+	attach := "attach is not allowed"
+
+	tests := []struct {
+		method  string
+		path    string
+		want    Action
+		wantMsg string
+	}{
+		// attachGetDeniedTest (#76): the websocket attach endpoint.
+		{"GET", "/containers/mycontainer/attach/ws", ActionDeny, attach},
+		// attachPostDeniedTest (#76)
+		{"POST", "/containers/mycontainer/attach", ActionDeny, attach},
+		// attachHeadDeniedTest (#76)
+		{"HEAD", "/containers/mycontainer/attach", ActionDeny, attach},
+		// #76: the check runs after the API-version strip.
+		{"GET", "/v1.45/containers/mycontainer/attach/ws", ActionDeny, attach},
+		// #76: every method.
+		{"DELETE", "/containers/mycontainer/attach", ActionDeny, attach},
+		// #76 control: attach-runner is a name like any other.
+		{"GET", "/containers/attach-runner/json", ActionAllow, ""},
+		// #76 control: other container reads stay allowed.
+		{"GET", "/containers/mycontainer/logs", ActionAllow, ""},
+		{"GET", "/containers/json", ActionAllow, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, nil)
+			if got.Action != tt.want || got.DenyMsg != tt.wantMsg {
+				t.Fatalf("Route(%s, %s) = %v/%q, want %v/%q",
+					tt.method, tt.path, got.Action, got.DenyMsg, tt.want, tt.wantMsg)
+			}
+		})
+	}
+}

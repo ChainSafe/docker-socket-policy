@@ -448,6 +448,30 @@ S="${S:-000}"
 check_denied "GET http://docker/exec/*/json -> 403 (absolute-form target)" "$S" "$BODY" \
   'exec is not allowed' 'empty path segment not allowed'
 
+# #76: attach is denied by the router for every method, and any protocol
+# upgrade is refused by the handler before routing. Before #76 a websocket
+# attach went through the GET passthrough and Go relayed the daemon's 101,
+# handing the caller the container's stdin. The target is this test
+# container (its hostname is its short ID), so on a proxy without the fix the
+# daemon answers 101, not 404. curl does not speak websocket over http://, so
+# it reports the status and waits for the body until --max-time.
+upgrade_get() {
+  : >"$BODY"
+  out=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+    -H 'Upgrade: websocket' -H 'Connection: Upgrade' -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$1" 2>/dev/null || true)
+  echo "${out:-000}"
+}
+
+S=$(upgrade_get "$PROXY/containers/$(hostname)/attach/ws?stdin=1&stream=1")
+check_denied "GET /containers/*/attach/ws with Upgrade: websocket -> 403 (upgrade refused)" "$S" "$BODY" 'protocol upgrade not allowed'
+
+S=$(get_status "$PROXY/containers/no-such-container/attach/ws")
+check_denied "GET /containers/*/attach/ws -> 403 (attach denied)" "$S" "$BODY" 'attach is not allowed'
+
+S=$(upgrade_get "$PROXY/_ping")
+check_denied "GET /_ping with Upgrade: websocket -> 403 (upgrade refused)" "$S" "$BODY" 'protocol upgrade not allowed'
+
 # ─── Read-only mode (#75) ────────────────────────────────
 
 # The same config behind --readonly. Every request whose method is not GET or
