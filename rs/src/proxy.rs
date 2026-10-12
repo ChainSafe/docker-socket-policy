@@ -986,6 +986,19 @@ mod tests {
                 Action::Deny,
                 Some("endpoint OPTIONS /_ping is not allowed"),
             ),
+            (
+                "PATCH",
+                "/_ping",
+                Action::Deny,
+                Some("endpoint PATCH /_ping is not allowed"),
+            ),
+            // A lowercase method is an extension method, not CONNECT: the router denies it.
+            (
+                "connect",
+                "/_ping",
+                Action::Deny,
+                Some("endpoint connect /_ping is not allowed"),
+            ),
             // #78: the old /events prefix match.
             (
                 "POST",

@@ -558,6 +558,9 @@ describe("Router", () => {
       ["CONNECT", "/_ping", Action.Deny, "endpoint CONNECT /_ping is not allowed"],
       // #78: the daemon's CORS preflight, denied on purpose.
       ["OPTIONS", "/_ping", Action.Deny, "endpoint OPTIONS /_ping is not allowed"],
+      ["PATCH", "/_ping", Action.Deny, "endpoint PATCH /_ping is not allowed"],
+      // A lowercase method is an extension method, not CONNECT: the router denies it.
+      ["connect", "/_ping", Action.Deny, "endpoint connect /_ping is not allowed"],
       // #78: the old /events prefix match.
       ["POST", "/eventsxyz", Action.Deny, "endpoint POST /eventsxyz is not allowed"],
       // #78: the check runs after the API-version strip.

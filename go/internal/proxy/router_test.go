@@ -829,6 +829,9 @@ allowed_image_prefixes:
 		{"CONNECT", "/_ping", ActionDeny, "endpoint CONNECT /_ping is not allowed"},
 		// #78: the daemon's CORS preflight, denied on purpose.
 		{"OPTIONS", "/_ping", ActionDeny, "endpoint OPTIONS /_ping is not allowed"},
+		{"PATCH", "/_ping", ActionDeny, "endpoint PATCH /_ping is not allowed"},
+		// A lowercase method is an extension method, not CONNECT: the router denies it.
+		{"connect", "/_ping", ActionDeny, "endpoint connect /_ping is not allowed"},
 		// #78: the old /events prefix match.
 		{"POST", "/eventsxyz", ActionDeny, "endpoint POST /eventsxyz is not allowed"},
 		// #78: the check runs after the API-version strip.
