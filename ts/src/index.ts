@@ -77,6 +77,8 @@ const server = createServer((req, res) => {
   });
 });
 
+server.on("connect", (req, socket) => handler.refuseConnect(req, socket));
+
 // A bind failure leaves the process with no listener at all, so it is fatal.
 // This handler is scoped to the bind: net.Server also emits "error" for accept
 // failures (EMFILE and friends), and exiting on those would let any caller kill

@@ -104,6 +104,7 @@ test-spec:
 	$(QUINT) test $(ROUTER_SPEC) --main=router_pre55
 	$(QUINT) test $(ROUTER_SPEC) --main=router_readonly --match='^readonly.*Test$$'
 	$(QUINT) test $(ROUTER_SPEC) --main=router_pre76
+	$(QUINT) test $(ROUTER_SPEC) --main=router_pre78
 
 verify-ts:
 	$(QUINT) run $(SPEC) --max-steps=50 --invariants allInvariants --backend typescript

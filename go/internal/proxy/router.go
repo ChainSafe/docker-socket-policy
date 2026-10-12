@@ -59,10 +59,6 @@ func (r *Router) Route(method, path string, body map[string]interface{}) *RouteR
 
 	path = stripAPIVersion(path)
 
-	if path == "/_ping" || path == "/version" || path == "/info" || strings.HasPrefix(path, "/events") {
-		return &RouteResult{Action: ActionAllow}
-	}
-
 	if strings.HasPrefix(path, "/auth") {
 		return &RouteResult{Action: ActionDeny, DenyMsg: "auth endpoint is not allowed"}
 	}

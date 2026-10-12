@@ -4,8 +4,9 @@
 # and the deny message on every expected proxy 403.
 # The proxy's RegistryGate, MountSourceGate, EnvFileGate, CmdGate, and
 # ContainerConfigMutator are all exercised; exec and attach are denied by the
-# router, protocol upgrades by the handler (#76), and every write on a second
-# proxy run with --readonly (#75).
+# router, protocol upgrades by the handler (#76), non-read methods on the read
+# endpoints by the router and CONNECT by the handler (#78), and every write on a
+# second proxy run with --readonly (#75).
 
 set -e
 
@@ -166,7 +167,7 @@ case "$rc" in
     ;;
 esac
 
-# ─── Read-only endpoints (always allowed) ───────────────────────
+# ─── Read-only endpoints (GET and HEAD allowed, #78) ────────────
 
 echo "--- Read-only endpoints ---"
 
@@ -472,6 +473,42 @@ check_denied "GET /containers/*/attach/ws -> 403 (attach denied)" "$S" "$BODY" '
 
 S=$(upgrade_get "$PROXY/_ping")
 check_denied "GET /_ping with Upgrade: websocket -> 403 (upgrade refused)" "$S" "$BODY" 'protocol upgrade not allowed'
+
+# #78: the read endpoints admit only GET and HEAD. Before #78 an early router
+# clause allowed /_ping, /version, /info and /events… for every method, so the
+# daemon answered POST /_ping. CONNECT is refused by the handler before
+# routing; before #78 the TypeScript proxy dropped it with no response.
+# method_status METHOD URL [CURL_ARGS...]
+method_status() {
+  : >"$BODY"
+  m="$1"
+  u="$2"
+  shift 2
+  out=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --unix-socket "$PROXY_SOCK" \
+    -X "$m" "$@" "$u" 2>/dev/null || true)
+  echo "${out:-000}"
+}
+
+S=$(method_status POST "$PROXY/_ping")
+check_denied "POST /_ping -> 403 (read endpoint, GET/HEAD only)" "$S" "$BODY" 'endpoint POST /_ping is not allowed'
+
+S=$(method_status DELETE "$PROXY/version")
+check_denied "DELETE /version -> 403 (read endpoint, GET/HEAD only)" "$S" "$BODY" 'endpoint DELETE /version is not allowed'
+
+S=$(method_status OPTIONS "$PROXY/_ping")
+check_denied "OPTIONS /_ping -> 403 (CORS preflight denied)" "$S" "$BODY" 'endpoint OPTIONS /_ping is not allowed'
+
+S=$(method_status CONNECT "$PROXY/_ping")
+check_denied "CONNECT /_ping -> 403 (CONNECT refused)" "$S" "$BODY" 'CONNECT is not allowed'
+
+S=$(method_status CONNECT "$PROXY/" --request-target localhost:80)
+check_denied "CONNECT localhost:80 -> 403 (CONNECT refused, authority form)" "$S" "$BODY" 'CONNECT is not allowed'
+
+S=$(method_status HEAD "$PROXY/_ping" -I)
+check "HEAD /_ping -> 200" "200" "$S"
+
+S=$(get_status "$PROXY/events?since=1&until=2")
+check "GET /events (bounded) -> 200" "200" "$S"
 
 # ─── Read-only mode (#75) ────────────────────────────────
 

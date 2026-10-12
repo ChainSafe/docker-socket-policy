@@ -56,19 +56,6 @@ impl Router {
 
         let path = strip_api_version(path);
 
-        // Read-only endpoints
-        if path == "/_ping" || path == "/version" || path == "/info" || path.starts_with("/events") {
-            return RouteResult {
-                action: Action::Allow,
-                service: None,
-                policy: None,
-                body: None,
-                container: None,
-                image: None,
-                deny_msg: None,
-            };
-        }
-
         // Denied endpoints
         if path.starts_with("/auth") {
             return deny("auth endpoint is not allowed");
@@ -930,6 +917,115 @@ mod tests {
             // #76 control: other container reads stay allowed.
             ("GET", "/containers/mycontainer/logs", Action::Allow, None),
             ("GET", "/containers/json", Action::Allow, None),
+        ];
+        let mut mismatches = Vec::new();
+        for (method, path, want, want_msg) in cases {
+            let got = router.route(method, path, None);
+            if got.action != want || got.deny_msg.as_deref() != want_msg {
+                mismatches.push(format!(
+                    "{} {}: got {:?}/{}, want {:?}/{}",
+                    method,
+                    path,
+                    got.action,
+                    got.deny_msg.as_deref().unwrap_or("-"),
+                    want,
+                    want_msg.unwrap_or("-")
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
+    }
+
+    /// Cross-language parity guard for #78. /_ping, /version, /info and
+    /// /events admit only GET and HEAD, through the read passthrough; every
+    /// other method gets the default deny. Before #78 an early clause allowed
+    /// them for every method, and /events as a prefix also matched
+    /// /eventsxyz. Rows mirror the ping* runs in spec/router.qnt.
+    #[test]
+    fn test_route_read_endpoint_methods() {
+        let router = Router::new(make_manager(vec!["alpine"]));
+        let cases = [
+            // pingPostDeniedTest (#78)
+            (
+                "POST",
+                "/_ping",
+                Action::Deny,
+                Some("endpoint POST /_ping is not allowed"),
+            ),
+            // pingDeleteDeniedTest (#78)
+            (
+                "DELETE",
+                "/_ping",
+                Action::Deny,
+                Some("endpoint DELETE /_ping is not allowed"),
+            ),
+            // #78: every read endpoint, every non-read method.
+            (
+                "DELETE",
+                "/version",
+                Action::Deny,
+                Some("endpoint DELETE /version is not allowed"),
+            ),
+            ("PUT", "/info", Action::Deny, Some("endpoint PUT /info is not allowed")),
+            (
+                "POST",
+                "/events",
+                Action::Deny,
+                Some("endpoint POST /events is not allowed"),
+            ),
+            (
+                "CONNECT",
+                "/_ping",
+                Action::Deny,
+                Some("endpoint CONNECT /_ping is not allowed"),
+            ),
+            // #78: the daemon's CORS preflight, denied on purpose.
+            (
+                "OPTIONS",
+                "/_ping",
+                Action::Deny,
+                Some("endpoint OPTIONS /_ping is not allowed"),
+            ),
+            (
+                "PATCH",
+                "/_ping",
+                Action::Deny,
+                Some("endpoint PATCH /_ping is not allowed"),
+            ),
+            // A lowercase method is an extension method, not CONNECT: the router denies it.
+            (
+                "connect",
+                "/_ping",
+                Action::Deny,
+                Some("endpoint connect /_ping is not allowed"),
+            ),
+            // #78: the old /events prefix match.
+            (
+                "POST",
+                "/eventsxyz",
+                Action::Deny,
+                Some("endpoint POST /eventsxyz is not allowed"),
+            ),
+            // #78: the check runs after the API-version strip.
+            (
+                "POST",
+                "/v1.45/_ping",
+                Action::Deny,
+                Some("endpoint POST /_ping is not allowed"),
+            ),
+            // pingGetAllowedTest (#78)
+            ("GET", "/_ping", Action::Allow, None),
+            // pingHeadAllowedTest (#78)
+            ("HEAD", "/_ping", Action::Allow, None),
+            ("GET", "/version", Action::Allow, None),
+            ("HEAD", "/version", Action::Allow, None),
+            ("GET", "/info", Action::Allow, None),
+            ("HEAD", "/info", Action::Allow, None),
+            ("GET", "/events", Action::Allow, None),
+            ("HEAD", "/events", Action::Allow, None),
+            ("GET", "/v1.45/_ping", Action::Allow, None),
+            // #78 pin: a read on an unknown path stays on the passthrough.
+            ("GET", "/eventsxyz", Action::Allow, None),
         ];
         let mut mismatches = Vec::new();
         for (method, path, want, want_msg) in cases {

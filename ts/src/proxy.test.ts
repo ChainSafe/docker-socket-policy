@@ -539,4 +539,57 @@ describe("Router", () => {
     }
     assert.deepEqual(mismatches, []);
   });
+
+  // Cross-language parity guard for #78. /_ping, /version, /info and /events
+  // admit only GET and HEAD, through the read passthrough; every other method
+  // gets the default deny. Before #78 an early clause allowed them for every
+  // method, and /events as a prefix also matched /eventsxyz. Rows mirror the
+  // ping* runs in spec/router.qnt.
+  it("allows only GET and HEAD on the read endpoints", () => {
+    const cases: [string, string, Action, string | undefined][] = [
+      // pingPostDeniedTest (#78)
+      ["POST", "/_ping", Action.Deny, "endpoint POST /_ping is not allowed"],
+      // pingDeleteDeniedTest (#78)
+      ["DELETE", "/_ping", Action.Deny, "endpoint DELETE /_ping is not allowed"],
+      // #78: every read endpoint, every non-read method.
+      ["DELETE", "/version", Action.Deny, "endpoint DELETE /version is not allowed"],
+      ["PUT", "/info", Action.Deny, "endpoint PUT /info is not allowed"],
+      ["POST", "/events", Action.Deny, "endpoint POST /events is not allowed"],
+      ["CONNECT", "/_ping", Action.Deny, "endpoint CONNECT /_ping is not allowed"],
+      // #78: the daemon's CORS preflight, denied on purpose.
+      ["OPTIONS", "/_ping", Action.Deny, "endpoint OPTIONS /_ping is not allowed"],
+      ["PATCH", "/_ping", Action.Deny, "endpoint PATCH /_ping is not allowed"],
+      // A lowercase method is an extension method, not CONNECT: the router denies it.
+      ["connect", "/_ping", Action.Deny, "endpoint connect /_ping is not allowed"],
+      // #78: the old /events prefix match.
+      ["POST", "/eventsxyz", Action.Deny, "endpoint POST /eventsxyz is not allowed"],
+      // #78: the check runs after the API-version strip.
+      ["POST", "/v1.45/_ping", Action.Deny, "endpoint POST /_ping is not allowed"],
+      // pingGetAllowedTest (#78)
+      ["GET", "/_ping", Action.Allow, undefined],
+      // pingHeadAllowedTest (#78)
+      ["HEAD", "/_ping", Action.Allow, undefined],
+      ["GET", "/version", Action.Allow, undefined],
+      ["HEAD", "/version", Action.Allow, undefined],
+      ["GET", "/info", Action.Allow, undefined],
+      ["HEAD", "/info", Action.Allow, undefined],
+      ["GET", "/events", Action.Allow, undefined],
+      ["HEAD", "/events", Action.Allow, undefined],
+      ["GET", "/v1.45/_ping", Action.Allow, undefined],
+      // #78 pin: a read on an unknown path stays on the passthrough.
+      ["GET", "/eventsxyz", Action.Allow, undefined],
+      // #78, TS-only: the TS router receives the raw target, query included.
+      ["POST", "/events?since=1", Action.Deny, "endpoint POST /events is not allowed"],
+    ];
+    const mismatches: string[] = [];
+    for (const [method, path, want, wantMsg] of cases) {
+      const r = router.route(method, path);
+      if (r.action !== want || r.denyMsg !== wantMsg) {
+        mismatches.push(
+          `${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}/${wantMsg ?? "-"}`,
+        );
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
 });
