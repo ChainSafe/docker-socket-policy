@@ -182,7 +182,8 @@ module docker_socket_policy {
     { method: "*",    path: "/exec/*",                kind: "deny" },
     { method: "POST", path: "/containers/:name/rename",kind: "deny" },
     { method: "POST", path: "/containers/:name/update",kind: "deny" },
-    { method: "POST", path: "/containers/:name/attach",kind: "deny" },
+    { method: "*",    path: "/containers/:name/attach",kind: "deny" },
+    { method: "*",    path: "/containers/:name/attach/ws",kind: "deny" },
     { method: "POST", path: "/containers/:name/prune", kind: "deny" },
     { method: "POST", path: "/networks/create",       kind: "deny" },
     { method: "POST", path: "/volumes/create",        kind: "deny" }
@@ -455,7 +456,8 @@ module docker_socket_policy {
     endpointsTable.contains({ method: "*",    path: "/exec/*",                kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/containers/:name/rename",kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/containers/:name/update",kind: "deny" }),
-    endpointsTable.contains({ method: "POST", path: "/containers/:name/attach",kind: "deny" }),
+    endpointsTable.contains({ method: "*",    path: "/containers/:name/attach",kind: "deny" }),
+    endpointsTable.contains({ method: "*",    path: "/containers/:name/attach/ws",kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/containers/:name/prune", kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/networks/create",       kind: "deny" }),
     endpointsTable.contains({ method: "POST", path: "/volumes/create",        kind: "deny" })
