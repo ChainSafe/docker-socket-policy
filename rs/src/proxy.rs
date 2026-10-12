@@ -56,19 +56,6 @@ impl Router {
 
         let path = strip_api_version(path);
 
-        // Read-only endpoints
-        if path == "/_ping" || path == "/version" || path == "/info" || path.starts_with("/events") {
-            return RouteResult {
-                action: Action::Allow,
-                service: None,
-                policy: None,
-                body: None,
-                container: None,
-                image: None,
-                deny_msg: None,
-            };
-        }
-
         // Denied endpoints
         if path.starts_with("/auth") {
             return deny("auth endpoint is not allowed");

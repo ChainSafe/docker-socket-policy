@@ -41,11 +41,6 @@ export class Router {
     if (cleanPath.includes("//")) return { action: Action.Deny, denyMsg: "empty path segment not allowed" };
     path = stripAPIVersion(cleanPath);
 
-    // Read-only endpoints
-    if (path === "/_ping" || path === "/version" || path === "/info" || path.startsWith("/events")) {
-      return { action: Action.Allow };
-    }
-
     // Denied endpoints
     if (path.startsWith("/auth")) return { action: Action.Deny, denyMsg: "auth endpoint is not allowed" };
     if (isExecPath(path)) return { action: Action.Deny, denyMsg: "exec is not allowed" };

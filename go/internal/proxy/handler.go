@@ -33,6 +33,16 @@ func NewHandler(router *Router, chain *middleware.Chain, auditLog *audit.Logger,
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Refuse CONNECT before anything else, whatever its target or headers: it
+	// asks for a tunnel, which the proxy never provides (#78).
+	if r.Method == http.MethodConnect {
+		const msg = "CONNECT is not allowed"
+		slog.Warn("denied", "method", r.Method, "path", r.RequestURI, "reason", msg)
+		h.auditLog.Deny(r.Method, r.RequestURI, msg, map[string]interface{}{"method": r.Method, "path": r.RequestURI})
+		http.Error(w, msg, http.StatusForbidden)
+		return
+	}
+
 	// Refuse protocol upgrades before anything else: the reverse proxy would
 	// relay a 101 and hand the caller a raw stream to the daemon (#76).
 	if isUpgradeRequest(r.Header) {

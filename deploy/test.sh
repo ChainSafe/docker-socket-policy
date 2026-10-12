@@ -4,8 +4,9 @@
 # and the deny message on every expected proxy 403.
 # The proxy's RegistryGate, MountSourceGate, EnvFileGate, CmdGate, and
 # ContainerConfigMutator are all exercised; exec and attach are denied by the
-# router, protocol upgrades by the handler (#76), and every write on a second
-# proxy run with --readonly (#75).
+# router, protocol upgrades by the handler (#76), non-read methods on the read
+# endpoints by the router and CONNECT by the handler (#78), and every write on a
+# second proxy run with --readonly (#75).
 
 set -e
 
@@ -166,7 +167,7 @@ case "$rc" in
     ;;
 esac
 
-# ─── Read-only endpoints (always allowed) ───────────────────────
+# ─── Read-only endpoints (GET and HEAD allowed, #78) ────────────
 
 echo "--- Read-only endpoints ---"
 

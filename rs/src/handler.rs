@@ -6,7 +6,7 @@ use crate::transport::TransportError;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Full;
-use hyper::{header, Request, Response, StatusCode};
+use hyper::{header, Method, Request, Response, StatusCode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -45,7 +45,19 @@ impl Handler {
         let headers = parts.headers.clone();
         let version = parts.version;
 
-        // Refuse protocol upgrades before anything else: forwarding one would
+        // Refuse CONNECT before anything else, whatever its target or headers:
+        // it asks for a tunnel, which the proxy never provides (#78).
+        if parts.method == Method::CONNECT {
+            let msg = "CONNECT is not allowed";
+            warn!("denied {} {}: {}", method, full_uri, msg);
+            self.audit.deny(&method, &full_uri, msg);
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Full::new(Bytes::from(msg)))
+                .unwrap();
+        }
+
+        // Refuse protocol upgrades next: forwarding one would
         // hand the caller a raw stream to the daemon (#76).
         if is_upgrade_request(&headers) {
             let msg = "protocol upgrade not allowed";

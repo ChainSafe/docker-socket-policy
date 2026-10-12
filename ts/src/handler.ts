@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import { AuditLogger } from "./audit.js";
 import { Chain } from "./middleware.js";
 import { Action, Router } from "./proxy.js";
@@ -18,7 +19,18 @@ export class Handler {
     const method = req.method ?? "GET";
     const path = req.url ?? "/";
 
-    // Refuse protocol upgrades before anything else: forwarding one would
+    // Refuse CONNECT before anything else, whatever its target or headers
+    // (#78). Node's http.Server never delivers CONNECT here; refuseConnect
+    // answers it on the server's "connect" event.
+    if (method === "CONNECT") {
+      console.warn(`[${requestId}] DENIED ${method} ${path}: ${CONNECT_REFUSED}`);
+      this.audit.deny(method, path, CONNECT_REFUSED);
+      res.writeHead(403);
+      res.end(CONNECT_REFUSED);
+      return;
+    }
+
+    // Refuse protocol upgrades next: forwarding one would
     // hand the caller a raw stream to the daemon (#76). The server registers
     // no "upgrade" listener, so Node delivers these requests here.
     if (isUpgradeRequest(req)) {
@@ -72,7 +84,28 @@ export class Handler {
     this.audit.allow(method, path);
     await this.transport.forward(req, res, bodyBytes.length > 0 ? bodyBytes : undefined);
   }
+
+  // Answers a CONNECT request with 403 on the raw socket (#78). Node emits
+  // CONNECT as the server's "connect" event, never as a request, and without
+  // a listener it destroys the socket, so the caller got no response and
+  // nothing was audited.
+  refuseConnect(req: IncomingMessage, socket: Duplex): void {
+    socket.on("error", () => {});
+    const method = req.method ?? "CONNECT";
+    const target = req.url ?? "";
+    console.warn(`[${randomBytes(8).toString("hex")}] DENIED ${method} ${target}: ${CONNECT_REFUSED}`);
+    this.audit.deny(method, target, CONNECT_REFUSED);
+    const resp =
+      "HTTP/1.1 403 Forbidden\r\n" +
+      "Content-Type: text/plain; charset=utf-8\r\n" +
+      `Content-Length: ${Buffer.byteLength(CONNECT_REFUSED)}\r\n` +
+      "Connection: close\r\n\r\n" +
+      CONNECT_REFUSED;
+    socket.end(resp, () => socket.destroy());
+  }
 }
+
+const CONNECT_REFUSED = "CONNECT is not allowed";
 
 // An Upgrade header, or a Connection header that lists the upgrade token.
 function isUpgradeRequest(req: IncomingMessage): boolean {
