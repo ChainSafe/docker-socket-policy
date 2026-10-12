@@ -57,6 +57,11 @@ func (r *Router) Route(method, path string, body map[string]interface{}) *RouteR
 		return &RouteResult{Action: ActionDeny, DenyMsg: "empty path segment not allowed"}
 	}
 
+	// A . or .. segment can hide a denied prefix the same way (#70).
+	if hasDotSegment(path) {
+		return &RouteResult{Action: ActionDeny, DenyMsg: "dot path segment not allowed"}
+	}
+
 	path = stripAPIVersion(path)
 
 	if strings.HasPrefix(path, "/auth") {
@@ -208,6 +213,17 @@ func scanDigits(s string, i int) int {
 		i++
 	}
 	return i
+}
+
+// hasDotSegment reports a segment that is exactly . or ..; names such as
+// .hidden or a.b are not dot segments (#70).
+func hasDotSegment(path string) bool {
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // isExecPath matches exec on whole segments, so a name like exec-runner is not exec (#49).

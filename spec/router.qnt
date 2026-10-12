@@ -5,8 +5,9 @@
 // path deny that runs first in the router (#53), the empty interior segment
 // deny that follows it (#55), the segment-exact exec deny and
 // POST /containers/create route (#49), and the segment-exact attach deny
-// (#76), and that the read passthrough admits only GET and HEAD, with
-// `/_ping` standing for the read endpoints (#78). Mirrors
+// (#76), that the read passthrough admits only GET and HEAD, with
+// `/_ping` standing for the read endpoints (#78), and the dot segment deny
+// that follows the empty interior segment deny (#70). Mirrors
 // `extract_container_name` and the lifecycle branch of `Router::route` in
 // rs/src/proxy.rs. This is not the full router: the API-version strip and
 // the other checks that run between the percent check and the lifecycle
@@ -57,6 +58,12 @@
 // other read, and every other method is denied by default. `/_ping` stands
 // for all four.
 //
+// ALLOW_DOT_SEGMENTS = true models all three before #70, which let a `.`
+// or `..` segment through. false models all three after the fix: a path
+// with a segment that is exactly `.` or `..` is denied, for every method,
+// right after the empty interior segment check. `.hidden`, `...` and `a.b`
+// are names like any other.
+//
 // No instance models Go before #53. Go decoded before routing, which is
 // route(m, decodePath(segs)); with this table that agrees with the daemon
 // by construction, so the property cannot express Go's risk: decoding that
@@ -70,6 +77,7 @@ module router_model {
   const READONLY: bool
   const ALLOW_ATTACH: bool
   const ALLOW_ANY_METHOD_PING: bool
+  const ALLOW_DOT_SEGMENTS: bool
 
   // ─── Daemon decoding ────────────────────────────────────────────────
 
@@ -144,20 +152,24 @@ module router_model {
   pure def hasEmptyInterior(segs: List[str]): bool =
     segs.indices().exists(i => i < segs.length() - 1 and segs[i] == "")
 
+  // A segment that is exactly `.` or `..` (#70).
+  pure def hasDotSegment(segs: List[str]): bool =
+    segs.indices().exists(i => segs[i] == "." or segs[i] == "..")
+
   pure def isDenied(outcome: str): bool =
     outcome == "deny" or outcome == "denyExec"
 
   // The read-only check (#75) comes first, then the percent check (#53),
-  // then the empty interior segment check (#55). Before #78 the read
-  // endpoints were allowed next, for every method. The exec check (#49)
-  // and the attach check (#76) follow, before
-  // the create route, the lifecycle branch and the GET passthrough, so it
+  // then the empty interior segment check (#55), then the dot segment check
+  // (#70). Before #78 the read endpoints were allowed next, for every method.
+  // The exec check (#49) and the attach check (#76) follow, before the create route, the lifecycle branch and the GET passthrough, so it
   // denies every method. POST /containers/create matches only the exact
   // segments; a longer path falls through.
   pure def route(method: str, segs: List[str]): str =
     if (READONLY and not(method == "GET" or method == "HEAD")) "deny"
     else if (not(ALLOW_PERCENT) and hasEncodedSeg(segs)) "deny"
     else if (not(ALLOW_EMPTY_INTERIOR) and hasEmptyInterior(segs)) "deny"
+    else if (not(ALLOW_DOT_SEGMENTS) and hasDotSegment(segs)) "deny"
     else if (ALLOW_ANY_METHOD_PING and segs == ["_ping"]) "allowRead"
     else if (isExecPath(segs)) "denyExec"
     else if (not(ALLOW_ATTACH) and isAttachPath(segs)) "deny"
@@ -178,7 +190,7 @@ module router_model {
   pure val WORDS = Set(
     "containers", "", "json", "create", "exec", "mycontainer", "beacon", "start", "stop",
     "%2F", "%2f", "%6A%73%6F%6E", "beacon%2Fstart",
-    "exec-runner", "abc", "extra", "attach", "ws", "_ping",
+    "exec-runner", "abc", "extra", "attach", "ws", "_ping", ".", "..",
   )
   pure val METHODS = Set("GET", "HEAD", "POST", "DELETE")
 
@@ -258,6 +270,32 @@ module router_model {
       isExecPath(segs.select(s => s != "")) implies isDenied(route(m, segs))
     ))
 
+  // A path with a `.` or `..` segment is denied for every method (#70).
+  // Ranges over GET too.
+  pure val dotSegmentsDenied: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      hasDotSegment(segs) implies isDenied(route(m, segs))
+    ))
+
+  // The path a client that resolves dot segments reads, as the daemon's
+  // redirect to the clean path does: `.` is dropped, and `..` removes the
+  // segment before it, if any, and is dropped.
+  pure def resolveDots(segs: List[str]): List[str] =
+    segs.foldl([], (acc, s) =>
+      if (s == ".") acc
+      else if (s == "..") (if (acc.length() == 0) acc else acc.slice(0, acc.length() - 1))
+      else acc.append(s))
+
+  // The security claim behind dotSegmentsDenied: a path that is an exec or
+  // attach path once its dot segments are resolved is denied for every
+  // method (#70). It does not mention hasDotSegment or ALLOW_DOT_SEGMENTS,
+  // so that router_pre70 fails it.
+  pure val dotSegmentsHideNoExec: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      (isExecPath(resolveDots(segs)) or isAttachPath(resolveDots(segs)))
+        implies isDenied(route(m, segs))
+    ))
+
   // Every request that is not GET or HEAD is denied, for every path (#75).
   // The read-only claim: it holds only on `router_readonly`. It does not
   // mention READONLY, so that the instance with the flag off fails it
@@ -278,12 +316,12 @@ module router_model {
   // ─── Tests: one run per table row ───────────────────────────────────
   //
   // Rows whose outcome depends on none of ALLOW_EMPTY_NAME, ALLOW_PERCENT,
-  // ALLOW_EMPTY_INTERIOR, ALLOW_ATTACH and ALLOW_ANY_METHOD_PING run on
-  // every READONLY = false instance. The rows
+  // ALLOW_EMPTY_INTERIOR, ALLOW_ATTACH, ALLOW_ANY_METHOD_PING and
+  // ALLOW_DOT_SEGMENTS run on every READONLY = false instance. The rows
   // that do and the
   // property tests (soundTest, percentSoundTest, execSoundTest,
   // execPrefixSoundTest, createExactSoundTest, emptyInteriorSoundTest,
-  // attachSoundTest, readPassthroughSoundTest) live
+  // attachSoundTest, readPassthroughSoundTest, dotSoundTest) live
   // in `router`. `router_readonly` runs only its own `readonly*` tests
   // (`--match`): with READONLY = true the write rows here are denied.
 
@@ -348,12 +386,12 @@ module router_model {
 
 // ─── Instances ──────────────────────────────────────────────────────────
 
-// Go, TypeScript, and Rust after #48, #53, #49, #55, #76 and #78: an empty
-// segment is not a name, a percent-encoded path or one with an empty
-// interior segment is denied, attach is denied, and the read endpoints are
-// read-only.
+// Go, TypeScript, and Rust after #48, #53, #49, #55, #76, #78 and #70: an
+// empty segment is not a name, a percent-encoded path or one with an empty
+// interior segment or a dot segment is denied, attach is denied, and the
+// read endpoints are read-only.
 module router {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
 
   run emptyNameDeleteDeniedTest =
     assert(route("DELETE", ["containers", ""]) == "deny")
@@ -447,6 +485,24 @@ module router {
 
   run readPassthroughSoundTest =
     assert(readPassthroughOnlyForReads)
+
+  // Dot segments (#70). `GET /./exec/abc/json`: the leading `.` hid the
+  // exec namespace from the exec check.
+
+  run dotLeadingExecGetDeniedTest =
+    assert(route("GET", [".", "exec", "abc"]) == "deny")
+
+  run dotDotExecGetDeniedTest =
+    assert(route("GET", ["mycontainer", "..", "exec"]) == "deny")
+
+  run dotInContainerPathDeniedTest =
+    assert(route("GET", ["containers", "mycontainer", "."]) == "deny")
+
+  run dotSoundTest =
+    assert(and {
+      dotSegmentsDenied,
+      dotSegmentsHideNoExec,
+    })
 }
 
 // Rust before #48: `/containers/` and `/containers//start` reach
@@ -455,7 +511,7 @@ module router {
 // is off: with it on, `/containers//start` would be denied before it reached
 // the name branch, and the instance could not show #48.
 module router_pre48 {
-  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false).*
+  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
 
   run pre48UnsoundTest =
     assert(and {
@@ -469,7 +525,7 @@ module router_pre48 {
 // encoded name such as `%2F` counted as an unknown container and the
 // request was forwarded. The daemon decodes it and reads a different path.
 module router_pre53 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
 
   run pre53UnsoundTest =
     assert(and {
@@ -485,7 +541,7 @@ module router_pre53 {
 // check missed it and the GET passthrough forwarded it. The daemon answers
 // with a 301 to the clean path, so nothing leaked, but the router allowed it.
 module router_pre55 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
 
   run pre55UnsoundTest =
     assert(and {
@@ -499,7 +555,7 @@ module router_pre55 {
 // `--match='^readonly.*Test$'`; the shared write rows in router_model assume the
 // flag is off.
 module router_readonly {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = true, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = true, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
 
   run readonlySoundTest =
     assert(readonlyAllowsOnlyReads)
@@ -525,7 +581,7 @@ module router_readonly {
 // and Go relayed the 101, giving the caller the container's stdin. Other
 // flags as `router`.
 module router_pre76 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = true, ALLOW_ANY_METHOD_PING = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = true, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
 
   run pre76UnsoundTest =
     assert(and {
@@ -538,12 +594,30 @@ module router_pre76 {
 // `/info` and `/events…` for every method, so `POST /_ping` and
 // `DELETE /version` reached the daemon. Other flags as `router`.
 module router_pre78 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = true).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = true, ALLOW_DOT_SEGMENTS = false).*
 
   run pre78UnsoundTest =
     assert(and {
       not(readPassthroughOnlyForReads),
       route("POST", ["_ping"]) == "allowRead",
       route("DELETE", ["_ping"]) == "allowRead",
+    })
+}
+
+// All three before #70: a `.` or `..` segment went through. In
+// `GET /./exec/abc/json` the first segment is `.`, not `exec`, so the exec
+// check missed it and the GET passthrough forwarded it. The daemon answers
+// with a 301 to the clean path, so nothing leaked, but the router allowed it.
+// Other flags as `router`.
+module router_pre70 {
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = true).*
+
+  run pre70UnsoundTest =
+    assert(and {
+      not(dotSegmentsDenied),
+      not(dotSegmentsHideNoExec),
+      route("GET", [".", "exec", "abc"]) == "allowRead",
+      // The attach half of dotSegmentsHideNoExec, witnessed on its own.
+      route("GET", [".", "containers", "attach"]) == "allowRead",
     })
 }

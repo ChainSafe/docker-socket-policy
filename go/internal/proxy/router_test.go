@@ -860,3 +860,62 @@ allowed_image_prefixes:
 		})
 	}
 }
+
+// TestRouteDotSegments is the cross-language parity guard for #70.
+//
+// A path with a segment that is exactly . or .. is denied for every method,
+// right after the // check and before the API-version strip. Before #70
+// GET /./exec/<id>/json had a first segment of ".", so the exec check missed
+// it and the GET passthrough forwarded it. Rows mirror the dot* runs in
+// spec/router.qnt.
+func TestRouteDotSegments(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m)
+	dot := "dot path segment not allowed"
+
+	tests := []struct {
+		method  string
+		path    string
+		want    Action
+		wantMsg string
+	}{
+		// dotLeadingExecGetDeniedTest (#70): the leading . hid the exec namespace.
+		{"GET", "/./exec/abc/json", ActionDeny, dot},
+		// dotDotExecGetDeniedTest (#70)
+		{"GET", "/x/../exec/abc/json", ActionDeny, dot},
+		// dotInContainerPathDeniedTest (#70)
+		{"GET", "/containers/x/./exec", ActionDeny, dot},
+		// #70: .. climbing out of the container path.
+		{"GET", "/containers/x/../../exec/abc/json", ActionDeny, dot},
+		// #70: the check runs before the version strip.
+		{"GET", "/v1.45/./_ping", ActionDeny, dot},
+		// #70: every method.
+		{"DELETE", "/containers/..", ActionDeny, dot},
+		{"POST", "/containers/x/./start", ActionDeny, dot},
+		// #70: the dot hid the attach deny too.
+		{"GET", "/containers/./x/attach/ws", ActionDeny, dot},
+		// #70 control: names with dots are names.
+		{"GET", "/containers/.hidden/json", ActionAllow, ""},
+		{"GET", "/containers/a.b/json", ActionAllow, ""},
+		{"GET", "/containers/.../json", ActionAllow, ""},
+		// #70: the // check runs first.
+		{"GET", "//./_ping", ActionDeny, "empty path segment not allowed"},
+		// #70: an encoded dot is denied by the percent check (#53).
+		{"GET", "/containers/%2e/json", ActionDeny, "percent-encoded path not allowed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, nil)
+			if got.Action != tt.want || got.DenyMsg != tt.wantMsg {
+				t.Errorf("Route(%s, %s) = %v/%q, want %v/%q",
+					tt.method, tt.path, got.Action, got.DenyMsg, tt.want, tt.wantMsg)
+			}
+		})
+	}
+}

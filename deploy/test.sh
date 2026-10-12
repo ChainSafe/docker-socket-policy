@@ -510,6 +510,26 @@ check "HEAD /_ping -> 200" "200" "$S"
 S=$(get_status "$PROXY/events?since=1&until=2")
 check "GET /events (bounded) -> 200" "200" "$S"
 
+# #70: a . or .. segment is denied for every method, reads included. Before
+# #70 the leading . of /./exec/... (or the x of /x/../exec/...) hid the exec
+# namespace and the GET passthrough forwarded it; the daemon answered 301 to
+# the clean path. --path-as-is stops curl from resolving the dots.
+dot_get() {
+  : >"$BODY"
+  out=$(curl -s -o "$BODY" -w '%{http_code}' $TIMEOUT --path-as-is --unix-socket "$PROXY_SOCK" \
+    "$1" 2>/dev/null || true)
+  echo "${out:-000}"
+}
+
+S=$(dot_get "$PROXY/./exec/0000000000000000000000000000000000000000000000000000000000000000/json")
+check_denied "GET /./exec/*/json -> 403 (dot segment)" "$S" "$BODY" 'dot path segment not allowed'
+
+S=$(dot_get "$PROXY/x/../exec/0000000000000000000000000000000000000000000000000000000000000000/json")
+check_denied "GET /x/../exec/*/json -> 403 (dot segment)" "$S" "$BODY" 'dot path segment not allowed'
+
+S=$(dot_get "$PROXY/containers/./json")
+check_denied "GET /containers/./json -> 403 (dot segment)" "$S" "$BODY" 'dot path segment not allowed'
+
 # ─── Read-only mode (#75) ────────────────────────────────
 
 # The same config behind --readonly. Every request whose method is not GET or
