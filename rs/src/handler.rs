@@ -627,4 +627,75 @@ mod tests {
         }
         assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
+
+    /// #78: CONNECT is refused before the upgrade check and before routing,
+    /// so the transport never sees it, in origin form and in authority form.
+    /// Before #78 CONNECT /_ping matched the early read-endpoint allow and
+    /// was forwarded.
+    #[tokio::test]
+    async fn test_handler_refuses_connect() {
+        let log_path = std::env::temp_dir().join(format!(
+            "handler-connect-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let manager = Manager::from_map(std::collections::HashMap::new());
+        let router = Arc::new(Router::new(manager));
+        let audit = AuditLogger::new(log_path.to_str().unwrap()).unwrap();
+        let captured_uri = Arc::new(std::sync::Mutex::new(None));
+        let transport = UriRecordingTransport {
+            captured_uri: captured_uri.clone(),
+        };
+        let handler = Handler::new(router, Chain::new(), audit, Box::new(transport));
+        let refused = "CONNECT is not allowed";
+
+        let cases: [(&str, &str, &[(&str, &str)]); 3] = [
+            ("origin form", "/_ping", &[]),
+            ("authority form", "localhost:80", &[]),
+            (
+                "with Upgrade",
+                "/_ping",
+                &[("Upgrade", "websocket"), ("Connection", "Upgrade")],
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, target, headers) in cases {
+            let mut req = Request::builder().method("CONNECT").uri(target);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            let resp = handler.handle(req.body(Full::new(Bytes::new())).unwrap()).await;
+            let status = resp.status();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            if status != StatusCode::FORBIDDEN || body != refused {
+                mismatches.push(format!("{}: got {} {:?}", name, status, String::from_utf8_lossy(&body)));
+            }
+            if captured_uri.lock().unwrap().take().is_some() {
+                mismatches.push(format!("{}: forwarded", name));
+            }
+        }
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let _ = std::fs::remove_file(&log_path);
+        let lines: Vec<&str> = contents.lines().collect();
+        for (i, want_uri) in ["/_ping", "localhost:80", "/_ping"].iter().enumerate() {
+            let Some(line) = lines.get(i) else {
+                mismatches.push(format!("audit entry missing for {}", want_uri));
+                continue;
+            };
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            if entry["method"] != "CONNECT"
+                || entry["uri"] != *want_uri
+                || entry["decision"] != "DENY"
+                || entry["reason"] != refused
+            {
+                mismatches.push(format!("audit entry: {}", entry));
+            }
+        }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
+    }
 }

@@ -795,3 +795,65 @@ allowed_image_prefixes:
 		})
 	}
 }
+
+// TestRouteReadEndpointMethods is the cross-language parity guard for #78.
+//
+// /_ping, /version, /info and /events admit only GET and HEAD, through the
+// read passthrough; every other method gets the default deny. Before #78 an
+// early clause allowed them for every method, and /events as a prefix also
+// matched /eventsxyz. Rows mirror the ping* runs in spec/router.qnt.
+func TestRouteReadEndpointMethods(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m)
+
+	tests := []struct {
+		method  string
+		path    string
+		want    Action
+		wantMsg string
+	}{
+		// pingPostDeniedTest (#78)
+		{"POST", "/_ping", ActionDeny, "endpoint POST /_ping is not allowed"},
+		// pingDeleteDeniedTest (#78)
+		{"DELETE", "/_ping", ActionDeny, "endpoint DELETE /_ping is not allowed"},
+		// #78: every read endpoint, every non-read method.
+		{"DELETE", "/version", ActionDeny, "endpoint DELETE /version is not allowed"},
+		{"PUT", "/info", ActionDeny, "endpoint PUT /info is not allowed"},
+		{"POST", "/events", ActionDeny, "endpoint POST /events is not allowed"},
+		{"CONNECT", "/_ping", ActionDeny, "endpoint CONNECT /_ping is not allowed"},
+		// #78: the daemon's CORS preflight, denied on purpose.
+		{"OPTIONS", "/_ping", ActionDeny, "endpoint OPTIONS /_ping is not allowed"},
+		// #78: the old /events prefix match.
+		{"POST", "/eventsxyz", ActionDeny, "endpoint POST /eventsxyz is not allowed"},
+		// #78: the check runs after the API-version strip.
+		{"POST", "/v1.45/_ping", ActionDeny, "endpoint POST /_ping is not allowed"},
+		// pingGetAllowedTest (#78)
+		{"GET", "/_ping", ActionAllow, ""},
+		// pingHeadAllowedTest (#78)
+		{"HEAD", "/_ping", ActionAllow, ""},
+		{"GET", "/version", ActionAllow, ""},
+		{"HEAD", "/version", ActionAllow, ""},
+		{"GET", "/info", ActionAllow, ""},
+		{"HEAD", "/info", ActionAllow, ""},
+		{"GET", "/events", ActionAllow, ""},
+		{"HEAD", "/events", ActionAllow, ""},
+		{"GET", "/v1.45/_ping", ActionAllow, ""},
+		// #78 pin: a read on an unknown path stays on the passthrough.
+		{"GET", "/eventsxyz", ActionAllow, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, nil)
+			if got.Action != tt.want || got.DenyMsg != tt.wantMsg {
+				t.Errorf("Route(%s, %s) = %v/%q, want %v/%q",
+					tt.method, tt.path, got.Action, got.DenyMsg, tt.want, tt.wantMsg)
+			}
+		})
+	}
+}

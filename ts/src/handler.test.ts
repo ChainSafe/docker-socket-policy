@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { Readable } from "node:stream";
+import { Readable, type Duplex } from "node:stream";
 import { createServer, request, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 import { Handler } from "./handler.js";
 import { Chain } from "./middleware.js";
 import { Router } from "./proxy.js";
@@ -299,6 +299,88 @@ describe("Handler", () => {
       });
       assert.equal(got, "403 protocol upgrade not allowed");
       assert.equal(transport.lastRequest, undefined);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  // #78: CONNECT is refused before the upgrade check and before routing, so
+  // the transport never sees it, in origin form and in authority form. Before
+  // #78 CONNECT /_ping matched the early read-endpoint allow and was forwarded.
+  it("refuses CONNECT", async () => {
+    const dir = makeEnv(defaultConfig);
+    const { handler, transport } = newHandler(dir);
+    const refused = "CONNECT is not allowed";
+    const cases: [string, string, Record<string, string>][] = [
+      ["origin form", "/_ping", {}],
+      ["authority form", "localhost:80", {}],
+      ["with Upgrade", "/_ping", { upgrade: "websocket", connection: "Upgrade" }],
+    ];
+    const mismatches: string[] = [];
+    for (const [name, target, headers] of cases) {
+      const { res, recorder } = makeResponse();
+      await handler.handle(makeRequest("CONNECT", target, undefined, headers), res);
+      if (recorder.statusCode !== 403 || recorder.body !== refused) {
+        mismatches.push(`${name}: got ${recorder.statusCode} ${JSON.stringify(recorder.body)}`);
+      }
+      if (transport.lastRequest) mismatches.push(`${name}: forwarded`);
+      transport.lastRequest = undefined;
+    }
+
+    const lines = readFileSync(join(dir, "audit.log"), "utf-8").trim().split("\n");
+    ["/_ping", "localhost:80", "/_ping"].forEach((uri, i) => {
+      const entry = JSON.parse(lines[i] ?? "{}") as Record<string, string>;
+      if (entry.method !== "CONNECT" || entry.uri !== uri || entry.decision !== "DENY" || entry.reason !== refused) {
+        mismatches.push(`audit entry ${i}: ${lines[i]}`);
+      }
+    });
+    assert.deepEqual(mismatches, []);
+  });
+
+  // #78, TS-only: Node never passes CONNECT to the request handler. With no
+  // "connect" listener it destroys the socket, so the caller got no response
+  // and nothing was audited. The proxy wires Handler.refuseConnect to it.
+  it("refuses CONNECT through a real http.Server", async () => {
+    const dir = makeEnv(defaultConfig);
+    const { handler, transport } = newHandler(dir);
+    const server = createServer((req, res) => void handler.handle(req, res));
+    server.on("connect", (req: IncomingMessage, socket: Duplex) => handler.refuseConnect(req, socket));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const send = (target: string) =>
+      new Promise<string>((resolve, reject) => {
+        const sock = connect(port, "127.0.0.1");
+        let got = "";
+        sock.on("data", (c: Buffer) => (got += c.toString()));
+        sock.on("close", () => resolve(got));
+        sock.on("error", reject);
+        sock.setTimeout(2000, () => sock.destroy(new Error("no response within 2s")));
+        sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: localhost:80\r\n\r\n`);
+      });
+    try {
+      const mismatches: string[] = [];
+      for (const target of ["localhost:80", "/_ping"]) {
+        const got = await send(target);
+        if (!got.startsWith("HTTP/1.1 403 Forbidden\r\n") || !got.endsWith("\r\n\r\nCONNECT is not allowed")) {
+          mismatches.push(`${target}: got ${JSON.stringify(got)}`);
+        }
+      }
+      if (transport.lastRequest) mismatches.push("forwarded");
+      const log = readFileSync(join(dir, "audit.log"), { encoding: "utf-8", flag: "a+" });
+      const lines = log.trim().split("\n");
+      ["localhost:80", "/_ping"].forEach((uri, i) => {
+        const entry = JSON.parse(lines[i] || "{}") as Record<string, string>;
+        if (
+          entry.method !== "CONNECT" ||
+          entry.uri !== uri ||
+          entry.decision !== "DENY" ||
+          entry.reason !== "CONNECT is not allowed"
+        ) {
+          mismatches.push(`audit entry ${i}: ${lines[i]}`);
+        }
+      });
+      assert.deepEqual(mismatches, []);
     } finally {
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));

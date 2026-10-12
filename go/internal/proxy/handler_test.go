@@ -453,3 +453,78 @@ func TestHandlerRefusesProtocolUpgrade(t *testing.T) {
 		t.Fatalf("protocol upgrade mismatches:\n%s", strings.Join(mismatches, "\n"))
 	}
 }
+
+// #78: CONNECT is refused before the upgrade check and before routing, so the
+// transport never sees it, in origin form and in authority form. Before #78
+// CONNECT /_ping matched the early read-endpoint allow and was forwarded.
+func TestHandlerRefusesConnect(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "default.yaml"), []byte("service_name: default\nallowed_image_prefixes:\n  - scratch\n"), 0644)
+	policyManager, err := policy.NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "audit.log")
+	auditLog, err := audit.NewLogger(logPath)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+	defer auditLog.Close()
+	const refused = "CONNECT is not allowed"
+
+	tests := []struct {
+		name    string
+		target  string
+		headers map[string]string
+	}{
+		{"origin form", "/_ping", nil},
+		{"authority form", "localhost:80", nil},
+		{"with Upgrade", "/_ping", map[string]string{"Upgrade": "websocket", "Connection": "Upgrade"}},
+	}
+	var mismatches []string
+	for _, tt := range tests {
+		rec := &recorderTransport{}
+		h := NewHandler(NewRouter(policyManager), middleware.NewChain(), auditLog, rec)
+		req := httptest.NewRequest("CONNECT", tt.target, nil)
+		for k, v := range tt.headers {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if got := strings.TrimSpace(w.Body.String()); w.Code != http.StatusForbidden || got != refused {
+			mismatches = append(mismatches, tt.name+": "+http.StatusText(w.Code)+" "+got)
+		}
+		if rec.lastRequest != nil {
+			mismatches = append(mismatches, tt.name+": forwarded")
+		}
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading audit log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	wantURIs := []string{"/_ping", "localhost:80", "/_ping"}
+	for i, wantURI := range wantURIs {
+		if i >= len(lines) {
+			mismatches = append(mismatches, "audit entry missing for "+wantURI)
+			continue
+		}
+		var entry struct {
+			Method   string `json:"method"`
+			URI      string `json:"uri"`
+			Decision string `json:"decision"`
+			Reason   string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(lines[i]), &entry); err != nil {
+			t.Fatalf("audit line %d: %v", i, err)
+		}
+		if entry.Method != "CONNECT" || entry.URI != wantURI || entry.Decision != "DENY" || entry.Reason != refused {
+			mismatches = append(mismatches, "audit entry: "+lines[i])
+		}
+	}
+
+	if len(mismatches) > 0 {
+		t.Fatalf("CONNECT mismatches:\n%s", strings.Join(mismatches, "\n"))
+	}
+}
