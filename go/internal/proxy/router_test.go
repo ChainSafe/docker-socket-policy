@@ -678,3 +678,70 @@ func TestExtractContainerNameSkipsEmptySegment(t *testing.T) {
 		}
 	}
 }
+
+// TestRouteReadonly is the cross-language parity guard for #75.
+//
+// With --readonly, every request whose method is not GET or HEAD is denied
+// first in the router, for every path. Before #75 the flag only reached the
+// middleware chain, which runs on the create route alone, so lifecycle
+// POSTs, DELETE /containers/{name} and image pulls were forwarded. Rows
+// mirror the readonly* runs in spec/router.qnt.
+func TestRouteReadonly(t *testing.T) {
+	m := newTestManager(t, map[string]string{
+		"beacon.yaml": `
+service_name: beacon
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	})
+	r := NewRouter(m).WithReadonly(true)
+	post := "read-only mode: POST requests are not allowed"
+	createBody := map[string]interface{}{"Image": "chainsafe/lodestar:latest"}
+	pullBody := map[string]interface{}{"fromImage": "chainsafe/lodestar", "tag": "latest"}
+
+	tests := []struct {
+		method  string
+		path    string
+		body    map[string]interface{}
+		want    Action
+		wantMsg string
+	}{
+		// readonlyGetAllowedTest (#75)
+		{"GET", "/containers/json", nil, ActionAllow, ""},
+		// readonlyHeadAllowedTest (#75)
+		{"HEAD", "/containers/mycontainer", nil, ActionAllow, ""},
+		// #75: the read-only endpoints stay allowed.
+		{"GET", "/_ping", nil, ActionAllow, ""},
+		// readonlyLifecycleStopDeniedTest (#75)
+		{"POST", "/containers/mycontainer/stop", nil, ActionDeny, post},
+		// #75: the other lifecycle actions too.
+		{"POST", "/containers/mycontainer/start", nil, ActionDeny, post},
+		// readonlyDeleteDeniedTest (#75)
+		{"DELETE", "/containers/mycontainer", nil, ActionDeny, "read-only mode: DELETE requests are not allowed"},
+		// #75: an image pull of an allowed image.
+		{"POST", "/images/create", pullBody, ActionDeny, post},
+		// readonlyCreateDeniedTest (#75): an allowed image, so only the flag decides.
+		{"POST", "/containers/create", createBody, ActionDeny, post},
+		// #75: methods outside the spec's universe.
+		{"PUT", "/containers/mycontainer/archive", nil, ActionDeny, "read-only mode: PUT requests are not allowed"},
+		// #75: the check runs before the API-version strip.
+		{"POST", "/v1.45/containers/mycontainer/stop", nil, ActionDeny, post},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, tt.body)
+			if got.Action != tt.want || got.DenyMsg != tt.wantMsg {
+				t.Fatalf("Route(%s, %s) = %v/%q, want %v/%q",
+					tt.method, tt.path, got.Action, got.DenyMsg, tt.want, tt.wantMsg)
+			}
+		})
+	}
+
+	// #75: the flag gates the rule; without it a lifecycle POST is routed as before.
+	t.Run("readonly off", func(t *testing.T) {
+		got := NewRouter(m).Route("POST", "/containers/mycontainer/stop", nil)
+		if got.DenyMsg == post {
+			t.Fatalf("Route(POST, /containers/mycontainer/stop) without --readonly = %v/%q", got.Action, got.DenyMsg)
+		}
+	})
+}

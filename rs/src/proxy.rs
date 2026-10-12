@@ -809,6 +809,78 @@ mod tests {
         assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
     }
 
+    /// Cross-language parity guard for #75. With --readonly, every request
+    /// whose method is not GET or HEAD is denied first in the router, for
+    /// every path. Before #75 the flag only reached the middleware chain,
+    /// which runs on the create route alone, so lifecycle POSTs, DELETE
+    /// /containers/{name} and image pulls were forwarded. Rows mirror the
+    /// readonly* runs in spec/router.qnt.
+    #[test]
+    fn test_route_readonly() {
+        let router = Router::new(make_manager(vec!["chainsafe/lodestar"])).with_readonly(true);
+        let post = Some("read-only mode: POST requests are not allowed");
+        let create_body: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Image": "chainsafe/lodestar:latest"})).unwrap();
+        let pull_body: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"fromImage": "chainsafe/lodestar", "tag": "latest"})).unwrap();
+        let cases = [
+            // readonlyGetAllowedTest (#75)
+            ("GET", "/containers/json", None, Action::Allow, None),
+            // readonlyHeadAllowedTest (#75)
+            ("HEAD", "/containers/mycontainer", None, Action::Allow, None),
+            // #75: the read-only endpoints stay allowed.
+            ("GET", "/_ping", None, Action::Allow, None),
+            // readonlyLifecycleStopDeniedTest (#75)
+            ("POST", "/containers/mycontainer/stop", None, Action::Deny, post),
+            // #75: the other lifecycle actions too.
+            ("POST", "/containers/mycontainer/start", None, Action::Deny, post),
+            // readonlyDeleteDeniedTest (#75)
+            (
+                "DELETE",
+                "/containers/mycontainer",
+                None,
+                Action::Deny,
+                Some("read-only mode: DELETE requests are not allowed"),
+            ),
+            // #75: an image pull of an allowed image.
+            ("POST", "/images/create", Some(&pull_body), Action::Deny, post),
+            // readonlyCreateDeniedTest (#75): an allowed image, so only the flag decides.
+            ("POST", "/containers/create", Some(&create_body), Action::Deny, post),
+            // #75: methods outside the spec's universe.
+            (
+                "PUT",
+                "/containers/mycontainer/archive",
+                None,
+                Action::Deny,
+                Some("read-only mode: PUT requests are not allowed"),
+            ),
+            // #75: the check runs before the API-version strip.
+            ("POST", "/v1.45/containers/mycontainer/stop", None, Action::Deny, post),
+        ];
+        let mut mismatches = Vec::new();
+        for (method, path, body, want, want_msg) in cases {
+            let got = router.route(method, path, body);
+            if got.action != want || got.deny_msg.as_deref() != want_msg {
+                mismatches.push(format!(
+                    "{} {}: got {:?}/{}, want {:?}/{}",
+                    method,
+                    path,
+                    got.action,
+                    got.deny_msg.as_deref().unwrap_or("-"),
+                    want,
+                    want_msg.unwrap_or("-")
+                ));
+            }
+        }
+        // #75: the flag gates the rule; without it a lifecycle POST is routed as before.
+        let off =
+            Router::new(make_manager(vec!["chainsafe/lodestar"])).route("POST", "/containers/mycontainer/stop", None);
+        if off.deny_msg.as_deref() == post {
+            mismatches.push("POST /containers/mycontainer/stop without --readonly: got the read-only deny".to_string());
+        }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
+    }
+
     #[test]
     fn test_extract_container_name_skips_empty_segment() {
         for path in ["/containers/", "/containers//start"] {

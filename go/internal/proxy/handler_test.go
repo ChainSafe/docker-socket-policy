@@ -210,6 +210,28 @@ func TestHandlerAuditURIIsRequestTarget(t *testing.T) {
 	}
 }
 
+// #75: --readonly is enforced in the router, so a delete never reaches the
+// daemon. Before #75 the flag only reached the chain, which runs on create.
+func TestHandler_ReadonlyDeniesDelete(t *testing.T) {
+	rec := &recorderTransport{}
+	h := newTestHandler(t, nil, rec)
+	h.router = h.router.WithReadonly(true)
+
+	req := httptest.NewRequest("DELETE", "/containers/mycontainer", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != "read-only mode: DELETE requests are not allowed" {
+		t.Fatalf("deny reason = %q", got)
+	}
+	if rec.lastRequest != nil {
+		t.Fatal("expected no forward in read-only mode")
+	}
+}
+
 func TestHandler_CreateContainerValid(t *testing.T) {
 	rec := &recorderTransport{}
 	h := newTestHandler(t, map[string]string{
