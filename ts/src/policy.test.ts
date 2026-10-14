@@ -152,3 +152,151 @@ describe("parseImageRef (#84)", () => {
     }
   });
 });
+
+describe("Manager container names", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "policy-names-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // The cross-language parity guard for the #85 load-time checks. Two
+  // policies conflict when their image prefixes share a namespace and one has
+  // no container_names or their container_names intersect. Before #85 every
+  // row loaded, and a duplicate service_name silently replaced the first file.
+  it("validates policies at load time", () => {
+    const cases: [string, Record<string, string>, string][] = [
+      [
+        "same prefix, no container_names",
+        {
+          "a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\n",
+          "b.yaml": "service_name: b\nallowed_image_prefixes: [alpine]\n",
+        },
+        'conflicting policies "a" (a.yaml) and "b" (b.yaml): image prefixes "alpine" and "alpine" overlap and "a" has no container_names',
+      ],
+      [
+        "one side has no container_names",
+        {
+          "a.yaml": "service_name: a\ncontainer_names: [x]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+          "b.yaml": "service_name: b\nallowed_image_prefixes: [chainsafe]\n",
+        },
+        'conflicting policies "a" (a.yaml) and "b" (b.yaml): image prefixes "chainsafe/lodestar" and "chainsafe" overlap and "b" has no container_names',
+      ],
+      [
+        "shared container name",
+        {
+          "a.yaml": "service_name: a\ncontainer_names: [x, y]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+          "b.yaml": "service_name: b\ncontainer_names: [z, y]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+        },
+        'conflicting policies "a" (a.yaml) and "b" (b.yaml): image prefixes "chainsafe/lodestar" and "chainsafe/lodestar" overlap and both accept container name "y"',
+      ],
+      [
+        "disjoint container names",
+        {
+          "a.yaml": "service_name: a\ncontainer_names: [beacon]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+          "b.yaml": "service_name: b\ncontainer_names: [validator]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+        },
+        "",
+      ],
+      [
+        "sibling prefixes do not overlap",
+        {
+          "a.yaml": "service_name: a\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+          "b.yaml": "service_name: b\nallowed_image_prefixes: [chainsafe/lodestar-backup]\n",
+        },
+        "",
+      ],
+      [
+        "duplicate service_name",
+        {
+          "a.yaml": "service_name: svc\nallowed_image_prefixes: [alpine]\n",
+          "b.yaml": "service_name: svc\nallowed_image_prefixes: [busybox]\n",
+        },
+        'policies in a.yaml and b.yaml both use service_name "svc"',
+      ],
+      [
+        "invalid container name",
+        { "a.yaml": "service_name: a\ncontainer_names: [-bad]\nallowed_image_prefixes: [alpine]\n" },
+        'invalid container name "-bad" in container_names',
+      ],
+      [
+        "container name with a slash",
+        { "a.yaml": "service_name: a\ncontainer_names: [a/b]\nallowed_image_prefixes: [alpine]\n" },
+        'invalid container name "a/b" in container_names',
+      ],
+      [
+        "empty container_names",
+        { "a.yaml": "service_name: a\ncontainer_names: []\nallowed_image_prefixes: [alpine]\n" },
+        "container_names must not be empty",
+      ],
+    ];
+    const mismatches: string[] = [];
+    for (const [name, files, want] of cases) {
+      const dir = mkdtempSync(join(tmpDir, "case-"));
+      for (const [file, content] of Object.entries(files)) writeFileSync(join(dir, file), content);
+      let err: string | undefined;
+      try {
+        new Manager(dir);
+      } catch (e) {
+        err = (e as Error).message;
+      }
+      if (want === "" && err !== undefined) mismatches.push(`${name}: ${err}`);
+      if (want !== "" && err === undefined) mismatches.push(`${name}: loaded, want error ${want}`);
+      if (want !== "" && err !== undefined && !err.includes(want))
+        mismatches.push(`${name}: error ${err}, want ${want}`);
+    }
+    assert.deepEqual(mismatches, []);
+  });
+
+  // #85 selection: the one policy matching the image and accepting the name,
+  // the nameless create, and ambiguity.
+  it("selects the create policy by image and name", () => {
+    const beacon = {
+      service_name: "beacon",
+      container_names: ["beacon"],
+      allowed_image_prefixes: ["chainsafe/lodestar"],
+    };
+    const validator = {
+      service_name: "validator",
+      container_names: ["validator"],
+      allowed_image_prefixes: ["chainsafe/lodestar"],
+    };
+    let m = Manager.fromPolicies([validator, beacon, { service_name: "any", allowed_image_prefixes: ["chainsafe"] }]);
+    for (let i = 0; i < 50; i++) {
+      for (const name of ["beacon", "validator"]) {
+        assert.deepEqual(m.selectForCreate("chainsafe/lodestar:v1", name), {
+          error: `ambiguous policy for image chainsafe/lodestar:v1 and name ${name}: any, ${name}`,
+        });
+      }
+    }
+    const nameless = m.selectForCreate("chainsafe/lodestar:v1", "");
+    assert.ok("policy" in nameless && nameless.policy.service_name === "any");
+
+    m = Manager.fromPolicies([validator, beacon]);
+    for (let i = 0; i < 50; i++) {
+      for (const name of ["beacon", "validator"]) {
+        const got = m.selectForCreate("chainsafe/lodestar:v1", name);
+        assert.ok("policy" in got && got.policy.service_name === name, `iteration ${i}: ${JSON.stringify(got)}`);
+      }
+    }
+  });
+
+  it("reports the policies covering a name", () => {
+    const m = Manager.fromPolicies([
+      { service_name: "beacon", allowed_image_prefixes: ["chainsafe/lodestar"] },
+      { service_name: "vc", container_names: ["validator"], allowed_image_prefixes: ["chainsafe/lodestar"] },
+    ]);
+    for (const [name, want] of [
+      ["beacon", 1],
+      ["validator", 1],
+      ["vc", 0],
+      ["other", 0],
+    ] as const) {
+      assert.equal(m.covering(name).length, want, `covering(${name})`);
+    }
+  });
+});

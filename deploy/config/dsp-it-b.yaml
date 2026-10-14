@@ -1,0 +1,15 @@
+# Integration-test policy for #85 and #86 (deploy/test.sh). dsp-it-a and
+# dsp-it-b allow one image, the test runner's own, and are told apart by
+# container_names; each forces its own user so the test can see which one a
+# create got. Without disjoint container_names the two would fail to load.
+service_name: dsp-it-b
+container_names:
+  - dsp-it-b
+
+allowed_image_prefixes:
+  - docker-socket-policy-test-go-test
+  - docker-socket-policy-test-rs-test
+  - docker-socket-policy-test-ts-test
+
+container_config:
+  user: '2222:2222'

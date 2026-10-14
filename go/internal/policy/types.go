@@ -4,6 +4,7 @@ import "encoding/json"
 
 type Policy struct {
 	ServiceName          string          `yaml:"service_name"`
+	ContainerNames       []string        `yaml:"container_names"`
 	UserID               string          `yaml:"user_id"`
 	GroupID              string          `yaml:"group_id"`
 	AllowedImagePrefixes []string        `yaml:"allowed_image_prefixes"`
@@ -16,6 +17,30 @@ type Policy struct {
 	AllowedCLIFlags      []string        `yaml:"allowed_cli_flags"`
 	FlagRules            []FlagRule      `yaml:"flag_rules"`
 	DeniedFlags          []string        `yaml:"denied_flags"`
+}
+
+// CoveredNames are the container names the policy manages: its
+// container_names, or its service_name when container_names is unset (#85,
+// #86). Lifecycle actions and DELETE are forwarded only for covered names.
+func (p *Policy) CoveredNames() []string {
+	if p.ContainerNames != nil {
+		return p.ContainerNames
+	}
+	return []string{p.ServiceName}
+}
+
+// AcceptsName reports whether a create named name may use the policy: a
+// policy without container_names accepts any name, including none (#85).
+func (p *Policy) AcceptsName(name string) bool {
+	if p.ContainerNames == nil {
+		return true
+	}
+	for _, n := range p.ContainerNames {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 type ContainerConfig struct {

@@ -1,6 +1,6 @@
 use crate::audit::AuditLogger;
 use crate::middleware::Chain;
-use crate::proxy::{Action, Router};
+use crate::proxy::{Action, RouteResult, Router};
 use crate::transport::Transport;
 use crate::transport::TransportError;
 use bytes::Bytes;
@@ -89,14 +89,26 @@ impl Handler {
 
         // Route on the raw target: the path still percent-encoded (#53), and the
         // query, which the image pull reads (#83).
-        let route = self
+        let mut route = self
             .router
             .route_request(&method, &target, !body_bytes.is_empty(), body_json.as_ref());
+
+        // A lifecycle action or DELETE on a name that no policy covers
+        // directly: ask the daemon which container it is (#86).
+        if route.action == Action::ResolveContainer {
+            let id = route.container.clone().unwrap_or_default();
+            route = self.resolve_container(&id).await;
+        }
 
         if route.action == Action::Deny {
             let msg = route.deny_msg.unwrap_or_default();
             warn!("denied {} {}: {}", method, path, msg);
-            self.audit.deny(&method, &target, &msg);
+            match &route.resolved_name {
+                Some(name) => self
+                    .audit
+                    .deny(&method, &target, &format!("{} (resolved to {})", msg, name)),
+                None => self.audit.deny(&method, &target, &msg),
+            }
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Full::new(Bytes::from(msg)))
@@ -121,7 +133,18 @@ impl Handler {
         }
 
         info!("allowed {} {}", method, path);
-        self.audit.allow(&method, &target);
+        match &route.resolved_name {
+            Some(name) => self.audit.allow_reason(
+                &method,
+                &target,
+                &format!(
+                    "container {} resolved to {}",
+                    route.container.as_deref().unwrap_or(""),
+                    name
+                ),
+            ),
+            None => self.audit.allow(&method, &target),
+        }
 
         let mut forwarded = Request::builder()
             .method(method.as_str())
@@ -152,6 +175,97 @@ impl Handler {
             }
         }
     }
+}
+
+impl Handler {
+    /// Asks the daemon for GET /containers/{id}/json and allows the request
+    /// only if the container's name is covered by a policy. A 404, an
+    /// uncovered name or any other failure denies: it fails closed (#86).
+    async fn resolve_container(&self, id: &str) -> RouteResult {
+        let not_managed = |resolved: Option<String>| RouteResult {
+            resolved_name: resolved,
+            ..deny_result(format!("container {} is not managed by any policy", id))
+        };
+        let cannot_resolve = |reason: String| deny_result(format!("cannot resolve container {}: {}", id, reason));
+
+        let req = match Request::builder()
+            .method("GET")
+            .uri(format!("/containers/{}/json", path_escape(id)))
+            .header(header::HOST, "docker")
+            .body(Full::new(Bytes::new()))
+        {
+            Ok(r) => r,
+            Err(e) => return cannot_resolve(e.to_string()),
+        };
+        let resp = match self.transport.forward(req).await {
+            Ok(r) => r,
+            Err(e) => return cannot_resolve(e.to_string()),
+        };
+        match resp.status() {
+            StatusCode::OK => {}
+            StatusCode::NOT_FOUND => return not_managed(None),
+            other => return cannot_resolve(format!("daemon returned {}", other.as_u16())),
+        }
+        let body = match resp.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return cannot_resolve("unreadable inspect response".into()),
+        };
+        let name = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("Name").and_then(|n| n.as_str()).map(str::to_string))
+            .filter(|n| !n.is_empty());
+        let Some(name) = name else {
+            return cannot_resolve("unreadable inspect response".into());
+        };
+        let name = name.strip_prefix('/').unwrap_or(&name).to_string();
+
+        let covering = self.router.manager().covering(&name);
+        if covering.is_empty() {
+            return not_managed(Some(name));
+        }
+        let policy = if covering.len() == 1 {
+            Some(covering[0].clone())
+        } else {
+            None
+        };
+        RouteResult {
+            action: Action::Allow,
+            service: policy.as_ref().map(|p| p.service_name.clone()),
+            policy,
+            body: None,
+            container: Some(id.to_string()),
+            resolved_name: Some(name),
+            image: None,
+            deny_msg: None,
+        }
+    }
+}
+
+fn deny_result(msg: String) -> RouteResult {
+    RouteResult {
+        action: Action::Deny,
+        service: None,
+        policy: None,
+        body: None,
+        container: None,
+        resolved_name: None,
+        image: None,
+        deny_msg: Some(msg),
+    }
+}
+
+/// Percent-encodes everything but RFC 3986 unreserved characters, so the id
+/// stays one path segment.
+fn path_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 /// An Upgrade header, or a Connection header that lists the upgrade token.
@@ -225,6 +339,7 @@ mod tests {
             "svc".into(),
             Policy {
                 service_name: "svc".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: vec!["alpine".into()],
@@ -319,6 +434,7 @@ mod tests {
             "svc".into(),
             Policy {
                 service_name: "svc".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: vec!["alpine".into()],
@@ -375,6 +491,7 @@ mod tests {
             "svc".into(),
             Policy {
                 service_name: "svc".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: vec!["alpine".into()],
@@ -804,5 +921,294 @@ mod tests {
             "image busybox not allowed by any policy"
         );
         assert!(captured_uri.lock().unwrap().is_none(), "expected no forward");
+    }
+
+    const BEACON_ID: &str = "4f6e1d2c9a7b8c3d4e5f60718293a4b5c6d7e8f9012345678901234567890abc";
+    const MONITORING_ID: &str = "9d8c7b6a5f4e3d2c1b0a99887766554433221100ffeeddccbbaa998877665544";
+
+    /// Answers GET /containers/{id}/json from a table of id -> container
+    /// name, as the daemon does, and records every request.
+    struct DaemonTransport {
+        names: HashMap<String, String>,
+        status: Option<StatusCode>,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        last_body: Arc<std::sync::Mutex<Option<Bytes>>>,
+    }
+
+    #[async_trait]
+    impl Transport for DaemonTransport {
+        async fn forward(&self, req: Request<Full<Bytes>>) -> Result<Response<Full<Bytes>>, TransportError> {
+            let path = req.uri().path().to_string();
+            self.requests.lock().unwrap().push(format!("{} {}", req.method(), path));
+            if req.method() == Method::GET && path.starts_with("/containers/") && path.ends_with("/json") {
+                if let Some(status) = self.status {
+                    return Ok(Response::builder()
+                        .status(status)
+                        .body(Full::new(Bytes::from("boom")))
+                        .unwrap());
+                }
+                let id = &path["/containers/".len()..path.len() - "/json".len()];
+                return Ok(match self.names.get(id) {
+                    Some(name) => Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from(
+                            serde_json::json!({"Id": "4f6e1d2c9a7b", "Name": format!("/{name}")}).to_string(),
+                        )))
+                        .unwrap(),
+                    None => Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Full::new(Bytes::from("no such container")))
+                        .unwrap(),
+                });
+            }
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            *self.last_body.lock().unwrap() = Some(body);
+            Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Full::new(Bytes::new()))
+                .unwrap())
+        }
+    }
+
+    struct DaemonHandle {
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        last_body: Arc<std::sync::Mutex<Option<Bytes>>>,
+        log_path: std::path::PathBuf,
+    }
+
+    fn make_daemon_handler(files: &[(&str, &str)], status: Option<StatusCode>) -> (Handler, DaemonHandle) {
+        let names: HashMap<String, String> = [
+            ("beacon", "beacon"),
+            (BEACON_ID, "beacon"),
+            (&BEACON_ID[..12], "beacon"),
+            ("dsp-monitoring", "dsp-monitoring"),
+            (MONITORING_ID, "dsp-monitoring"),
+            (&MONITORING_ID[..12], "dsp-monitoring"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let last_body = Arc::new(std::sync::Mutex::new(None));
+        let transport = DaemonTransport {
+            names,
+            status,
+            requests: requests.clone(),
+            last_body: last_body.clone(),
+        };
+        let log_path = std::env::temp_dir().join(format!(
+            "handler-coverage-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let manager = crate::policy::tests::load_dir(files).unwrap();
+        let audit = AuditLogger::new(log_path.to_str().unwrap()).unwrap();
+        let handler = Handler::new(Arc::new(Router::new(manager)), Chain::new(), audit, Box::new(transport));
+        (
+            handler,
+            DaemonHandle {
+                requests,
+                last_body,
+                log_path,
+            },
+        )
+    }
+
+    const BEACON_ONLY: [(&str, &str); 1] = [(
+        "beacon.yaml",
+        "service_name: beacon\nallowed_image_prefixes:\n  - chainsafe/lodestar\n",
+    )];
+
+    async fn send(handler: &Handler, method: &str, target: &str, body: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method(method)
+            .uri(format!("http://localhost{target}"))
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The handler half of #86: a lifecycle action or DELETE is forwarded
+    /// only if its target is a container a policy covers. A name, full ID or
+    /// short ID is resolved with GET /containers/{id}/json. Before #86 every
+    /// row was forwarded.
+    #[tokio::test]
+    async fn test_handler_lifecycle_coverage() {
+        let not_managed = |id: &str| format!("container {id} is not managed by any policy");
+        let inspect = |id: &str| vec![format!("GET /containers/{id}/json")];
+        let beacon_short = &BEACON_ID[..12];
+        let mon_short = &MONITORING_ID[..12];
+        let cases: Vec<(&str, &str, String, StatusCode, String, Vec<String>)> = vec![
+            (
+                "covered name",
+                "POST",
+                "/v1.45/containers/beacon/stop?t=1".into(),
+                StatusCode::NO_CONTENT,
+                String::new(),
+                vec![],
+            ),
+            (
+                "covered full ID",
+                "POST",
+                format!("/containers/{BEACON_ID}/kill"),
+                StatusCode::NO_CONTENT,
+                String::new(),
+                inspect(BEACON_ID),
+            ),
+            (
+                "covered short ID",
+                "DELETE",
+                format!("/containers/{beacon_short}?force=1"),
+                StatusCode::NO_CONTENT,
+                String::new(),
+                inspect(beacon_short),
+            ),
+            // uncoveredNameStopDeniedTest: an operator container.
+            (
+                "uncovered name",
+                "POST",
+                "/containers/dsp-monitoring/stop".into(),
+                StatusCode::FORBIDDEN,
+                not_managed("dsp-monitoring"),
+                inspect("dsp-monitoring"),
+            ),
+            (
+                "uncovered full ID",
+                "POST",
+                format!("/containers/{MONITORING_ID}/kill"),
+                StatusCode::FORBIDDEN,
+                not_managed(MONITORING_ID),
+                inspect(MONITORING_ID),
+            ),
+            (
+                "uncovered short ID",
+                "DELETE",
+                format!("/containers/{mon_short}"),
+                StatusCode::FORBIDDEN,
+                not_managed(mon_short),
+                inspect(mon_short),
+            ),
+            // realNameDeleteDeniedTest: the daemon answers 404.
+            (
+                "unknown name",
+                "DELETE",
+                "/containers/mycontainer".into(),
+                StatusCode::FORBIDDEN,
+                not_managed("mycontainer"),
+                inspect("mycontainer"),
+            ),
+            // execPrefixNameStartDeniedTest
+            (
+                "unknown exec-prefixed name",
+                "POST",
+                "/containers/exec-runner/start".into(),
+                StatusCode::FORBIDDEN,
+                not_managed("exec-runner"),
+                inspect("exec-runner"),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, method, target, status, body, inspects) in cases {
+            let (handler, d) = make_daemon_handler(&BEACON_ONLY, None);
+            let (got_status, got_body) = send(&handler, method, &target, "").await;
+            let _ = std::fs::remove_file(&d.log_path);
+            if got_status != status || (!body.is_empty() && got_body != body) {
+                mismatches.push(format!("{name}: got {got_status} {got_body:?}, want {status} {body:?}"));
+            }
+            let mut want = inspects;
+            if status != StatusCode::FORBIDDEN {
+                want.push(format!("{method} {}", target.split('?').next().unwrap()));
+            }
+            let seen = d.requests.lock().unwrap().clone();
+            if seen != want {
+                mismatches.push(format!("{name}: daemon saw {seen:?}, want {want:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
+    }
+
+    /// A daemon error other than 404 fails closed with its own message (#86).
+    #[tokio::test]
+    async fn test_handler_lifecycle_resolve_fails_closed() {
+        let (handler, d) = make_daemon_handler(&BEACON_ONLY, Some(StatusCode::INTERNAL_SERVER_ERROR));
+        let short = &BEACON_ID[..12];
+        let (status, body) = send(&handler, "POST", &format!("/containers/{short}/stop"), "").await;
+        let _ = std::fs::remove_file(&d.log_path);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, format!("cannot resolve container {short}: daemon returned 500"));
+        assert_eq!(d.requests.lock().unwrap().len(), 1, "only the inspect");
+    }
+
+    /// The resolved name is audited with the request (#86).
+    #[tokio::test]
+    async fn test_handler_lifecycle_audits_resolved_name() {
+        let (handler, d) = make_daemon_handler(&BEACON_ONLY, None);
+        send(&handler, "POST", &format!("/containers/{}/start", &BEACON_ID[..12]), "").await;
+        send(
+            &handler,
+            "POST",
+            &format!("/containers/{}/start", &MONITORING_ID[..12]),
+            "",
+        )
+        .await;
+        let contents = std::fs::read_to_string(&d.log_path).unwrap();
+        let _ = std::fs::remove_file(&d.log_path);
+        let lines: Vec<serde_json::Value> = contents.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2, "{contents}");
+        assert_eq!(lines[0]["decision"], "ALLOW");
+        assert_eq!(
+            lines[0]["reason"],
+            format!("container {} resolved to beacon", &BEACON_ID[..12])
+        );
+        assert_eq!(lines[1]["decision"], "DENY");
+        assert_eq!(
+            lines[1]["reason"],
+            format!(
+                "container {} is not managed by any policy (resolved to dsp-monitoring)",
+                &MONITORING_ID[..12]
+            )
+        );
+    }
+
+    /// The #85 reproduction through the handler: two policies for one image
+    /// force different users, and each create named for one of them gets
+    /// that policy's user, every time.
+    #[tokio::test]
+    async fn test_handler_create_selects_by_name() {
+        let files = [
+            (
+                "a.yaml",
+                "service_name: svc-a\ncontainer_names: [svc-a]\nallowed_image_prefixes: [alpine]\ncontainer_config: { user: \"1111:1111\" }\n",
+            ),
+            (
+                "b.yaml",
+                "service_name: svc-b\ncontainer_names: [svc-b]\nallowed_image_prefixes: [alpine]\ncontainer_config: { user: \"2222:2222\" }\n",
+            ),
+        ];
+        let (handler, d) = make_daemon_handler(&files, None);
+        let body = r#"{"Image":"alpine:3.20","Cmd":["true"]}"#;
+        for i in 0..50 {
+            for (name, user) in [("svc-a", "1111:1111"), ("svc-b", "2222:2222")] {
+                *d.last_body.lock().unwrap() = None;
+                let (status, msg) =
+                    send(&handler, "POST", &format!("/v1.45/containers/create?name={name}"), body).await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "iteration {i} {name}: {msg}");
+                let fwd: serde_json::Value =
+                    serde_json::from_slice(d.last_body.lock().unwrap().as_ref().unwrap()).unwrap();
+                assert_eq!(fwd["User"], user, "iteration {i}: create ?name={name}");
+            }
+        }
+        let (status, msg) = send(&handler, "POST", "/containers/create", r#"{"Image":"alpine:3.20"}"#).await;
+        let _ = std::fs::remove_file(&d.log_path);
+        assert_eq!(
+            (status, msg.as_str()),
+            (StatusCode::FORBIDDEN, "image alpine:3.20 requires a container name")
+        );
     }
 }

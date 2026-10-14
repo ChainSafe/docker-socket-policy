@@ -4,6 +4,7 @@ import { parse } from "yaml";
 
 export interface Policy {
   service_name: string;
+  container_names?: string[];
   user_id?: string;
   group_id?: string;
   allowed_image_prefixes: string[];
@@ -38,10 +39,43 @@ export interface FlagRule {
   value_pattern: string;
 }
 
+// A Docker container name without the optional leading slash (#85).
+const VALID_CONTAINER_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+
+export function validContainerName(name: string): boolean {
+  return VALID_CONTAINER_NAME.test(name);
+}
+
+// The container names a policy manages: its container_names, or its
+// service_name when container_names is unset (#85, #86). Lifecycle actions and
+// DELETE are forwarded only for covered names.
+export function coveredNames(p: Policy): string[] {
+  return p.container_names ?? [p.service_name];
+}
+
+// Whether a create named `name` may use the policy: a policy without
+// container_names accepts any name, including none (#85).
+export function acceptsName(p: Policy, name: string): boolean {
+  return p.container_names === undefined || p.container_names === null || p.container_names.includes(name);
+}
+
 export class Manager {
   private policiesByName = new Map<string, Policy>();
+  // Sorted by service_name, so selection never depends on load order (#85).
+  private ordered: Policy[] = [];
 
-  constructor(configDir: string) {
+  // Builds a manager without load-time validation, as Go's
+  // NewManagerFromPolicies and Rust's Manager::from_map do. Tests use it to
+  // reach states that the constructor refuses, such as ambiguity.
+  static fromPolicies(policies: Policy[]): Manager {
+    const m = new Manager(undefined);
+    for (const p of policies) m.policiesByName.set(p.service_name, p);
+    m.sortPolicies();
+    return m;
+  }
+
+  constructor(configDir: string | undefined) {
+    if (configDir === undefined) return;
     let entries: string[];
     try {
       entries = readdirSync(configDir);
@@ -54,7 +88,8 @@ export class Manager {
       }
     }
 
-    for (const entry of entries) {
+    const fileOf = new Map<string, string>();
+    for (const entry of [...entries].sort()) {
       if (!entry.endsWith(".yaml") && !entry.endsWith(".yml")) continue;
 
       const filePath = join(configDir, entry);
@@ -67,6 +102,25 @@ export class Manager {
       if (!policy.allowed_image_prefixes?.length) {
         throw new Error(`policy file ${entry} missing required field 'allowed_image_prefixes'`);
       }
+      if (policy.container_names === null) delete policy.container_names;
+      if (policy.container_names !== undefined) {
+        if (!Array.isArray(policy.container_names) || policy.container_names.length === 0) {
+          throw new Error(`policy file ${entry}: container_names must not be empty`);
+        }
+        const bad = policy.container_names.find((n) => typeof n !== "string" || !validContainerName(n));
+        if (bad !== undefined) {
+          throw new Error(`policy file ${entry}: invalid container name ${JSON.stringify(bad)} in container_names`);
+        }
+      }
+      // A second file with the same service_name used to replace the first
+      // silently (#85).
+      const prev = fileOf.get(policy.service_name);
+      if (prev !== undefined) {
+        throw new Error(
+          `policies in ${prev} and ${entry} both use service_name ${JSON.stringify(policy.service_name)}`,
+        );
+      }
+      fileOf.set(policy.service_name, entry);
       // Prefixes are compared in normalised form (#84).
       policy.allowed_image_prefixes = policy.allowed_image_prefixes.map((prefix) => {
         try {
@@ -77,6 +131,43 @@ export class Manager {
       });
 
       this.policiesByName.set(policy.service_name, policy);
+    }
+
+    this.sortPolicies();
+    this.checkConflicts(fileOf);
+  }
+
+  private sortPolicies(): void {
+    this.ordered = [...this.policiesByName.values()].sort((a, b) =>
+      a.service_name < b.service_name ? -1 : a.service_name > b.service_name ? 1 : 0,
+    );
+  }
+
+  // Fails when two policies could both be selected for one create: their
+  // image prefixes share a namespace, and one of them accepts any name or
+  // their container_names intersect (#85).
+  private checkConflicts(fileOf: Map<string, string>): void {
+    const q = JSON.stringify;
+    for (let i = 0; i < this.ordered.length; i++) {
+      for (const b of this.ordered.slice(i + 1)) {
+        const a = this.ordered[i];
+        const pair = overlappingPrefixes(a.allowed_image_prefixes, b.allowed_image_prefixes);
+        if (!pair) continue;
+        let reason: string;
+        if (a.container_names === undefined) {
+          reason = `${q(a.service_name)} has no container_names`;
+        } else if (b.container_names === undefined) {
+          reason = `${q(b.service_name)} has no container_names`;
+        } else {
+          const shared = a.container_names.filter((n) => b.container_names!.includes(n)).sort();
+          if (shared.length === 0) continue;
+          reason = `both accept container name ${q(shared[0])}`;
+        }
+        throw new Error(
+          `conflicting policies ${q(a.service_name)} (${fileOf.get(a.service_name)}) and ${q(b.service_name)} ` +
+            `(${fileOf.get(b.service_name)}): image prefixes ${q(pair[0])} and ${q(pair[1])} overlap and ${reason}`,
+        );
+      }
     }
   }
 
@@ -93,15 +184,61 @@ export class Manager {
     } catch {
       return undefined;
     }
-    for (const policy of this.policiesByName.values()) {
-      if (matchesImagePrefix(name, policy.allowed_image_prefixes)) return policy;
+    return this.matchingImage(name)[0];
+  }
+
+  // The policies, sorted by service_name, whose prefixes match a normalised
+  // repository name (#85).
+  matchingImage(name: string): Policy[] {
+    return this.ordered.filter((p) => matchesImagePrefix(name, p.allowed_image_prefixes));
+  }
+
+  // The one policy whose image prefixes match the normalised repository of
+  // imageRef and which accepts the container name ("" for a create without
+  // ?name=). No match, or more than one, is an error whose text is the deny
+  // message (#85).
+  selectForCreate(imageRef: string, name: string): { policy: Policy } | { error: string } {
+    let imageName: string;
+    try {
+      imageName = parseImageRef(imageRef).name;
+    } catch (err) {
+      return { error: (err as Error).message };
     }
-    return undefined;
+    const matching = this.matchingImage(imageName);
+    const candidates = matching.filter((p) => acceptsName(p, name));
+    if (matching.length === 0) return { error: `image ${imageRef} not allowed by any policy` };
+    if (candidates.length === 0 && name === "") return { error: `image ${imageRef} requires a container name` };
+    if (candidates.length === 0) {
+      return { error: `container name ${name} not allowed for image ${imageRef} by any policy` };
+    }
+    if (candidates.length > 1) {
+      return {
+        error: `ambiguous policy for image ${imageRef} and name ${name}: ${candidates.map((p) => p.service_name).join(", ")}`,
+      };
+    }
+    return { policy: candidates[0] };
+  }
+
+  // The policies, sorted by service_name, whose covered names include name
+  // (#86).
+  covering(name: string): Policy[] {
+    return this.ordered.filter((p) => coveredNames(p).includes(name));
   }
 
   list(): string[] {
-    return [...this.policiesByName.keys()];
+    return this.ordered.map((p) => p.service_name);
   }
+}
+
+// The first pair of prefixes where one equals the other or is a namespace (/)
+// prefix of it.
+function overlappingPrefixes(as: string[], bs: string[]): [string, string] | undefined {
+  for (const a of as) {
+    for (const b of bs) {
+      if (a === b || a.startsWith(b + "/") || b.startsWith(a + "/")) return [a, b];
+    }
+  }
+  return undefined;
 }
 
 // A parsed image reference (#84). `name` is the normalised repository: the

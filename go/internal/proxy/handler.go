@@ -3,9 +3,11 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/ChainSafe/docker-socket-policy/go/internal/audit"
@@ -80,6 +82,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	route := h.router.RouteRequest(r.Method, target, len(body) > 0, bodyJSON)
 
+	// A lifecycle action or DELETE on a name that no policy covers directly:
+	// ask the daemon which container it is (#86).
+	if route.Action == ActionResolveContainer {
+		route = h.resolveContainer(r, route.Container)
+	}
+
 	extra := map[string]interface{}{
 		"method": r.Method,
 		"path":   path,
@@ -89,6 +97,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if route.Image != "" {
 		extra["image"] = route.Image
+	}
+	if route.Container != "" {
+		extra["container"] = route.Container
+	}
+	if route.ResolvedName != "" {
+		extra["resolved_name"] = route.ResolvedName
 	}
 
 	if route.Action == ActionDeny {
@@ -121,6 +135,91 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.auditLog.Allow(r.Method, r.RequestURI, "request allowed", extra)
 
 	h.transport.ServeHTTP(w, r)
+}
+
+// maxInspectBody bounds the inspect response read during resolution.
+const maxInspectBody = 4 << 20
+
+// resolveContainer asks the daemon for GET /containers/{id}/json and allows
+// the request only if the container's name is covered by a policy. A 404, an
+// uncovered name or any other failure denies: it fails closed (#86).
+func (h *Handler) resolveContainer(r *http.Request, id string) *RouteResult {
+	notManaged := &RouteResult{Action: ActionDeny, Container: id, DenyMsg: fmt.Sprintf("container %s is not managed by any policy", id)}
+	cannotResolve := func(reason string) *RouteResult {
+		return &RouteResult{Action: ActionDeny, Container: id, DenyMsg: fmt.Sprintf("cannot resolve container %s: %s", id, reason)}
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, "/containers/"+url.PathEscape(id)+"/json", nil)
+	if err != nil {
+		return cannotResolve(err.Error())
+	}
+	rec := newCaptureWriter(maxInspectBody)
+	h.transport.ServeHTTP(rec, req)
+
+	switch {
+	case rec.status == http.StatusNotFound:
+		return notManaged
+	case rec.status != http.StatusOK:
+		return cannotResolve(fmt.Sprintf("daemon returned %d", rec.status))
+	case rec.overflow:
+		return cannotResolve("inspect response too large")
+	}
+
+	var inspect struct {
+		Name string `json:"Name"`
+	}
+	if err := json.Unmarshal(rec.body.Bytes(), &inspect); err != nil || inspect.Name == "" {
+		return cannotResolve("unreadable inspect response")
+	}
+	name := strings.TrimPrefix(inspect.Name, "/")
+
+	ps := h.router.manager.Covering(name)
+	if len(ps) == 0 {
+		notManaged.ResolvedName = name
+		return notManaged
+	}
+	res := &RouteResult{Action: ActionAllow, Container: id, ResolvedName: name}
+	if len(ps) == 1 {
+		res.Service = ps[0].ServiceName
+		res.Policy = ps[0]
+	}
+	return res
+}
+
+// captureWriter is an http.ResponseWriter that keeps the status and up to
+// limit bytes of the body.
+type captureWriter struct {
+	header   http.Header
+	status   int
+	body     bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func newCaptureWriter(limit int) *captureWriter {
+	return &captureWriter{header: make(http.Header), limit: limit}
+}
+
+func (c *captureWriter) Header() http.Header { return c.header }
+
+func (c *captureWriter) WriteHeader(status int) {
+	if c.status == 0 {
+		c.status = status
+	}
+}
+
+func (c *captureWriter) Write(p []byte) (int, error) {
+	if c.status == 0 {
+		c.status = http.StatusOK
+	}
+	if room := c.limit - c.body.Len(); len(p) > room {
+		c.overflow = true
+		if room > 0 {
+			c.body.Write(p[:room])
+		}
+		return len(p), nil
+	}
+	return c.body.Write(p)
 }
 
 // isUpgradeRequest reports an Upgrade header, or a Connection header that

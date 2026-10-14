@@ -9,7 +9,7 @@ A validating Docker API proxy that enforces **per-service container policies** t
 
 Key features:
 
-- **Policy-driven**: Per-service YAML policies, selected by image name, control images, volumes, flags, and env vars. The listening socket is the trust boundary: every caller of a socket can use every policy behind it (see [Trust model](#trust-model))
+- **Policy-driven**: Per-service YAML policies, selected by image and container name, control images, volumes, flags, and env vars. The listening socket is the trust boundary: every caller of a socket can use every policy behind it (see [Trust model](#trust-model))
 - **Middleware pipeline**: 4 validation gates + 1 config mutator chain
 - **Default-deny router**: Only explicitly allowed endpoints pass through
 - **Formally verified**: [Quint](https://quint-lang.org/) specification: 9 request-handling invariants, 6 listener invariants, and router properties for `--readonly`, percent-encoded paths, empty segments, dot segments, exec, attach, the read-only passthrough and the container lifecycle
@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 119 unit + 94 integration + 15 socket | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 146 unit + 94 integration + 15 socket | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 300 unit (1 skipped) + 94 integration + 15 socket | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 131 unit + 108 integration + 15 socket | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 158 unit + 108 integration + 15 socket | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 312 unit (1 skipped) + 108 integration + 15 socket | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -147,6 +147,8 @@ Create a YAML policy in the config directory:
 ```yaml
 # config/beacon.yaml
 service_name: beacon
+container_names:          # optional; see below
+  - beacon
 allowed_image_prefixes:
   - chainsafe/lodestar
 container_config:
@@ -179,6 +181,45 @@ the key is left out in Go and TypeScript; Rust requires the key) is enforced:
 the bind must carry `:ro`, or the mount `ReadOnly: true`, and a bind without a
 mode is read-write in Docker, so it is denied. See
 [Container create: HostConfig rules](#container-create-hostconfig-rules).
+
+`container_names` is optional. It lists the container names the policy
+manages, each a valid Docker name (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`; anything else
+fails startup). It does two things
+([#85](https://github.com/ChainSafe/docker-socket-policy/issues/85),
+[#86](https://github.com/ChainSafe/docker-socket-policy/issues/86)):
+
+- **Create selects one policy.** `POST /containers/create?name=N` uses the one
+  policy whose `allowed_image_prefixes` match the image and whose
+  `container_names` contain `N`; a policy without `container_names` accepts any
+  name. No match is denied (`image X not allowed by any policy`, or
+  `container name N not allowed for image X by any policy`), and so is more than
+  one (`ambiguous policy for image X and name N: a, b`). A create without
+  `?name=` can only use a policy without `container_names`
+  (`image X requires a container name` otherwise). This is how two services
+  built from one image, such as a Lodestar beacon node and validator client,
+  get their own users and volumes. An image pull has no container name and
+  creates no container, so it is allowed when any policy for the image accepts
+  its tag or digest.
+- **Lifecycle actions reach only covered containers.** A policy covers its
+  `container_names`, or its `service_name` when `container_names` is unset.
+  `start`, `stop`, `restart`, `kill`, `wait`, `pause`, `unpause` and `DELETE`
+  are forwarded only for a container whose name is covered (see
+  [Endpoint Access](#endpoint-access)).
+
+Policies are checked when the proxy starts, and it refuses to start (naming
+both files) if two policies use the same `service_name`, or if two policies
+could both match one create: their image prefixes share a namespace (equal, or
+one is a `/`-prefix of the other) and either one has no `container_names` or
+their `container_names` overlap. Two services that share an image therefore
+both need `container_names`, with no name in common:
+
+```yaml
+# config/beacon.yaml               # config/validator.yaml
+service_name: beacon               service_name: validator
+container_names: [beacon]          container_names: [validator]
+allowed_image_prefixes:            allowed_image_prefixes:
+  - chainsafe/lodestar               - chainsafe/lodestar
+```
 
 ### Use the Proxy
 
@@ -250,8 +291,8 @@ The daemon matches JSON field names without regard to case, and the last match w
 | Any | Path containing `//` | **DENIED** |
 | Any | Path with a `.` or `..` segment | **DENIED** |
 | POST | `/containers/create` | Validated by middleware chain |
-| POST | `/containers/{name}/start\|stop\|restart\|kill\|wait\|pause\|unpause` | Allowed on known containers |
-| DELETE | `/containers/{name}` | Allowed on known containers |
+| POST | `/containers/{name}/start\|stop\|restart\|kill\|wait\|pause\|unpause` | Allowed only on a container a policy covers (see below) |
+| DELETE | `/containers/{name}` | Allowed only on a container a policy covers (see below) |
 | Any | `/containers/…/exec` (an `exec` segment anywhere under `/containers`) | **DENIED** |
 | Any | `/exec/*` | **DENIED** |
 | Any | `/containers/{name}/attach…` (an `attach` segment anywhere under `/containers`) | **DENIED** |
@@ -268,6 +309,8 @@ Any request whose path contains a percent-encoded byte (`%`) is denied with 403 
 Exec is matched on whole path segments, so containers named like `exec-runner` work normally, and exec inspect (`GET /exec/{id}/json`) is denied too. A path with an empty segment (`//`, as in `//exec/{id}/json`) is denied for every method, so an empty segment cannot hide the exec namespace; a single trailing slash is fine, and `//` in the query string is not inspected. A path with a segment that is exactly `.` or `..` (`/./exec/{id}/json`, `/x/../exec/{id}/json`) is denied the same way, with `dot path segment not allowed`, rather than resolved: the proxy never routes one path and forwards another ([#70](https://github.com/ChainSafe/docker-socket-policy/issues/70)). Names such as `.hidden` or `a.b` are fine, and the query string is not inspected. Absolute-form request targets (`GET http://host/…`) never reach exec: Go and Rust route them on the parsed path, so exec is denied and other paths are routed as usual, while the TypeScript proxy sees the raw target and denies every absolute-form request (its `//` after the scheme is an empty segment). The Docker CLI never sends absolute form.
 
 Attach is matched the same way: an `attach` segment under `/containers` is denied for every method, so `attach-runner` is an ordinary name, while a container literally named `attach` cannot be reached by name. Protocol upgrades are refused outright: any request with an `Upgrade` header, or a `Connection` header that lists `upgrade`, gets 403 `protocol upgrade not allowed` before it is routed, whatever its path ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)). Forwarding one would hand the caller a raw stream to the daemon. Every Docker endpoint that upgrades (attach, exec start, the build session) is denied anyway; the refusal keeps any path the router allows from becoming one.
+
+Lifecycle actions and `DELETE` are forwarded only for a container that a loaded policy covers: its name is in some policy's `container_names`, or is the `service_name` of a policy without `container_names` ([#86](https://github.com/ChainSafe/docker-socket-policy/issues/86)). If `{name}` is exactly one policy's covered name, the request is forwarded. Otherwise, because it may be a full or short container ID, or a covered name that only looks like an ID prefix (all lowercase hex), the proxy first asks the daemon `GET /containers/{name}/json` and checks the `Name` it reports. A covered name is forwarded; an uncovered name or a daemon 404 is denied with 403 `container {name} is not managed by any policy`, and any other daemon error with 403 `cannot resolve container {name}: …`. The audit log records the resolved name. Containers outside every policy, such as operator containers for monitoring, cannot be stopped or removed through the proxy. Reads (`GET`) on any container are unchanged. Before #86 these endpoints were forwarded for any container.
 
 `/_ping`, `/version`, `/info` and `/events` are ordinary reads: `GET` and `HEAD` pass, and every other method is denied with `endpoint <METHOD> <path> is not allowed`, `OPTIONS` (a CORS preflight) included ([#78](https://github.com/ChainSafe/docker-socket-policy/issues/78)). `CONNECT` is refused with 403 `CONNECT is not allowed` before anything else, whatever its target or headers; the TypeScript proxy answers it on the raw socket, since Node never hands `CONNECT` to the request handler.
 
@@ -422,12 +465,18 @@ callers. Anyone who can `connect(2)` to the socket, which means any member of
 its group, can create containers under **every** policy loaded from that
 proxy's `--config-dir`.
 
-A policy is a per-service *template*, chosen by the `Image` of the request. It
-fixes what a container from that image may look like: volumes, network mode,
-env file, user, CLI flags, and no other host access (`HostConfig` is
-default-deny, #88). A policy says nothing about *who* may ask for it. A
-caller who names `chainsafe/lodestar` gets the policy for that image, whichever
-service the caller belongs to. This is intended, not a gap: callers on a
+A policy is a per-service *template*, chosen by the `Image` of the request and,
+when policies set `container_names`, by the container name. It fixes what a
+container from that image may look like: volumes, network mode, env file, user,
+CLI flags, and no other host access (`HostConfig` is default-deny, #88). A
+policy says nothing about *who* may ask for it. A caller who names
+`chainsafe/lodestar` gets the policy for that image, whichever service the
+caller belongs to. Container names are routing, not access control: the caller
+picks the name, so a caller who may use the beacon policy may also name a
+container `validator` and get the validator policy. Covered names do bound
+lifecycle actions: a caller can stop or remove only containers that some
+policy behind the socket covers, not every container on the host. This is
+intended, not a gap: callers on a
 shared socket are all the same caller as far as the kernel can tell (for
 example, several developers sharing one account), so no proxy-side check could
 tell them apart.
@@ -493,7 +542,7 @@ not at the socket.
 
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 11 invariants on every state transition. The same file models the create check on `HostConfig` ([#88](https://github.com/ChainSafe/docker-socket-policy/issues/88)): the default-deny field rules, `Mounts`, bind options and read-only volumes, and the case-insensitive field names the daemon accepts; its properties are checked exhaustively over every single-field, single-bind and single-mount request of the model, and instance `create_pre88` shows that they failed before the fix. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for writes under `--readonly` ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)), percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)), dot segments ([#70](https://github.com/ChainSafe/docker-socket-policy/issues/70)), exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)) and attach ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)), the GET/HEAD-only read passthrough ([#78](https://github.com/ChainSafe/docker-socket-policy/issues/78)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 12 properties are checked exhaustively over the methods `GET`, `HEAD`, `POST`, `DELETE` and every path of 1 to 3 segments over the model's word set; exec is denied by the router, not by a middleware gate.
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 12 invariants on every state transition, among them that every create used the one policy matching its image and name ([#85](https://github.com/ChainSafe/docker-socket-policy/issues/85)). The same file models the create check on `HostConfig` ([#88](https://github.com/ChainSafe/docker-socket-policy/issues/88)): the default-deny field rules, `Mounts`, bind options and read-only volumes, and the case-insensitive field names the daemon accepts; its properties are checked exhaustively over every single-field, single-bind and single-mount request of the model, and instance `create_pre88` shows that they failed before the fix. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for writes under `--readonly` ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)), percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)), dot segments ([#70](https://github.com/ChainSafe/docker-socket-policy/issues/70)), exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)) and attach ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)), the GET/HEAD-only read passthrough ([#78](https://github.com/ChainSafe/docker-socket-policy/issues/78)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch with the daemon lookup that limits it to covered containers ([#86](https://github.com/ChainSafe/docker-socket-policy/issues/86)), not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 13 properties are checked exhaustively over the methods `GET`, `HEAD`, `POST`, `DELETE` and every path of 1 to 3 segments over the model's word set; exec is denied by the router, not by a middleware gate.
 
 The request-handling spec also has a module, `network_endpoints_model`, for the endpoint entries under a forced `network_mode` ([#87](https://github.com/ChainSafe/docker-socket-policy/issues/87)). Its 3 properties (extra networks are denied, an allowed create names no network but the forced one, and every allowed create starts) are checked over five network modes and every endpoint map over seven keys; `network_endpoints_pre87` shows all three failing before the fix.
 
@@ -503,7 +552,7 @@ The CI pipeline runs verification on every push and PR. A violation blocks the b
 make typecheck            # Quint type-check (proves type safety)
 make verify               # Random-simulation verification (default evaluator)
 make verify BACKEND=rust  # Same, using the faster Rust backend
-make test-spec            # Quint `run` tests for listener.qnt, router.qnt, network_endpoints and the create model (one per table row)
+make test-spec            # Quint `run` tests for listener.qnt, router.qnt, network_endpoints, the create model and policy selection (one per table row)
 make validate             # All checks: typecheck + verify + go vet + go test
 ```
 

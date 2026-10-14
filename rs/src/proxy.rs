@@ -1,4 +1,4 @@
-use crate::policy::{check_image_tag, parse_image_ref, Manager, Policy};
+use crate::policy::{check_image_tag, parse_image_ref, valid_container_name, Manager, Policy};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6,6 +6,10 @@ pub enum Action {
     Deny,
     Allow,
     CreateContainer,
+    /// A lifecycle action or DELETE on a container that is not directly a
+    /// covered name. The handler asks the daemon which container it is and
+    /// allows the request only if its name is covered (#86).
+    ResolveContainer,
 }
 
 #[derive(Debug, Clone)]
@@ -15,6 +19,9 @@ pub struct RouteResult {
     pub policy: Option<Policy>,
     pub body: Option<HashMap<String, serde_json::Value>>,
     pub container: Option<String>,
+    /// The daemon's name for `container`, set when the handler resolved it
+    /// (#86).
+    pub resolved_name: Option<String>,
     pub image: Option<String>,
     pub deny_msg: Option<String>,
 }
@@ -30,6 +37,10 @@ impl Router {
             manager,
             readonly: false,
         }
+    }
+
+    pub fn manager(&self) -> &Manager {
+        &self.manager
     }
 
     /// Sets read-only mode (--readonly) and returns the router.
@@ -99,7 +110,7 @@ impl Router {
 
         // Container create
         if method == "POST" && path == "/containers/create" {
-            return self.route_create(body);
+            return self.route_create(body, query);
         }
 
         // Container lifecycle
@@ -133,7 +144,7 @@ impl Router {
         deny(&format!("endpoint {} {} is not allowed", method, path))
     }
 
-    fn route_create(&self, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
+    fn route_create(&self, body: Option<&HashMap<String, serde_json::Value>>, query: &str) -> RouteResult {
         let body = match body {
             Some(b) if !b.is_empty() => b,
             _ => return deny("empty request body"),
@@ -147,37 +158,49 @@ impl Router {
             return deny(&msg);
         }
 
-        match self.manager.get_by_image(image) {
-            Some(policy) => RouteResult {
+        let name = match create_name(query) {
+            Ok(n) => n,
+            Err(msg) => return deny(msg),
+        };
+
+        match self.manager.select_for_create(image, &name) {
+            Ok(policy) => RouteResult {
                 action: Action::CreateContainer,
                 service: Some(policy.service_name.clone()),
                 policy: Some(policy.clone()),
                 body: Some(body.clone()),
-                container: None,
+                container: if name.is_empty() { None } else { Some(name) },
+                resolved_name: None,
                 image: Some(image.to_string()),
                 deny_msg: None,
             },
-            None => deny(&format!("image {} not allowed by any policy", image)),
+            Err(msg) => deny(&msg),
         }
     }
 
+    /// Allows a lifecycle action or DELETE on a name that exactly one policy
+    /// covers. Anything else, including a name that could also be an ID
+    /// prefix, needs the daemon to say which container it is (#86).
     fn route_by_name(&self, name: &str) -> RouteResult {
-        match self.manager.get(name) {
-            Some(policy) => RouteResult {
+        let covering = self.manager.covering(name);
+        match covering.as_slice() {
+            [policy] if !could_be_id(name) => RouteResult {
                 action: Action::Allow,
                 service: Some(policy.service_name.clone()),
-                policy: Some(policy.clone()),
+                policy: Some((*policy).clone()),
                 body: None,
-                container: None,
+                container: Some(name.to_string()),
+                resolved_name: None,
                 image: None,
                 deny_msg: None,
             },
-            None => RouteResult {
-                action: Action::Allow,
+            _ => RouteResult {
+                action: Action::ResolveContainer,
                 service: None,
                 policy: None,
                 body: None,
                 container: Some(name.to_string()),
+                resolved_name: None,
                 image: None,
                 deny_msg: None,
             },
@@ -235,22 +258,35 @@ impl Router {
         if image_ref.tag.is_empty() && image_ref.digest.is_empty() {
             return deny("image pull without a tag or digest pulls every tag and is not allowed");
         }
-        let policy = match self.manager.get_by_image(&image_ref.name) {
-            Some(p) => p,
-            None => return deny(&format!("image {} not allowed by any policy", from_image)),
-        };
-        if let Err(msg) = check_image_tag(policy, &image_ref) {
-            return deny(&msg);
+        // Several policies may allow the image once container_names tells
+        // their creates apart (#85). A pull creates no container, so any of
+        // them may accept the tag or digest; with none, the first one's
+        // reason is given.
+        let matching = self.manager.matching_image(&image_ref.name);
+        if matching.is_empty() {
+            return deny(&format!("image {} not allowed by any policy", from_image));
         }
-        RouteResult {
-            action: Action::Allow,
-            service: Some(policy.service_name.clone()),
-            policy: None,
-            body: None,
-            container: None,
-            image: Some(from_image.to_string()),
-            deny_msg: None,
+        let mut first_err = None;
+        for policy in matching {
+            match check_image_tag(policy, &image_ref) {
+                Ok(()) => {
+                    return RouteResult {
+                        action: Action::Allow,
+                        service: Some(policy.service_name.clone()),
+                        policy: None,
+                        body: None,
+                        container: None,
+                        resolved_name: None,
+                        image: Some(from_image.to_string()),
+                        deny_msg: None,
+                    }
+                }
+                Err(msg) => {
+                    first_err.get_or_insert(msg);
+                }
+            }
         }
+        deny(&first_err.unwrap_or_default())
     }
 }
 
@@ -305,6 +341,7 @@ fn allow() -> RouteResult {
         policy: None,
         body: None,
         container: None,
+        resolved_name: None,
         image: None,
         deny_msg: None,
     }
@@ -317,9 +354,40 @@ fn deny(msg: &str) -> RouteResult {
         policy: None,
         body: None,
         container: None,
+        resolved_name: None,
         image: None,
         deny_msg: Some(msg.to_string()),
     }
+}
+
+/// The ?name= of a create, without the one leading slash the daemon also
+/// strips, or "" when there is none. The query is parsed as the daemon parses
+/// it, as the image pull does (#83). The error is the deny message for a query
+/// the daemon would reject or an invalid name (#85).
+fn create_name(query: &str) -> Result<String, &'static str> {
+    let params = parse_query(query).ok_or("invalid query string")?;
+    // The daemon takes the first of a repeated name (r.Form.Get). Deny it
+    // rather than pick, as the pull does for its parameters.
+    if params.iter().filter(|(k, _)| k == "name").count() > 1 {
+        return Err("duplicate name query parameter");
+    }
+    let name = params
+        .iter()
+        .find(|(k, _)| k == "name")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let name = name.strip_prefix('/').unwrap_or(name);
+    if !name.is_empty() && !valid_container_name(name) {
+        return Err("invalid container name");
+    }
+    Ok(name.to_string())
+}
+
+/// A name of lowercase hex digits only. The daemon looks up an ID, then a
+/// name, then an ID prefix, so if no container has this name it would act on
+/// the container whose ID starts with it (#86).
+fn could_be_id(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 // Strips one leading /v<N>/ or /v<N>.<M>/ (ASCII digits only); anything else is left as is (#57).
@@ -398,6 +466,7 @@ mod tests {
             "myservice".into(),
             Policy {
                 service_name: "myservice".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
@@ -626,9 +695,11 @@ mod tests {
             ("DELETE", "/containers/exec", Action::Deny, Some("exec is not allowed")),
             // Listing stays allowed, via the GET/HEAD passthrough.
             ("GET", "/containers/json", Action::Allow, None),
-            // A real container name is still routed as a container.
-            // realNameDeleteAllowedTest
-            ("DELETE", "/containers/mycontainer", Action::Allow, None),
+            // A real container name is still routed as a container. No policy
+            // covers it, so the daemon is asked which container it is, and the
+            // handler denies it (#86).
+            // realNameDeleteDeniedTest
+            ("DELETE", "/containers/mycontainer", Action::ResolveContainer, None),
             ("GET", "/containers/mycontainer", Action::Allow, None),
             // Reserved words are only reserved in the name position.
             // reservedInSubpathAllowedTest
@@ -709,10 +780,10 @@ mod tests {
         let create_body: HashMap<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({"Image": "alpine:latest"})).unwrap();
         let cases = [
-            // #52: dotted version, container lifecycle delete.
-            ("DELETE", "/v1.43/containers/foo", None, Action::Allow),
-            // #52: dotted version, container lifecycle start.
-            ("POST", "/v1.43/containers/beacon/start", None, Action::Allow),
+            // #52: dotted version, container lifecycle delete (uncovered, #86).
+            ("DELETE", "/v1.43/containers/foo", None, Action::ResolveContainer),
+            // #52: dotted version, container lifecycle start (covered).
+            ("POST", "/v1.43/containers/myservice/start", None, Action::Allow),
             // #52: dotted version, create with a policy-allowed image.
             (
                 "POST",
@@ -721,13 +792,13 @@ mod tests {
                 Action::CreateContainer,
             ),
             // #52: undotted control — stripped correctly everywhere already.
-            ("POST", "/v1/containers/beacon/start", None, Action::Allow),
+            ("POST", "/v1/containers/myservice/start", None, Action::Allow),
             // #52: the reserved segment survives the strip (#24 parity).
             ("DELETE", "/v1.43/containers/json", None, Action::Deny),
-            // #57: undotted version, container lifecycle delete.
-            ("DELETE", "/v1/containers/foo", None, Action::Allow),
+            // #57: undotted version, container lifecycle delete (uncovered, #86).
+            ("DELETE", "/v1/containers/foo", None, Action::ResolveContainer),
             // #57: multi-digit major version.
-            ("DELETE", "/v10.0/containers/foo", None, Action::Allow),
+            ("DELETE", "/v10.0/containers/foo", None, Action::ResolveContainer),
             // #57: /volumes/ is not a version; the daemon routes this as a volume removal.
             ("DELETE", "/volumes/containers/foo", None, Action::Deny),
             // #57: /version/ is not a version prefix.
@@ -795,8 +866,8 @@ mod tests {
             ("DELETE", "/v%31/containers/foo", Action::Deny),
             // #53: network names that need escaping are denied, GET included.
             ("GET", "/networks/a%20b", Action::Deny),
-            // #53 control: a plain name is still routed as a container.
-            ("DELETE", "/containers/foo", Action::Allow),
+            // #53 control: a plain name is still routed as a container (#86).
+            ("DELETE", "/containers/foo", Action::ResolveContainer),
         ];
         let mut mismatches = Vec::new();
         for (method, path, want) in cases {
@@ -831,10 +902,23 @@ mod tests {
             ("DELETE", "/containers/mycontainer/exec", None, Action::Deny, exec),
             // execSubpathPostDeniedTest (#49)
             ("POST", "/containers/mycontainer/exec", None, Action::Deny, exec),
-            // execPrefixNameStartAllowedTest (#49): an unknown container.
-            ("POST", "/containers/exec-runner/start", None, Action::Allow, None),
-            // execPrefixNameDeleteAllowedTest (#49): an unknown container.
-            ("DELETE", "/containers/exec-runner", None, Action::Allow, None),
+            // execPrefixNameStartDeniedTest (#49, #86): an uncovered container,
+            // routed for resolution; the handler denies it.
+            (
+                "POST",
+                "/containers/exec-runner/start",
+                None,
+                Action::ResolveContainer,
+                None,
+            ),
+            // execPrefixNameDeleteDeniedTest (#49, #86)
+            (
+                "DELETE",
+                "/containers/exec-runner",
+                None,
+                Action::ResolveContainer,
+                None,
+            ),
             // execPrefixNameGetAllowedTest (#49)
             ("GET", "/containers/exec-runner/json", None, Action::Allow, None),
             // execNamespaceGetDeniedTest (#49): exec inspect leaks command lines.
@@ -862,7 +946,7 @@ mod tests {
             // A name ending in exec is a plain name (#49, language-only).
             ("GET", "/containers/myexec/json", None, Action::Allow, None),
             // A name starting with exec is a plain name (#49, language-only).
-            ("DELETE", "/containers/executor", None, Action::Allow, None),
+            ("DELETE", "/containers/executor", None, Action::ResolveContainer, None),
             // The reserved name, decided by the exec check (#49, language-only).
             ("GET", "/containers/exec/json", None, Action::Deny, exec),
             // A top-level name starting with exec is not the exec namespace (#49, language-only).
@@ -1648,7 +1732,8 @@ mod tests {
     fn test_route_container_by_name_no_policy() {
         let router = Router::new(make_manager(vec!["alpine"]));
         let result = router.route("POST", "/containers/unknown-container/start", None);
-        assert_eq!(result.action, Action::Allow);
+        // Not covered: resolved by the handler, never allowed directly (#86).
+        assert_eq!(result.action, Action::ResolveContainer);
         assert!(result.service.is_none());
         assert_eq!(result.container, Some("unknown-container".into()));
     }
@@ -1684,5 +1769,361 @@ mod tests {
         assert!(result.service.is_none());
         assert!(result.policy.is_none());
         assert!(result.body.is_none());
+    }
+
+    /// The #85 layout: beacon and validator run one image.
+    pub(crate) const LODESTAR_POLICIES: [(&str, &str); 3] = [
+        (
+            "beacon.yaml",
+            "service_name: beacon\ncontainer_names: [beacon]\nallowed_image_prefixes:\n  - chainsafe/lodestar\n",
+        ),
+        (
+            "validator.yaml",
+            "service_name: validator\ncontainer_names: [validator, validator-2]\nallowed_image_prefixes:\n  - chainsafe/lodestar\n",
+        ),
+        (
+            "monitoring.yaml",
+            "service_name: monitoring\nallowed_image_prefixes:\n  - prom/prometheus\n",
+        ),
+    ];
+
+    fn body_of(v: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// The cross-language parity guard for #85. POST /containers/create
+    /// selects the one policy whose image prefixes match and whose
+    /// container_names contain ?name=; a policy without container_names
+    /// accepts any name. Before #85 the policy was whichever matched the
+    /// image first in map order (Go, Rust) or load order (TypeScript).
+    #[test]
+    fn test_route_create_selects_by_name() {
+        let router = Router::new(crate::policy::tests::load_dir(&LODESTAR_POLICIES).unwrap());
+        let lodestar = body_of(serde_json::json!({"Image": "chainsafe/lodestar:v1.20.0"}));
+        let prom = body_of(serde_json::json!({"Image": "prom/prometheus:latest"}));
+        let alpine = body_of(serde_json::json!({"Image": "alpine:latest"}));
+        let cases: Vec<(
+            &str,
+            &HashMap<String, serde_json::Value>,
+            Action,
+            Option<&str>,
+            Option<&str>,
+        )> = vec![
+            ("name=beacon", &lodestar, Action::CreateContainer, Some("beacon"), None),
+            (
+                "name=validator",
+                &lodestar,
+                Action::CreateContainer,
+                Some("validator"),
+                None,
+            ),
+            (
+                "name=validator-2",
+                &lodestar,
+                Action::CreateContainer,
+                Some("validator"),
+                None,
+            ),
+            // The daemon strips one leading slash, and the name is decoded.
+            (
+                "name=/validator",
+                &lodestar,
+                Action::CreateContainer,
+                Some("validator"),
+                None,
+            ),
+            (
+                "name=%2Fbeacon&platform=",
+                &lodestar,
+                Action::CreateContainer,
+                Some("beacon"),
+                None,
+            ),
+            (
+                "platform=linux&name=beacon",
+                &lodestar,
+                Action::CreateContainer,
+                Some("beacon"),
+                None,
+            ),
+            // A name no policy for the image accepts.
+            (
+                "name=other",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("container name other not allowed for image chainsafe/lodestar:v1.20.0 by any policy"),
+            ),
+            // A create without ?name= only matches a policy without container_names.
+            (
+                "",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("image chainsafe/lodestar:v1.20.0 requires a container name"),
+            ),
+            (
+                "name=",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("image chainsafe/lodestar:v1.20.0 requires a container name"),
+            ),
+            ("", &prom, Action::CreateContainer, Some("monitoring"), None),
+            (
+                "name=anything",
+                &prom,
+                Action::CreateContainer,
+                Some("monitoring"),
+                None,
+            ),
+            // The image decides first.
+            (
+                "name=beacon",
+                &alpine,
+                Action::Deny,
+                None,
+                Some("image alpine:latest not allowed by any policy"),
+            ),
+            // An invalid or undecodable name is denied.
+            (
+                "name=-beacon",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("invalid container name"),
+            ),
+            (
+                "name=bea%2Fcon",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("invalid container name"),
+            ),
+            ("name=%zz", &lodestar, Action::Deny, None, Some("invalid query string")),
+            // Decoded as the daemon's r.Form does.
+            (
+                "name=%62eacon",
+                &lodestar,
+                Action::CreateContainer,
+                Some("beacon"),
+                None,
+            ),
+            (
+                "name=validator%2D2",
+                &lodestar,
+                Action::CreateContainer,
+                Some("validator"),
+                None,
+            ),
+            // The daemon takes the first of a repeated name; the proxy denies it.
+            (
+                "name=beacon&name=monitoring",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("duplicate name query parameter"),
+            ),
+            (
+                "name=beacon&n%61me=validator",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("duplicate name query parameter"),
+            ),
+            // A query the daemon rejects is denied, as for the pull (#83).
+            (
+                "platform=%zz&name=beacon",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("invalid query string"),
+            ),
+            (
+                "name=beacon;x=1",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("invalid query string"),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (query, body, action, service, msg) in cases {
+            let got = router.route("POST", &format!("/v1.45/containers/create?{query}"), Some(body));
+            if got.action != action || got.service.as_deref() != service || got.deny_msg.as_deref() != msg {
+                mismatches.push(format!(
+                    "create ?{query}: got {:?} {:?} {:?}, want {:?} {:?} {:?}",
+                    got.action, got.service, got.deny_msg, action, service, msg
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// The #85 reproduction: with two policies for one image, every create
+    /// gets its own policy, every time.
+    #[test]
+    fn test_route_create_selection_is_stable() {
+        let router = Router::new(crate::policy::tests::load_dir(&LODESTAR_POLICIES).unwrap());
+        let body = body_of(serde_json::json!({"Image": "chainsafe/lodestar:v1.20.0"}));
+        for i in 0..50 {
+            for name in ["beacon", "validator"] {
+                let got = router.route("POST", &format!("/containers/create?name={name}"), Some(&body));
+                assert_eq!(
+                    (got.action, got.service.as_deref()),
+                    (Action::CreateContainer, Some(name)),
+                    "iteration {i}: {:?}",
+                    got.deny_msg
+                );
+            }
+        }
+    }
+
+    /// Two policies that both accept one image and name are refused at load
+    /// time; built without that check, the router denies.
+    #[test]
+    fn test_route_create_ambiguous() {
+        let mut b = make_manager(vec!["chainsafe/lodestar"])
+            .get("myservice")
+            .unwrap()
+            .clone();
+        b.service_name = "b".into();
+        let mut a = b.clone();
+        a.service_name = "a".into();
+        a.allowed_image_prefixes = vec!["chainsafe".into()];
+        a.container_names = Some(vec!["beacon".into()]);
+        let router = Router::new(Manager::from_map(HashMap::from([("a".into(), a), ("b".into(), b)])));
+        let body = body_of(serde_json::json!({"Image": "chainsafe/lodestar:v1"}));
+        let got = router.route("POST", "/containers/create?name=beacon", Some(&body));
+        assert_eq!(got.action, Action::Deny);
+        assert_eq!(
+            got.deny_msg.as_deref(),
+            Some("ambiguous policy for image chainsafe/lodestar:v1 and name beacon: a, b")
+        );
+        let got = router.route("POST", "/containers/create?name=validator", Some(&body));
+        assert_eq!(
+            (got.action, got.service.as_deref()),
+            (Action::CreateContainer, Some("b"))
+        );
+    }
+
+    /// The cross-language parity guard for #86. A lifecycle action or DELETE
+    /// is allowed directly only on a name that exactly one policy covers
+    /// (container_names, or service_name when unset). Any other target is
+    /// routed for resolution: the handler asks the daemon which container it
+    /// is. Rows mirror the covered* and uncovered* runs in spec/router.qnt.
+    #[test]
+    fn test_route_lifecycle_coverage() {
+        let files = [
+            LODESTAR_POLICIES[1],
+            LODESTAR_POLICIES[2],
+            (
+                "vc.yaml",
+                "service_name: vc-svc\ncontainer_names: [vc-1]\nallowed_image_prefixes:\n  - example/vc\n",
+            ),
+            (
+                "cafe.yaml",
+                "service_name: cafe\nallowed_image_prefixes:\n  - cafe/app\n",
+            ),
+        ];
+        let router = Router::new(crate::policy::tests::load_dir(&files).unwrap());
+        let resolve = Action::ResolveContainer;
+        let cases = [
+            // coveredNameStartAllowedTest
+            ("POST", "/containers/validator/start", Action::Allow, Some("validator")),
+            (
+                "POST",
+                "/v1.45/containers/validator-2/kill",
+                Action::Allow,
+                Some("validator"),
+            ),
+            ("DELETE", "/containers/validator", Action::Allow, Some("validator")),
+            // A policy without container_names covers its service_name.
+            (
+                "POST",
+                "/containers/monitoring/restart",
+                Action::Allow,
+                Some("monitoring"),
+            ),
+            // With container_names set, service_name is not covered.
+            ("POST", "/containers/vc-svc/stop", resolve.clone(), None),
+            ("POST", "/containers/vc-1/stop", Action::Allow, Some("vc-svc")),
+            // uncoveredNameStopDeniedTest: an operator container, resolved first.
+            ("POST", "/containers/mycontainer/stop", resolve.clone(), None),
+            // An ID (full or short) is resolved by the daemon.
+            ("POST", "/containers/4f6e1d2c9a7b/kill", resolve.clone(), None),
+            (
+                "DELETE",
+                "/containers/4f6e1d2c9a7b8c3d4e5f60718293a4b5c6d7e8f9012345678901234567890abc",
+                resolve.clone(),
+                None,
+            ),
+            // A covered name that could also be an ID prefix is resolved too.
+            ("POST", "/containers/cafe/start", resolve.clone(), None),
+            // Reads are not lifecycle actions.
+            ("GET", "/containers/mycontainer/json", Action::Allow, None),
+        ];
+        let mut mismatches = Vec::new();
+        for (method, path, action, service) in cases {
+            let got = router.route(method, path, None);
+            if got.action != action || got.service.as_deref() != service {
+                mismatches.push(format!(
+                    "{method} {path}: got {:?} {:?}, want {:?} {:?}",
+                    got.action, got.service, action, service
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+
+        // --readonly still denies first (#75).
+        let ro = Router::new(crate::policy::tests::load_dir(&files).unwrap()).with_readonly(true);
+        assert_eq!(
+            ro.route("POST", "/containers/validator/start", None).action,
+            Action::Deny
+        );
+    }
+
+    /// Several policies may allow one image once container_names tells
+    /// their creates apart (#85). A pull creates no container, so it is
+    /// allowed when any policy for the image accepts its tag or digest, and
+    /// denied with the first policy's reason (sorted by service_name) when
+    /// none does.
+    #[test]
+    fn test_route_pull_shared_image() {
+        let files = [
+            (
+                "vc-b.yaml",
+                "service_name: vc-b\ncontainer_names: [vc-b]\nallowed_image_prefixes: [example/vc]\nimage_tag_pattern: '^v2$'\n",
+            ),
+            (
+                "vc-a.yaml",
+                "service_name: vc-a\ncontainer_names: [vc-a]\nallowed_image_prefixes: [example/vc]\nimage_tag_pattern: '^v1$'\n",
+            ),
+        ];
+        let router = Router::new(crate::policy::tests::load_dir(&files).unwrap());
+        let cases = [
+            ("v1", Action::Allow, Some("vc-a"), None),
+            ("v2", Action::Allow, Some("vc-b"), None),
+            (
+                "v3",
+                Action::Deny,
+                None,
+                Some(r#"image tag "v3" does not match pattern "^v1$""#),
+            ),
+        ];
+        for i in 0..50 {
+            for (tag, action, service, msg) in &cases {
+                let got = router.route(
+                    "POST",
+                    &format!("/images/create?fromImage=example%2Fvc&tag={tag}"),
+                    None,
+                );
+                assert_eq!(
+                    (&got.action, got.service.as_deref(), got.deny_msg.as_deref()),
+                    (action, *service, *msg),
+                    "iteration {i}: pull tag {tag}"
+                );
+            }
+        }
     }
 }

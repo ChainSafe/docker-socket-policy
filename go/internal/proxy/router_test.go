@@ -414,9 +414,9 @@ func TestRouterDenyPostOnReadOnly(t *testing.T) {
 // /containers/<x> is ambiguous: <x> is usually a container name, but Docker
 // also has reserved endpoints at that position (/containers/json to list,
 // /containers/create to create). Treating a reserved word as a container name
-// sends the request down the lifecycle path, where an unknown container is
-// allowed through — so DELETE /containers/json was allowed in Go while Rust
-// and TypeScript denied it.
+// sends the request down the lifecycle path, where an unknown container was
+// allowed through before #86 — so DELETE /containers/json was allowed in Go
+// while Rust and TypeScript denied it.
 //
 // GET stays allowed either way: it reaches the GET/HEAD passthrough instead.
 func TestRouterReservedPathSegments(t *testing.T) {
@@ -444,9 +444,11 @@ allowed_image_prefixes:
 		{"DELETE", "/containers/exec", ActionDeny, "exec is not allowed"},
 		// Listing and inspecting stay allowed via the GET/HEAD passthrough.
 		{"GET", "/containers/json", ActionAllow, ""},
-		// A real container name is still routed as a container.
-		// realNameDeleteAllowedTest
-		{"DELETE", "/containers/mycontainer", ActionAllow, ""},
+		// A real container name is still routed as a container. No policy
+		// covers it, so the daemon is asked which container it is, and the
+		// handler denies it (#86).
+		// realNameDeleteDeniedTest
+		{"DELETE", "/containers/mycontainer", ActionResolveContainer, ""},
 		{"GET", "/containers/mycontainer", ActionAllow, ""},
 		// The reserved word as a *sub*-resource is a normal inspect.
 		// reservedInSubpathAllowedTest
@@ -543,8 +545,8 @@ allowed_image_prefixes:
 		body   map[string]interface{}
 		want   Action
 	}{
-		// #52: dotted version, container lifecycle delete.
-		{"DELETE", "/v1.43/containers/foo", nil, ActionAllow},
+		// #52: dotted version, container lifecycle delete (uncovered, #86).
+		{"DELETE", "/v1.43/containers/foo", nil, ActionResolveContainer},
 		// #52: dotted version, container lifecycle start.
 		{"POST", "/v1.43/containers/beacon/start", nil, ActionAllow},
 		// #52: dotted version, create with a policy-allowed image.
@@ -553,10 +555,10 @@ allowed_image_prefixes:
 		{"POST", "/v1/containers/beacon/start", nil, ActionAllow},
 		// #52: the reserved segment survives the strip (#24 parity).
 		{"DELETE", "/v1.43/containers/json", nil, ActionDeny},
-		// #57: undotted version, container lifecycle delete.
-		{"DELETE", "/v1/containers/foo", nil, ActionAllow},
+		// #57: undotted version, container lifecycle delete (uncovered, #86).
+		{"DELETE", "/v1/containers/foo", nil, ActionResolveContainer},
 		// #57: multi-digit major version.
-		{"DELETE", "/v10.0/containers/foo", nil, ActionAllow},
+		{"DELETE", "/v10.0/containers/foo", nil, ActionResolveContainer},
 		// #57: /volumes/ is not a version; the daemon routes this as a volume removal.
 		{"DELETE", "/volumes/containers/foo", nil, ActionDeny},
 		// #57: /version/ is not a version prefix.
@@ -630,8 +632,8 @@ allowed_image_prefixes:
 		{"DELETE", "/v%31/containers/foo", ActionDeny},
 		// #53: network names that need escaping are denied, GET included.
 		{"GET", "/networks/a%20b", ActionDeny},
-		// #53 control: a plain name is still routed as a container.
-		{"DELETE", "/containers/foo", ActionAllow},
+		// #53 control: a plain name is still routed as a container (#86).
+		{"DELETE", "/containers/foo", ActionResolveContainer},
 	}
 	for _, tt := range tests {
 		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
@@ -678,10 +680,11 @@ allowed_image_prefixes:
 		{"DELETE", "/containers/mycontainer/exec", nil, ActionDeny, "exec is not allowed"},
 		// execSubpathPostDeniedTest (#49)
 		{"POST", "/containers/mycontainer/exec", nil, ActionDeny, "exec is not allowed"},
-		// execPrefixNameStartAllowedTest (#49): an unknown container.
-		{"POST", "/containers/exec-runner/start", nil, ActionAllow, ""},
-		// execPrefixNameDeleteAllowedTest (#49): an unknown container.
-		{"DELETE", "/containers/exec-runner", nil, ActionAllow, ""},
+		// execPrefixNameStartDeniedTest (#49, #86): an uncovered container,
+		// routed for resolution; the handler denies it.
+		{"POST", "/containers/exec-runner/start", nil, ActionResolveContainer, ""},
+		// execPrefixNameDeleteDeniedTest (#49, #86)
+		{"DELETE", "/containers/exec-runner", nil, ActionResolveContainer, ""},
 		// execPrefixNameGetAllowedTest (#49)
 		{"GET", "/containers/exec-runner/json", nil, ActionAllow, ""},
 		// execNamespaceGetDeniedTest (#49): exec inspect leaks command lines.
@@ -697,7 +700,7 @@ allowed_image_prefixes:
 		// A name ending in exec is a plain name (#49, language-only).
 		{"GET", "/containers/myexec/json", nil, ActionAllow, ""},
 		// A name starting with exec is a plain name (#49, language-only).
-		{"DELETE", "/containers/executor", nil, ActionAllow, ""},
+		{"DELETE", "/containers/executor", nil, ActionResolveContainer, ""},
 		// The reserved name, decided by the exec check (#49, language-only).
 		{"GET", "/containers/exec/json", nil, ActionDeny, "exec is not allowed"},
 		// A top-level name starting with exec is not the exec namespace (#49, language-only).
@@ -1029,5 +1032,224 @@ allowed_image_prefixes:
 					tt.method, tt.path, got.Action, got.DenyMsg, tt.want, tt.wantMsg)
 			}
 		})
+	}
+}
+
+// lodestarPolicies is the #85 layout: beacon and validator run one image.
+var lodestarPolicies = map[string]string{
+	"beacon.yaml": `
+service_name: beacon
+container_names: [beacon]
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	"validator.yaml": `
+service_name: validator
+container_names: [validator, validator-2]
+allowed_image_prefixes:
+  - chainsafe/lodestar
+`,
+	"monitoring.yaml": `
+service_name: monitoring
+allowed_image_prefixes:
+  - prom/prometheus
+`,
+}
+
+// TestRouteCreateSelectsByName is the cross-language parity guard for #85.
+//
+// POST /containers/create selects the one policy whose image prefixes match
+// and whose container_names contain ?name=; a policy without container_names
+// accepts any name. Before #85 the policy was whichever matched the image
+// first in map order (Go, Rust) or load order (TypeScript).
+func TestRouteCreateSelectsByName(t *testing.T) {
+	r := NewRouter(newTestManager(t, lodestarPolicies))
+	lodestar := map[string]interface{}{"Image": "chainsafe/lodestar:v1.20.0"}
+	prom := map[string]interface{}{"Image": "prom/prometheus:latest"}
+
+	tests := []struct {
+		query   string
+		body    map[string]interface{}
+		want    Action
+		service string
+		wantMsg string
+	}{
+		{"name=beacon", lodestar, ActionCreateContainer, "beacon", ""},
+		{"name=validator", lodestar, ActionCreateContainer, "validator", ""},
+		{"name=validator-2", lodestar, ActionCreateContainer, "validator", ""},
+		// The daemon strips one leading slash, and the name is decoded.
+		{"name=/validator", lodestar, ActionCreateContainer, "validator", ""},
+		{"name=%2Fbeacon&platform=", lodestar, ActionCreateContainer, "beacon", ""},
+		{"platform=linux&name=beacon", lodestar, ActionCreateContainer, "beacon", ""},
+		// A name no policy for the image accepts.
+		{"name=other", lodestar, ActionDeny, "", "container name other not allowed for image chainsafe/lodestar:v1.20.0 by any policy"},
+		// A create without ?name= only matches a policy without container_names.
+		{"", lodestar, ActionDeny, "", "image chainsafe/lodestar:v1.20.0 requires a container name"},
+		{"name=", lodestar, ActionDeny, "", "image chainsafe/lodestar:v1.20.0 requires a container name"},
+		{"", prom, ActionCreateContainer, "monitoring", ""},
+		{"name=anything", prom, ActionCreateContainer, "monitoring", ""},
+		// The image decides first.
+		{"name=beacon", map[string]interface{}{"Image": "alpine:latest"}, ActionDeny, "", "image alpine:latest not allowed by any policy"},
+		// An invalid or undecodable name is denied.
+		{"name=-beacon", lodestar, ActionDeny, "", "invalid container name"},
+		{"name=bea%2Fcon", lodestar, ActionDeny, "", "invalid container name"},
+		// Decoded as the daemon's r.Form does.
+		{"name=%62eacon", lodestar, ActionCreateContainer, "beacon", ""},
+		{"name=validator%2D2", lodestar, ActionCreateContainer, "validator", ""},
+		// The daemon takes the first of a repeated name; the proxy denies it.
+		{"name=beacon&name=monitoring", lodestar, ActionDeny, "", "duplicate name query parameter"},
+		{"name=beacon&n%61me=validator", lodestar, ActionDeny, "", "duplicate name query parameter"},
+		// A query the daemon rejects is denied, as for the pull (#83).
+		{"name=%zz", lodestar, ActionDeny, "", "invalid query string"},
+		{"platform=%zz&name=beacon", lodestar, ActionDeny, "", "invalid query string"},
+		{"name=beacon;x=1", lodestar, ActionDeny, "", "invalid query string"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			got := r.Route("POST", "/v1.45/containers/create?"+tt.query, tt.body)
+			if got.Action != tt.want {
+				t.Fatalf("create ?%s = %v, want %v (deny msg: %q)", tt.query, got.Action, tt.want, got.DenyMsg)
+			}
+			if got.Service != tt.service {
+				t.Fatalf("create ?%s service = %q, want %q", tt.query, got.Service, tt.service)
+			}
+			if got.DenyMsg != tt.wantMsg {
+				t.Fatalf("create ?%s deny msg = %q, want %q", tt.query, got.DenyMsg, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestRouteCreateSelectionIsStable repeats the #85 reproduction: with two
+// policies for one image, every create gets its own policy, every time.
+func TestRouteCreateSelectionIsStable(t *testing.T) {
+	r := NewRouter(newTestManager(t, lodestarPolicies))
+	body := map[string]interface{}{"Image": "chainsafe/lodestar:v1.20.0"}
+	for i := 0; i < 50; i++ {
+		for _, name := range []string{"beacon", "validator"} {
+			got := r.Route("POST", "/containers/create?name="+name, body)
+			if got.Action != ActionCreateContainer || got.Service != name {
+				t.Fatalf("iteration %d: create ?name=%s got %v service %q (%q)", i, name, got.Action, got.Service, got.DenyMsg)
+			}
+		}
+	}
+}
+
+// TestRouteCreateAmbiguous: two policies that both accept one image and name
+// are refused at load time; built without that check, the router denies.
+func TestRouteCreateAmbiguous(t *testing.T) {
+	m := policy.NewManagerFromPolicies(
+		&policy.Policy{ServiceName: "b", AllowedImagePrefixes: []string{"chainsafe/lodestar"}},
+		&policy.Policy{ServiceName: "a", AllowedImagePrefixes: []string{"chainsafe"}, ContainerNames: []string{"beacon"}},
+	)
+	r := NewRouter(m)
+	body := map[string]interface{}{"Image": "chainsafe/lodestar:v1"}
+	got := r.Route("POST", "/containers/create?name=beacon", body)
+	want := "ambiguous policy for image chainsafe/lodestar:v1 and name beacon: a, b"
+	if got.Action != ActionDeny || got.DenyMsg != want {
+		t.Fatalf("got %v %q, want deny %q", got.Action, got.DenyMsg, want)
+	}
+	got = r.Route("POST", "/containers/create?name=validator", body)
+	if got.Action != ActionCreateContainer || got.Service != "b" {
+		t.Fatalf("name=validator: got %v %q (%q), want b", got.Action, got.Service, got.DenyMsg)
+	}
+}
+
+// TestRouteLifecycleCoverage is the cross-language parity guard for #86.
+//
+// A lifecycle action or DELETE is allowed directly only on a name that
+// exactly one policy covers (container_names, or service_name when unset).
+// Any other target is routed for resolution: the handler asks the daemon
+// which container it is. Rows mirror the covered* and uncovered* runs in
+// spec/router.qnt.
+func TestRouteLifecycleCoverage(t *testing.T) {
+	files := map[string]string{
+		"validator.yaml":  lodestarPolicies["validator.yaml"],
+		"monitoring.yaml": lodestarPolicies["monitoring.yaml"],
+		"vc.yaml": `
+service_name: vc-svc
+container_names: [vc-1]
+allowed_image_prefixes:
+  - example/vc
+`,
+		"cafe.yaml": `
+service_name: cafe
+allowed_image_prefixes:
+  - cafe/app
+`,
+	}
+	r := NewRouter(newTestManager(t, files))
+
+	tests := []struct {
+		method  string
+		path    string
+		want    Action
+		service string
+	}{
+		// coveredNameStartAllowedTest
+		{"POST", "/containers/validator/start", ActionAllow, "validator"},
+		{"POST", "/v1.45/containers/validator-2/kill", ActionAllow, "validator"},
+		{"DELETE", "/containers/validator", ActionAllow, "validator"},
+		// A policy without container_names covers its service_name.
+		{"POST", "/containers/monitoring/restart", ActionAllow, "monitoring"},
+		// With container_names set, service_name is not covered.
+		{"POST", "/containers/vc-svc/stop", ActionResolveContainer, ""},
+		{"POST", "/containers/vc-1/stop", ActionAllow, "vc-svc"},
+		// uncoveredNameStopDeniedTest: an operator container, resolved first.
+		{"POST", "/containers/mycontainer/stop", ActionResolveContainer, ""},
+		// An ID (full or short) is resolved by the daemon.
+		{"POST", "/containers/4f6e1d2c9a7b/kill", ActionResolveContainer, ""},
+		{"DELETE", "/containers/4f6e1d2c9a7b8c3d4e5f60718293a4b5c6d7e8f9012345678901234567890abc", ActionResolveContainer, ""},
+		// A covered name that could also be an ID prefix is resolved too.
+		{"POST", "/containers/cafe/start", ActionResolveContainer, ""},
+		// Reads are not lifecycle actions.
+		{"GET", "/containers/mycontainer/json", ActionAllow, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			got := r.Route(tt.method, tt.path, nil)
+			if got.Action != tt.want {
+				t.Fatalf("Route(%s, %s) = %v, want %v (deny msg: %q)", tt.method, tt.path, got.Action, tt.want, got.DenyMsg)
+			}
+			if got.Service != tt.service {
+				t.Fatalf("Route(%s, %s) service = %q, want %q", tt.method, tt.path, got.Service, tt.service)
+			}
+		})
+	}
+
+	// --readonly still denies first (#75).
+	ro := NewRouter(newTestManager(t, files)).WithReadonly(true)
+	if got := ro.Route("POST", "/containers/validator/start", nil); got.Action != ActionDeny {
+		t.Fatalf("readonly start: got %v, want deny", got.Action)
+	}
+}
+
+// TestRoutePullSharedImage: several policies may allow one image once
+// container_names tells their creates apart (#85). A pull creates no
+// container, so it is allowed when any policy for the image accepts its tag
+// or digest, and denied with the first policy's reason (sorted by
+// service_name) when none does.
+func TestRoutePullSharedImage(t *testing.T) {
+	r := NewRouter(newTestManager(t, map[string]string{
+		"vc-b.yaml": "service_name: vc-b\ncontainer_names: [vc-b]\nallowed_image_prefixes: [example/vc]\nimage_tag_pattern: '^v2$'\n",
+		"vc-a.yaml": "service_name: vc-a\ncontainer_names: [vc-a]\nallowed_image_prefixes: [example/vc]\nimage_tag_pattern: '^v1$'\n",
+	}))
+	tests := []struct {
+		tag     string
+		want    Action
+		service string
+		wantMsg string
+	}{
+		{"v1", ActionAllow, "vc-a", ""},
+		{"v2", ActionAllow, "vc-b", ""},
+		{"v3", ActionDeny, "", `image tag "v3" does not match pattern "^v1$"`},
+	}
+	for i := 0; i < 50; i++ {
+		for _, tt := range tests {
+			got := r.Route("POST", "/images/create?fromImage=example%2Fvc&tag="+tt.tag, nil)
+			if got.Action != tt.want || got.Service != tt.service || got.DenyMsg != tt.wantMsg {
+				t.Fatalf("iteration %d: pull tag %s = %v %q %q, want %v %q %q", i, tt.tag, got.Action, got.Service, got.DenyMsg, tt.want, tt.service, tt.wantMsg)
+			}
+		}
 	}
 }

@@ -10,8 +10,43 @@ export function isPermissionDenied(err: NodeJS.ErrnoException): boolean {
   return err.code === "EACCES" || err.code === "EPERM";
 }
 
+export interface DaemonResponse {
+  statusCode: number;
+  body: Buffer;
+}
+
+// Bounds the response read by get().
+const MAX_GET_BODY = 4 << 20;
+
 export class Transport {
   constructor(private socketPath: string = DEFAULT_SOCKET_PATH) {}
+
+  // Sends GET path to the daemon and returns its response, for the proxy's
+  // own lookups (#86). Nothing from the caller's request is forwarded.
+  get(path: string): Promise<DaemonResponse> {
+    return new Promise((resolve, reject) => {
+      const dockerReq = request(
+        { socketPath: this.socketPath, path, method: "GET", headers: { Host: "docker" } },
+        (dockerRes) => {
+          const chunks: Buffer[] = [];
+          let size = 0;
+          dockerRes.on("data", (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > MAX_GET_BODY) {
+              dockerRes.destroy();
+              reject(new Error("response too large"));
+              return;
+            }
+            chunks.push(chunk);
+          });
+          dockerRes.on("end", () => resolve({ statusCode: dockerRes.statusCode ?? 500, body: Buffer.concat(chunks) }));
+          dockerRes.on("error", reject);
+        },
+      );
+      dockerReq.on("error", reject);
+      dockerReq.end();
+    });
+  }
 
   forward(req: IncomingMessage, res: ServerResponse, body?: Buffer): Promise<void> {
     return new Promise((resolve, reject) => {

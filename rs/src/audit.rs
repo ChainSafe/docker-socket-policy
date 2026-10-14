@@ -25,6 +25,10 @@ impl AuditLogger {
         self.log("ALLOW", method, uri, "");
     }
 
+    pub fn allow_reason(&self, method: &str, uri: &str, reason: &str) {
+        self.log("ALLOW", method, uri, reason);
+    }
+
     pub fn deny(&self, method: &str, uri: &str, reason: &str) {
         self.log("DENY", method, uri, reason);
     }

@@ -64,6 +64,16 @@
 // right after the empty interior segment check. `.hidden`, `...` and `a.b`
 // are names like any other.
 //
+// ALLOW_UNCOVERED = true models all three before #86, where a lifecycle
+// action or DELETE on a name no policy covers was forwarded as an unknown
+// container (`allowUnknown`). false models all three after the fix: a name
+// that exactly one policy covers is allowed (`allowKnown`); any other target
+// (an uncovered name, a full or short ID) is `resolve`d: the handler asks the
+// daemon `GET /containers/{x}/json` and allows the request only if the
+// container's name is covered (`allowResolved`), denying a 404, an uncovered
+// name or any other daemon error. The daemon's lookup is the fixed table
+// DAEMON_CONTAINERS, and `handle` is `route` followed by that lookup.
+//
 // No instance models Go before #53. Go decoded before routing, which is
 // route(m, decodePath(segs)); with this table that agrees with the daemon
 // by construction, so the property cannot express Go's risk: decoding that
@@ -78,6 +88,7 @@ module router_model {
   const ALLOW_ATTACH: bool
   const ALLOW_ANY_METHOD_PING: bool
   const ALLOW_DOT_SEGMENTS: bool
+  const ALLOW_UNCOVERED: bool
 
   // ─── Daemon decoding ────────────────────────────────────────────────
 
@@ -106,7 +117,25 @@ module router_model {
   // ─── Router ─────────────────────────────────────────────────────────
 
   pure val RESERVED = Set("create", "json", "exec")
-  pure val KNOWN_SERVICES = Set("beacon")
+  // The names the loaded policies cover: their container_names, or their
+  // service_name when container_names is unset (#86).
+  pure val COVERED_NAMES = Set("beacon")
+
+  // ─── Daemon containers (#86) ────────────────────────────────────────
+
+  // What the daemon resolves an identifier to: a name or an ID (full or
+  // short) maps to the name of the container it denotes. `f00d` is the
+  // covered container's ID, `mycontainer` an operator container no policy
+  // covers and `c0ffee` its ID. Any other identifier is a 404.
+  pure val DAEMON_CONTAINERS: str -> str = Map(
+    "beacon" -> "beacon",
+    "f00d" -> "beacon",
+    "mycontainer" -> "mycontainer",
+    "c0ffee" -> "mycontainer",
+  )
+
+  pure def daemonHas(id: str): bool =
+    DAEMON_CONTAINERS.keys().contains(id)
 
   pure val BY_NAME_ACTIONS = Set("start", "stop", "restart", "kill", "wait", "pause", "unpause")
   pure val DENIED_ACTIONS = Set("rename", "update")
@@ -128,7 +157,9 @@ module router_model {
     if (segs.length() == 0) "" else segs[segs.length() - 1]
 
   pure def routeByName(name: str): str =
-    if (KNOWN_SERVICES.contains(name)) "allowKnown" else "allowUnknown"
+    if (COVERED_NAMES.contains(name)) "allowKnown"
+    else if (ALLOW_UNCOVERED) "allowUnknown"
+    else "resolve"
 
   // Exec matches whole segments only (#49): the `/exec/<id>/…` namespace,
   // or `exec` anywhere after `containers`. A segment such as `exec-runner`
@@ -185,12 +216,27 @@ module router_model {
     else if (method == "GET" or method == "HEAD") "allowRead"
     else "deny"
 
+  // The router's outcome, followed by the handler's daemon lookup for a
+  // `resolve` (#86): a container whose name is covered is allowed, anything
+  // else (a 404, an uncovered name) is denied. A daemon error other than 404
+  // also denies; the table has none.
+  pure def handle(method: str, segs: List[str]): str = {
+    val r = route(method, segs)
+    if (r != "resolve") r
+    else if (daemonHas(segs[1]) and COVERED_NAMES.contains(DAEMON_CONTAINERS.get(segs[1]))) "allowResolved"
+    else "deny"
+  }
+
+  pure def isLifecycleAllow(outcome: str): bool =
+    Set("allowKnown", "allowUnknown", "allowResolved").contains(outcome)
+
   // ─── Path universe ──────────────────────────────────────────────────
 
   pure val WORDS = Set(
     "containers", "", "json", "create", "exec", "mycontainer", "beacon", "start", "stop",
     "%2F", "%2f", "%6A%73%6F%6E", "beacon%2Fstart",
     "exec-runner", "abc", "extra", "attach", "ws", "_ping", ".", "..",
+    "f00d", "c0ffee",
   )
   pure val METHODS = Set("GET", "HEAD", "POST", "DELETE")
 
@@ -201,14 +247,26 @@ module router_model {
 
   // ─── Properties ─────────────────────────────────────────────────────
 
-  // A lifecycle allow only ever targets a real, non-reserved name.
+  // A lifecycle allow, or a lookup for one, only ever targets a real,
+  // non-reserved name.
   pure val lifecycleOnlyTargetsRealNames: bool =
     METHODS.forall(m => PATHS.forall(segs =>
-      Set("allowKnown", "allowUnknown").contains(route(m, segs)) implies and {
+      Set("allowKnown", "allowUnknown", "resolve").contains(route(m, segs)) implies and {
         segs.length() >= 2,
         segs[1] != "",
         not(RESERVED.contains(segs[1])),
       }
+    ))
+
+  // No lifecycle action or DELETE is forwarded for an existing container
+  // outside every policy's covered names (#86), whether the request names
+  // it or gives its ID. A forwarded request for an identifier the daemon
+  // does not know gets a 404 from the daemon. It does not mention
+  // ALLOW_UNCOVERED or `resolve`, so that router_pre86 fails it.
+  pure val lifecycleOnlyCovered: bool =
+    METHODS.forall(m => PATHS.forall(segs =>
+      isLifecycleAllow(handle(m, segs)) implies
+        (not(daemonHas(segs[1])) or COVERED_NAMES.contains(DAEMON_CONTAINERS.get(segs[1])))
     ))
 
   // Any request the router does not deny reads the same to the daemon:
@@ -338,9 +396,6 @@ module router_model {
   run reservedExecDeleteDeniedTest =
     assert(route("DELETE", ["containers", "exec"]) == "denyExec")
 
-  run realNameDeleteAllowedTest =
-    assert(route("DELETE", ["containers", "mycontainer"]) == "allowUnknown")
-
   run reservedInSubpathAllowedTest =
     assert(route("GET", ["containers", "mycontainer", "json"]) == "allowRead")
 
@@ -351,12 +406,6 @@ module router_model {
 
   run execSubpathPostDeniedTest =
     assert(route("POST", ["containers", "mycontainer", "exec"]) == "denyExec")
-
-  run execPrefixNameStartAllowedTest =
-    assert(route("POST", ["containers", "exec-runner", "start"]) == "allowUnknown")
-
-  run execPrefixNameDeleteAllowedTest =
-    assert(route("DELETE", ["containers", "exec-runner"]) == "allowUnknown")
 
   run execPrefixNameGetAllowedTest =
     assert(route("GET", ["containers", "exec-runner", "json"]) == "allowRead")
@@ -391,7 +440,7 @@ module router_model {
 // interior segment or a dot segment is denied, attach is denied, and the
 // read endpoints are read-only.
 module router {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false, ALLOW_UNCOVERED = false).*
 
   run emptyNameDeleteDeniedTest =
     assert(route("DELETE", ["containers", ""]) == "deny")
@@ -503,6 +552,52 @@ module router {
       dotSegmentsDenied,
       dotSegmentsHideNoExec,
     })
+
+  // Lifecycle actions and DELETE only on covered containers (#86). Before
+  // #86 the first three rows were allowed as an unknown container.
+
+  run realNameDeleteDeniedTest =
+    assert(and {
+      route("DELETE", ["containers", "mycontainer"]) == "resolve",
+      handle("DELETE", ["containers", "mycontainer"]) == "deny",
+    })
+
+  // The daemon answers 404 for these two.
+  run execPrefixNameStartDeniedTest =
+    assert(and {
+      route("POST", ["containers", "exec-runner", "start"]) == "resolve",
+      handle("POST", ["containers", "exec-runner", "start"]) == "deny",
+    })
+
+  run execPrefixNameDeleteDeniedTest =
+    assert(and {
+      route("DELETE", ["containers", "exec-runner"]) == "resolve",
+      handle("DELETE", ["containers", "exec-runner"]) == "deny",
+    })
+
+  run coveredNameStartAllowedTest =
+    assert(and {
+      route("POST", ["containers", "beacon", "start"]) == "allowKnown",
+      handle("POST", ["containers", "beacon", "start"]) == "allowKnown",
+    })
+
+  run coveredIdStartAllowedTest =
+    assert(and {
+      route("POST", ["containers", "f00d", "start"]) == "resolve",
+      handle("POST", ["containers", "f00d", "start"]) == "allowResolved",
+    })
+
+  run uncoveredNameStopDeniedTest =
+    assert(handle("POST", ["containers", "mycontainer", "stop"]) == "deny")
+
+  run uncoveredIdStopDeniedTest =
+    assert(handle("POST", ["containers", "c0ffee", "stop"]) == "deny")
+
+  run missingContainerDeleteDeniedTest =
+    assert(handle("DELETE", ["containers", "abc"]) == "deny")
+
+  run coveredSoundTest =
+    assert(lifecycleOnlyCovered)
 }
 
 // Rust before #48: `/containers/` and `/containers//start` reach
@@ -511,13 +606,13 @@ module router {
 // is off: with it on, `/containers//start` would be denied before it reached
 // the name branch, and the instance could not show #48.
 module router_pre48 {
-  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
+  import router_model(ALLOW_EMPTY_NAME = true, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false, ALLOW_UNCOVERED = false).*
 
   run pre48UnsoundTest =
     assert(and {
       not(lifecycleOnlyTargetsRealNames),
-      route("DELETE", ["containers", ""]) == "allowUnknown",
-      route("POST", ["containers", "", "start"]) == "allowUnknown",
+      route("DELETE", ["containers", ""]) == "resolve",
+      route("POST", ["containers", "", "start"]) == "resolve",
     })
 }
 
@@ -525,13 +620,13 @@ module router_pre48 {
 // encoded name such as `%2F` counted as an unknown container and the
 // request was forwarded. The daemon decodes it and reads a different path.
 module router_pre53 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = true, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false, ALLOW_UNCOVERED = false).*
 
   run pre53UnsoundTest =
     assert(and {
       not(routerSeesWhatDaemonSees),
-      route("DELETE", ["containers", "%2F"]) == "allowUnknown",
-      route("POST", ["containers", "%2F", "start"]) == "allowUnknown",
+      route("DELETE", ["containers", "%2F"]) == "resolve",
+      route("POST", ["containers", "%2F", "start"]) == "resolve",
       route("GET", ["containers", "%2F"]) == "allowRead",
     })
 }
@@ -541,7 +636,7 @@ module router_pre53 {
 // check missed it and the GET passthrough forwarded it. The daemon answers
 // with a 301 to the clean path, so nothing leaked, but the router allowed it.
 module router_pre55 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = true, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false, ALLOW_UNCOVERED = false).*
 
   run pre55UnsoundTest =
     assert(and {
@@ -555,7 +650,7 @@ module router_pre55 {
 // `--match='^readonly.*Test$'`; the shared write rows in router_model assume the
 // flag is off.
 module router_readonly {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = true, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = true, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false, ALLOW_UNCOVERED = false).*
 
   run readonlySoundTest =
     assert(readonlyAllowsOnlyReads)
@@ -581,7 +676,7 @@ module router_readonly {
 // and Go relayed the 101, giving the caller the container's stdin. Other
 // flags as `router`.
 module router_pre76 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = true, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = true, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false, ALLOW_UNCOVERED = false).*
 
   run pre76UnsoundTest =
     assert(and {
@@ -594,7 +689,7 @@ module router_pre76 {
 // `/info` and `/events…` for every method, so `POST /_ping` and
 // `DELETE /version` reached the daemon. Other flags as `router`.
 module router_pre78 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = true, ALLOW_DOT_SEGMENTS = false).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = true, ALLOW_DOT_SEGMENTS = false, ALLOW_UNCOVERED = false).*
 
   run pre78UnsoundTest =
     assert(and {
@@ -610,7 +705,7 @@ module router_pre78 {
 // with a 301 to the clean path, so nothing leaked, but the router allowed it.
 // Other flags as `router`.
 module router_pre70 {
-  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = true).*
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = true, ALLOW_UNCOVERED = false).*
 
   run pre70UnsoundTest =
     assert(and {
@@ -870,5 +965,20 @@ module pull_pre84 {
       not(pullDecidedOnCanonicalImage),
       routePull(cliPull("docker.io/library/alpine")) == "deny",
       routePull(cliPull("alpine")) == "allowPull",
+    })
+}
+
+// All three before #86: a lifecycle action or DELETE on a name no policy
+// covers, an operator container's name or its ID included, was forwarded as
+// an unknown container. Other flags as `router`.
+module router_pre86 {
+  import router_model(ALLOW_EMPTY_NAME = false, ALLOW_PERCENT = false, ALLOW_EMPTY_INTERIOR = false, READONLY = false, ALLOW_ATTACH = false, ALLOW_ANY_METHOD_PING = false, ALLOW_DOT_SEGMENTS = false, ALLOW_UNCOVERED = true).*
+
+  run pre86UnsoundTest =
+    assert(and {
+      not(lifecycleOnlyCovered),
+      route("DELETE", ["containers", "mycontainer"]) == "allowUnknown",
+      route("POST", ["containers", "c0ffee", "stop"]) == "allowUnknown",
+      route("POST", ["containers", "exec-runner", "start"]) == "allowUnknown",
     })
 }
