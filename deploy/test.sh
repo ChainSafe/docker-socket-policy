@@ -304,30 +304,61 @@ fi
 echo ""
 echo "--- Docker API passthrough ---"
 
-# Image pull: allowed image passes proxy, daemon fails (image doesn't exist)
-S=$(post_json '{"fromImage":"chainsafe/lodestar:beacon"}' "$PROXY/images/create")
-if [ "$S" = "200" ]; then
-  echo "  PASS: image pull allowed -> $S"
-  PASS=$((PASS+1))
-elif [ "$S" = "500" ]; then
-  echo "  PASS: image pull allowed (500 = daemon can't fetch, not proxy) -> $S"
-  PASS=$((PASS+1))
-elif [ "$S" = "404" ]; then
-  echo "  PASS: image pull allowed (404 = daemon can't fetch, not proxy) -> $S"
+# #83: image pulls are routed on the query string, as the Docker CLI sends
+# them: fromImage (fully qualified, URL-encoded) and tag, with an empty body.
+# config/pull-allowed.yaml allows busybox:latest, a few MB, so the allowed pull
+# runs to completion against the daemon: 200 and a stream with no error in it.
+# The image is sent as docker.io/library/busybox, so the check also covers
+# normalisation of the policy's bare busybox prefix (#84). Before
+# #83 every such pull was denied with "empty request body".
+# pull_query QUERY [BODY [CONTENT_TYPE [HEADER]]]: POST /images/create?QUERY,
+# empty body unless given, JSON unless CONTENT_TYPE is given.
+pull_query() {
+  : >"$BODY"
+  out=$(curl -s -o "$BODY" -w '%{http_code}' --max-time 120 --connect-timeout 2 --unix-socket "$PROXY_SOCK" \
+    -X POST -H "Content-Type: ${3:-application/json}" ${4:+-H "$4"} -d "${2:-}" \
+    "$PROXY/v1.45/images/create?$1" 2>/dev/null || true)
+  echo "${out:-000}"
+}
+
+S=$(pull_query 'fromImage=docker.io%2Flibrary%2Fbusybox&tag=latest')
+if [ "$S" = "200" ] && grep -q '"status"' "$BODY" && ! grep -q '"error' "$BODY"; then
+  echo "  PASS: pull allowed image the CLI way -> 200 (pulled)"
   PASS=$((PASS+1))
 else
-  echo "  FAIL: image pull (expected 200|404|500, got $S)"
+  echo "  FAIL: pull allowed image the CLI way (expected 200 and a clean pull, got $S: $(head -c 200 "$BODY"))"
   FAIL=$((FAIL+1))
 fi
 
-# Unlisted image pull -> proxy denies
-S=$(post_json '{"fromImage":"alpine:latest"}' "$PROXY/images/create")
-check_denied "pull unlisted image -> 403" "$S" "$BODY" 'image alpine:latest not allowed by any policy'
+S=$(pull_query 'fromImage=docker.io%2Flibrary%2Falpine&tag=latest')
+check_denied "pull unlisted image the CLI way -> 403" "$S" "$BODY" 'image docker.io/library/alpine not allowed by any policy'
 
-# Real container lifecycle with busybox (image that exists)
-# Step 1: Pull busybox through proxy (should be denied — not in policy)
-S=$(post_json '{"fromImage":"busybox:latest"}' "$PROXY/images/create")
-check_denied "pull busybox (unlisted) -> 403" "$S" "$BODY" 'image busybox:latest not allowed by any policy'
+S=$(pull_query 'fromImage=alpine&tag=latest')
+check_denied "pull alpine (unlisted, short name) -> 403" "$S" "$BODY" 'image alpine not allowed by any policy'
+
+# #83: pull-allowed.yaml's tag pattern applies to pulls as it does to creates.
+S=$(pull_query 'fromImage=busybox&tag=musl')
+check_denied "pull allowed image with a tag outside the pattern -> 403" "$S" "$BODY" 'image tag "musl" does not match pattern'
+
+# #83: a pull has no body. Before #83 an allowed image in a JSON body
+# forwarded a pull of the query's image (alpine here, pulled for real). The
+# daemon reads a form body over the query, so routing on the query and
+# forwarding the body would let a form body name any image: with busybox
+# (allowed) in the query and alpine in the form body, the daemon pulls
+# alpine. Every body is denied, whatever its Content-Type or framing.
+body_msg='image pull must not have a request body'
+S=$(pull_query 'fromImage=alpine&tag=latest' '{"fromImage":"chainsafe/lodestar"}')
+check_denied "pull with allowed image in JSON body, unlisted in query -> 403" "$S" "$BODY" "$body_msg"
+
+S=$(pull_query 'fromImage=busybox&tag=latest' 'fromImage=alpine&tag=3.19' 'application/x-www-form-urlencoded')
+check_denied "pull with allowed image in query, unlisted in form body -> 403" "$S" "$BODY" "$body_msg"
+
+S=$(pull_query 'fromImage=busybox&tag=latest' 'fromImage=alpine&tag=3.19' 'application/x-www-form-urlencoded' 'Transfer-Encoding: chunked')
+check_denied "pull with a chunked form body -> 403" "$S" "$BODY" "$body_msg"
+
+# #83: an import (fromSrc) would store any tarball under an allowed name.
+S=$(pull_query 'fromSrc=http%3A%2F%2F127.0.0.1%3A9%2Fx.tar&repo=chainsafe%2Flodestar&tag=imported')
+check_denied "image import (fromSrc) -> 403" "$S" "$BODY" 'image import (fromSrc) is not allowed'
 
 # ─── Endpoint completeness ─────────────────────────────
 
@@ -542,15 +573,10 @@ check_denied "GET /containers/./json -> 403 (dot segment)" "$S" "$BODY" 'dot pat
 echo ""
 echo "--- Forced network_mode (#87) ---"
 
-# pull IMAGE TAG: pull through the proxy. The router reads the body (and the
-# query string, #83); the daemon reads the query string. A pull streams until
-# it completes, so it gets a longer timeout.
+# pull IMAGE TAG: pull through the proxy the way the Docker CLI does,
+# fromImage and tag in the query string and no body (#83); see pull_query.
 pull() {
-  : >"$BODY"
-  out=$(curl -s -o "$BODY" -w '%{http_code}' --max-time 120 --connect-timeout 2 --unix-socket "$PROXY_SOCK" \
-    -X POST -H "Content-Type: application/json" -d "{\"fromImage\":\"$1:$2\"}" \
-    "$PROXY/images/create?fromImage=$1&tag=$2" 2>/dev/null || true)
-  echo "${out:-000}"
+  pull_query "fromImage=$1&tag=$2"
 }
 
 # start_forced NAME IMAGE MODE: create NAME as the CLI does, start it, and

@@ -516,6 +516,50 @@ mod tests {
         assert_eq!(uri.query(), Some(query));
     }
 
+    /// #83: a pull with a body is never forwarded. The daemon reads a form
+    /// body's fromImage over the query's, so an allowed image in the query
+    /// and another in the body would pull the body's. Any body is denied,
+    /// whatever its Content-Type.
+    #[tokio::test]
+    async fn test_handler_pull_denies_body() {
+        let cases = [
+            ("application/x-www-form-urlencoded", "fromImage=busybox&tag=latest"),
+            ("application/json", r#"{"fromImage":"alpine"}"#),
+            ("text/plain", "x"),
+        ];
+        for (content_type, body) in cases {
+            let policy: crate::policy::Policy =
+                serde_yaml::from_str("service_name: probe\nallowed_image_prefixes:\n  - alpine\n").unwrap();
+            let mut policies = std::collections::HashMap::new();
+            policies.insert("probe".to_string(), policy);
+            let router = Arc::new(Router::new(Manager::from_map(policies)));
+            let captured_uri = Arc::new(std::sync::Mutex::new(None));
+            let transport = UriRecordingTransport {
+                captured_uri: captured_uri.clone(),
+            };
+            let audit = AuditLogger::new("/dev/null").unwrap();
+            let handler = Handler::new(router, Chain::new(), audit, Box::new(transport));
+            let req = Request::post("http://localhost/v1.56/images/create?fromImage=alpine&tag=3.19")
+                .header("content-type", content_type)
+                .body(Full::new(Bytes::from(body)))
+                .unwrap();
+            let resp = handler.handle(req).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{}", content_type);
+            let got = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                "image pull must not have a request body",
+                "{}",
+                content_type
+            );
+            assert!(
+                captured_uri.lock().unwrap().is_none(),
+                "{}: expected no forward",
+                content_type
+            );
+        }
+    }
+
     /// #55: the audit uri is the raw request target, query and escapes
     /// included, for allowed and denied requests alike.
     #[tokio::test]

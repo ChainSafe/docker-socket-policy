@@ -162,6 +162,46 @@ func TestHandler_ForwardsPercentEncodedQuery(t *testing.T) {
 
 // #55: the audit uri is the raw request target, query and escapes included,
 // for allowed and denied requests alike.
+// TestHandler_PullDeniesBody checks that a pull with a body is never
+// forwarded (#83). The daemon reads a form body's fromImage over the query's,
+// so an allowed image in the query and another in the body would pull the
+// body's. Any body is denied, whatever its Content-Type or framing.
+func TestHandler_PullDeniesBody(t *testing.T) {
+	files := map[string]string{"probe.yaml": "service_name: probe\nallowed_image_prefixes:\n  - alpine\n"}
+	const target = "/v1.56/images/create?fromImage=alpine&tag=3.19"
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		chunked     bool
+	}{
+		{"form body", "application/x-www-form-urlencoded", "fromImage=busybox&tag=latest", false},
+		{"chunked form body", "application/x-www-form-urlencoded", "fromImage=busybox&tag=latest", true},
+		{"JSON body", "application/json", `{"fromImage":"alpine"}`, false},
+		{"text body", "text/plain", "x", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := &recorderTransport{}
+			h := newTestHandler(t, files, rec)
+			req := httptest.NewRequest("POST", target, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", tt.contentType)
+			if tt.chunked {
+				req.ContentLength = -1
+				req.TransferEncoding = []string{"chunked"}
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != http.StatusForbidden || rec.lastRequest != nil {
+				t.Fatalf("status %d, forwarded %v, want 403 and no forward", w.Code, rec.lastRequest != nil)
+			}
+			if got := strings.TrimSpace(w.Body.String()); got != "image pull must not have a request body" {
+				t.Errorf("deny body = %q", got)
+			}
+		})
+	}
+}
+
 func TestHandlerAuditURIIsRequestTarget(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "default.yaml"), []byte("service_name: default\nallowed_image_prefixes:\n  - scratch\n"), 0644)

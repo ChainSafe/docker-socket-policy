@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -236,44 +237,157 @@ func TestRouterStripAPIVersion(t *testing.T) {
 	}
 }
 
-func TestRouterImagePull(t *testing.T) {
-	m := newTestManager(t, map[string]string{
-		"beacon.yaml": `
+// pullTestPolicies is the policy set for the #83 and #84 tables. beacon's
+// prefixes are written in spellings that normalisation must reduce at load
+// time: docker.io/chainsafe/lodestar is chainsafe/lodestar, and the registry
+// host Registry.Example.com:443 is lower-cased.
+var pullTestPolicies = map[string]string{
+	"probe.yaml": `
+service_name: probe
+allowed_image_prefixes:
+  - alpine
+image_digest_allowed: true
+`,
+	"beacon.yaml": `
 service_name: beacon
 allowed_image_prefixes:
-  - chainsafe/lodestar
+  - docker.io/chainsafe/lodestar
+  - ghcr.io/chainsafe/lodestar
+  - localhost:5000/x
+  - Registry.Example.com:443/a
+image_tag_pattern: '^(v[0-9]+|[0-9]+)$'
 `,
-	})
-	r := NewRouter(m)
+}
 
-	body := map[string]interface{}{
-		"fromImage": "chainsafe/lodestar:next",
+const testDigest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+
+// TestRoutePullQuery is the cross-language parity guard for #83 and #84.
+//
+// POST /images/create is routed on its query string, the way the Docker CLI
+// sends it: fromImage (fully qualified, URL-encoded) and tag, with an empty
+// body. The body is ignored, fromSrc (import) is denied, and the image gets
+// the create checks: a policy prefix on the normalised repository, then that
+// policy's tag pattern and digest rule. Rows mirror the pull* runs in
+// spec/router.qnt; the rest are language-only.
+func TestRoutePullQuery(t *testing.T) {
+	r := NewRouter(newTestManager(t, pullTestPolicies))
+	alpineBody := map[string]interface{}{"fromImage": "alpine"}
+	notAllowed := func(image string) string { return "image " + image + " not allowed by any policy" }
+	required := "fromImage query parameter is required for image pull"
+	bodyMsg := "image pull must not have a request body"
+	fromSrc := "image import (fromSrc) is not allowed"
+
+	tests := []struct {
+		path    string
+		body    map[string]interface{}
+		want    Action
+		service string
+		wantMsg string
+	}{
+		// pullCliAllowedTest (#83): the issue's reproduction, as the CLI sends it.
+		{"/v1.56/images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.19", nil, ActionAllow, "probe", ""},
+		// pullShortNameAllowedTest (#84)
+		{"/images/create?fromImage=alpine&tag=3.19", nil, ActionAllow, "probe", ""},
+		// pullLibraryNameAllowedTest (#84)
+		{"/images/create?fromImage=library%2Falpine&tag=latest", nil, ActionAllow, "probe", ""},
+		// pullCliOrgAllowedTest (#84): the prefix is written docker.io/chainsafe/lodestar.
+		{"/images/create?fromImage=docker.io%2Fchainsafe%2Flodestar&tag=v1", nil, ActionAllow, "beacon", ""},
+		// #84: the tag in fromImage, on another Docker Hub host name.
+		{"/images/create?fromImage=index.docker.io%2Flibrary%2Falpine%3A3.19", nil, ActionAllow, "probe", ""},
+		// #83: the CLI sends a digest in tag.
+		{"/images/create?fromImage=alpine&tag=" + url.QueryEscape(testDigest), nil, ActionAllow, "probe", ""},
+		// #83: a digest in fromImage.
+		{"/images/create?fromImage=" + url.QueryEscape("alpine@"+testDigest), nil, ActionAllow, "probe", ""},
+		// #83: image_digest_allowed is false for beacon.
+		{"/images/create?fromImage=ghcr.io%2Fchainsafe%2Flodestar&tag=" + url.QueryEscape(testDigest), nil, ActionDeny, "", "image digests not allowed for service beacon"},
+		// #84: a registry port is not a tag.
+		{"/images/create?fromImage=localhost%3A5000%2Fx%2Fy&tag=2", nil, ActionAllow, "beacon", ""},
+		// #84: the registry host is compared lower-cased.
+		{"/images/create?fromImage=REGISTRY.example.com%3A443%2Fa&tag=1", nil, ActionAllow, "beacon", ""},
+		// #83: the tag pattern applies to pulls.
+		{"/images/create?fromImage=chainsafe%2Flodestar&tag=latest", nil, ActionDeny, "", `image tag "latest" does not match pattern "^(v[0-9]+|[0-9]+)$"`},
+		// pullDisallowedCliDeniedTest (#83)
+		{"/images/create?fromImage=docker.io%2Fattacker%2Fmalware&tag=latest", nil, ActionDeny, "", notAllowed("docker.io/attacker/malware")},
+		// pullOtherRegistryDeniedTest (#84): another registry is not Docker Hub's alpine.
+		{"/images/create?fromImage=localhost%3A5000%2Falpine&tag=1", nil, ActionDeny, "", notAllowed("localhost:5000/alpine")},
+		// #84: the prefix match stays on namespace boundaries.
+		{"/images/create?fromImage=alpine-evil&tag=1", nil, ActionDeny, "", notAllowed("alpine-evil")},
+		// pullNoFromImageDeniedTest (#83)
+		{"/images/create", nil, ActionDeny, "", required},
+		// #83: the old contract, fromImage in a JSON body: a pull has no body.
+		{"/images/create", map[string]interface{}{"fromImage": "alpine:3.19"}, ActionDeny, "", bodyMsg},
+		// pullBodyIgnoredDeniedTest (#83): the daemon would pull the query's image.
+		{"/images/create?fromImage=attacker%2Fmalware&tag=latest", alpineBody, ActionDeny, "", bodyMsg},
+		// pullJsonBodyDeniedTest (#83): any body is denied, even one that agrees.
+		{"/images/create?fromImage=alpine&tag=3.19", alpineBody, ActionDeny, "", bodyMsg},
+		// pullImportDeniedTest (#83): the daemon would import the tarball as alpine:latest.
+		{"/images/create?fromSrc=http%3A%2F%2Fexample.com%2Fx.tar&repo=alpine&tag=latest", nil, ActionDeny, "", fromSrc},
+		// pullImportWithImageDeniedTest (#83)
+		{"/images/create?fromImage=alpine&tag=latest&fromSrc=-", nil, ActionDeny, "", fromSrc},
+		// #83: a tag in fromImage and in tag is ambiguous.
+		{"/images/create?fromImage=alpine%3A3.19&tag=3.20", nil, ActionDeny, "", "fromImage alpine:3.19 already has a tag or digest; the tag query parameter is ambiguous"},
+		// #83: no tag and no digest pulls every tag.
+		{"/images/create?fromImage=alpine", nil, ActionDeny, "", "image pull without a tag or digest pulls every tag and is not allowed"},
+		// #84: upper case in the repository path is invalid.
+		{"/images/create?fromImage=Alpine&tag=latest", nil, ActionDeny, "", `invalid image reference "Alpine"`},
+		// #83: a repeated parameter could be read two ways.
+		{"/images/create?fromImage=alpine&fromImage=attacker%2Fmalware&tag=1", nil, ActionDeny, "", "duplicate fromImage query parameter"},
+		// #83: the daemon rejects a malformed query; so does the proxy.
+		{"/images/create?fromImage=alpine%zz&tag=1", nil, ActionDeny, "", "invalid query string"},
+		// #53 still holds: the percent check reads the path, not the query.
+		{"/images/%63reate?fromImage=alpine&tag=1", nil, ActionDeny, "", "percent-encoded path not allowed"},
 	}
-	result := r.Route("POST", "/images/create", body)
-	if result.Action != ActionAllow {
-		t.Fatalf("expected ActionAllow, got %v: %s", result.Action, result.DenyMsg)
-	}
-	if result.Image != "chainsafe/lodestar:next" {
-		t.Fatalf("expected image 'chainsafe/lodestar:next', got '%s'", result.Image)
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			got := r.Route("POST", tt.path, tt.body)
+			if got.Action != tt.want || got.DenyMsg != tt.wantMsg || got.Service != tt.service {
+				t.Errorf("Route(POST, %s) = %v/%q/%q, want %v/%q/%q",
+					tt.path, got.Action, got.Service, got.DenyMsg, tt.want, tt.service, tt.wantMsg)
+			}
+		})
 	}
 }
 
-func TestRouterImagePullDenied(t *testing.T) {
-	m := newTestManager(t, map[string]string{
-		"beacon.yaml": `
-service_name: beacon
-allowed_image_prefixes:
-  - chainsafe/lodestar
-`,
-	})
-	r := NewRouter(m)
+// TestRouteImageNormalization is the normalisation table for #84, on the
+// create route: each spelling selects the policy its normalised repository
+// matches, and a path with upper case is invalid. The same table runs in
+// Rust and TypeScript.
+func TestRouteImageNormalization(t *testing.T) {
+	r := NewRouter(newTestManager(t, pullTestPolicies))
+	notAllowed := func(image string) string { return "image " + image + " not allowed by any policy" }
 
-	body := map[string]interface{}{
-		"fromImage": "ubuntu:latest",
+	tests := []struct {
+		image   string
+		want    Action
+		service string
+		wantMsg string
+	}{
+		{"alpine", ActionCreateContainer, "probe", ""},
+		{"library/alpine", ActionCreateContainer, "probe", ""},
+		{"docker.io/library/alpine", ActionCreateContainer, "probe", ""},
+		{"docker.io/alpine", ActionCreateContainer, "probe", ""},
+		{"index.docker.io/library/alpine:3.19", ActionCreateContainer, "probe", ""},
+		{"docker.io/chainsafe/lodestar:v1", ActionCreateContainer, "beacon", ""},
+		{"chainsafe/lodestar:v1", ActionCreateContainer, "beacon", ""},
+		{"registry-1.docker.io/chainsafe/lodestar:v1", ActionCreateContainer, "beacon", ""},
+		{"ghcr.io/chainsafe/lodestar@" + testDigest, ActionCreateContainer, "beacon", ""},
+		{"localhost:5000/x/y:2", ActionCreateContainer, "beacon", ""},
+		{"registry.example.com:443/a", ActionCreateContainer, "beacon", ""},
+		{"Alpine:latest", ActionDeny, "", `invalid image reference "Alpine:latest"`},
+		{"chainsafe/Lodestar:v1", ActionDeny, "", `invalid image reference "chainsafe/Lodestar:v1"`},
+		{"alpine-evil", ActionDeny, "", notAllowed("alpine-evil")},
+		{"ghcr.io/library/alpine", ActionDeny, "", notAllowed("ghcr.io/library/alpine")},
+		{"ghcr.io/chainsafe/lodestar-evil", ActionDeny, "", notAllowed("ghcr.io/chainsafe/lodestar-evil")},
+		{"localhost:5000/xy:1", ActionDeny, "", notAllowed("localhost:5000/xy:1")},
 	}
-	result := r.Route("POST", "/images/create", body)
-	if result.Action != ActionDeny {
-		t.Fatalf("expected ActionDeny, got %v", result.Action)
+	for _, tt := range tests {
+		t.Run(tt.image, func(t *testing.T) {
+			got := r.Route("POST", "/containers/create", map[string]interface{}{"Image": tt.image})
+			if got.Action != tt.want || got.DenyMsg != tt.wantMsg || got.Service != tt.service {
+				t.Errorf("create %s = %v/%q/%q, want %v/%q/%q",
+					tt.image, got.Action, got.Service, got.DenyMsg, tt.want, tt.service, tt.wantMsg)
+			}
+		})
 	}
 }
 
@@ -552,7 +666,6 @@ allowed_image_prefixes:
 	})
 	r := NewRouter(m)
 	createBody := map[string]interface{}{"Image": "chainsafe/lodestar:next"}
-	pullBody := map[string]interface{}{"fromImage": "chainsafe/lodestar:next"}
 
 	tests := []struct {
 		method  string
@@ -580,7 +693,7 @@ allowed_image_prefixes:
 		// Exec is matched under containers or exec only (#49, language-only).
 		{"GET", "/images/exec", nil, ActionAllow, ""},
 		// An allowed image, so only the path decides (#49, language-only).
-		{"POST", "/images/create/extra", pullBody, ActionDeny, ""},
+		{"POST", "/images/create/extra?fromImage=chainsafe/lodestar&tag=next", nil, ActionDeny, ""},
 		// A name ending in exec is a plain name (#49, language-only).
 		{"GET", "/containers/myexec/json", nil, ActionAllow, ""},
 		// A name starting with exec is a plain name (#49, language-only).
@@ -697,7 +810,6 @@ allowed_image_prefixes:
 	r := NewRouter(m).WithReadonly(true)
 	post := "read-only mode: POST requests are not allowed"
 	createBody := map[string]interface{}{"Image": "chainsafe/lodestar:latest"}
-	pullBody := map[string]interface{}{"fromImage": "chainsafe/lodestar", "tag": "latest"}
 
 	tests := []struct {
 		method  string
@@ -719,7 +831,7 @@ allowed_image_prefixes:
 		// readonlyDeleteDeniedTest (#75)
 		{"DELETE", "/containers/mycontainer", nil, ActionDeny, "read-only mode: DELETE requests are not allowed"},
 		// #75: an image pull of an allowed image.
-		{"POST", "/images/create", pullBody, ActionDeny, post},
+		{"POST", "/images/create?fromImage=chainsafe%2Flodestar&tag=latest", nil, ActionDeny, post},
 		// readonlyCreateDeniedTest (#75): an allowed image, so only the flag decides.
 		{"POST", "/containers/create", createBody, ActionDeny, post},
 		// #75: methods outside the spec's universe.

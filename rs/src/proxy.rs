@@ -715,8 +715,6 @@ mod tests {
         let router = Router::new(make_manager(vec!["alpine"]));
         let create_body: HashMap<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({"Image": "alpine:latest"})).unwrap();
-        let pull_body: HashMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({"fromImage": "alpine:latest"})).unwrap();
         let exec = Some("exec is not allowed");
         let cases = [
             // execSubpathDeleteDeniedTest (#49)
@@ -744,7 +742,13 @@ mod tests {
             // Exec is matched under containers or exec only (#49, language-only).
             ("GET", "/images/exec", None, Action::Allow, None),
             // An allowed image, so only the path decides (#49, language-only).
-            ("POST", "/images/create/extra", Some(&pull_body), Action::Deny, None),
+            (
+                "POST",
+                "/images/create/extra?fromImage=alpine&tag=latest",
+                None,
+                Action::Deny,
+                None,
+            ),
             // A name ending in exec is a plain name (#49, language-only).
             ("GET", "/containers/myexec/json", None, Action::Allow, None),
             // A name starting with exec is a plain name (#49, language-only).
@@ -844,8 +848,6 @@ mod tests {
         let post = Some("read-only mode: POST requests are not allowed");
         let create_body: HashMap<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({"Image": "chainsafe/lodestar:latest"})).unwrap();
-        let pull_body: HashMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({"fromImage": "chainsafe/lodestar", "tag": "latest"})).unwrap();
         let cases = [
             // readonlyGetAllowedTest (#75)
             ("GET", "/containers/json", None, Action::Allow, None),
@@ -866,7 +868,13 @@ mod tests {
                 Some("read-only mode: DELETE requests are not allowed"),
             ),
             // #75: an image pull of an allowed image.
-            ("POST", "/images/create", Some(&pull_body), Action::Deny, post),
+            (
+                "POST",
+                "/images/create?fromImage=chainsafe%2Flodestar&tag=latest",
+                None,
+                Action::Deny,
+                post,
+            ),
             // readonlyCreateDeniedTest (#75): an allowed image, so only the flag decides.
             ("POST", "/containers/create", Some(&create_body), Action::Deny, post),
             // #75: methods outside the spec's universe.
@@ -1121,41 +1129,381 @@ mod tests {
         }
     }
 
+    const TEST_DIGEST: &str = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    /// The policy set for the #83 and #84 tables, loaded from YAML so that
+    /// the prefixes go through load-time normalisation: beacon's prefixes are
+    /// written docker.io/chainsafe/lodestar and Registry.Example.com:443/a.
+    fn pull_test_manager() -> Manager {
+        let dir = std::env::temp_dir().join(format!("dsp-pull-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("probe.yaml"),
+            "service_name: probe\nallowed_image_prefixes:\n  - alpine\nimage_digest_allowed: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("beacon.yaml"),
+            "service_name: beacon\nallowed_image_prefixes:\n  - docker.io/chainsafe/lodestar\n  - ghcr.io/chainsafe/lodestar\n  - localhost:5000/x\n  - Registry.Example.com:443/a\nimage_tag_pattern: '^(v[0-9]+|[0-9]+)$'\n",
+        )
+        .unwrap();
+        let manager = Manager::new(dir.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        manager
+    }
+
+    /// Cross-language parity guard for #83 and #84. POST /images/create is
+    /// routed on its query string, the way the Docker CLI sends it: fromImage
+    /// (fully qualified, URL-encoded) and tag, with an empty body. The body is
+    /// ignored, fromSrc (import) is denied, and the image gets the create
+    /// checks: a policy prefix on the normalised repository, then that
+    /// policy's tag pattern and digest rule. Rows mirror the pull* runs in
+    /// spec/router.qnt; the rest are language-only.
     #[test]
-    fn test_route_image_pull() {
-        let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> =
+    fn test_route_pull_query() {
+        let router = Router::new(pull_test_manager());
+        let alpine_body: HashMap<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({"fromImage": "alpine"})).unwrap();
-        let result = router.route("POST", "/images/create", Some(&map));
-        assert_eq!(result.action, Action::Allow);
-        assert_eq!(result.image, Some("alpine".into()));
+        let old_body: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"fromImage": "alpine:3.19"})).unwrap();
+        let not_allowed = |image: &str| format!("image {} not allowed by any policy", image);
+        let required = "fromImage query parameter is required for image pull".to_string();
+        let body_msg = "image pull must not have a request body".to_string();
+        let from_src = "image import (fromSrc) is not allowed".to_string();
+        let enc_digest = TEST_DIGEST.replace(':', "%3A");
+        let cases: Vec<(
+            String,
+            Option<&HashMap<String, serde_json::Value>>,
+            Action,
+            &str,
+            String,
+        )> = vec![
+            // pullCliAllowedTest (#83): the issue's reproduction, as the CLI sends it.
+            (
+                "/v1.56/images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.19".into(),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // pullShortNameAllowedTest (#84)
+            (
+                "/images/create?fromImage=alpine&tag=3.19".into(),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // pullLibraryNameAllowedTest (#84)
+            (
+                "/images/create?fromImage=library%2Falpine&tag=latest".into(),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // pullCliOrgAllowedTest (#84): the prefix is written docker.io/chainsafe/lodestar.
+            (
+                "/images/create?fromImage=docker.io%2Fchainsafe%2Flodestar&tag=v1".into(),
+                None,
+                Action::Allow,
+                "beacon",
+                String::new(),
+            ),
+            // #84: the tag in fromImage, on another Docker Hub host name.
+            (
+                "/images/create?fromImage=index.docker.io%2Flibrary%2Falpine%3A3.19".into(),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // #83: the CLI sends a digest in tag.
+            (
+                format!("/images/create?fromImage=alpine&tag={}", enc_digest),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // #83: a digest in fromImage.
+            (
+                format!("/images/create?fromImage=alpine%40{}", enc_digest),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // #83: image_digest_allowed is false for beacon.
+            (
+                format!(
+                    "/images/create?fromImage=ghcr.io%2Fchainsafe%2Flodestar&tag={}",
+                    enc_digest
+                ),
+                None,
+                Action::Deny,
+                "",
+                "image digests not allowed for service beacon".into(),
+            ),
+            // #84: a registry port is not a tag.
+            (
+                "/images/create?fromImage=localhost%3A5000%2Fx%2Fy&tag=2".into(),
+                None,
+                Action::Allow,
+                "beacon",
+                String::new(),
+            ),
+            // #84: the registry host is compared lower-cased.
+            (
+                "/images/create?fromImage=REGISTRY.example.com%3A443%2Fa&tag=1".into(),
+                None,
+                Action::Allow,
+                "beacon",
+                String::new(),
+            ),
+            // #83: the tag pattern applies to pulls.
+            (
+                "/images/create?fromImage=chainsafe%2Flodestar&tag=latest".into(),
+                None,
+                Action::Deny,
+                "",
+                r#"image tag "latest" does not match pattern "^(v[0-9]+|[0-9]+)$""#.into(),
+            ),
+            // pullDisallowedCliDeniedTest (#83)
+            (
+                "/images/create?fromImage=docker.io%2Fattacker%2Fmalware&tag=latest".into(),
+                None,
+                Action::Deny,
+                "",
+                not_allowed("docker.io/attacker/malware"),
+            ),
+            // pullOtherRegistryDeniedTest (#84): another registry is not Docker Hub's alpine.
+            (
+                "/images/create?fromImage=localhost%3A5000%2Falpine&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                not_allowed("localhost:5000/alpine"),
+            ),
+            // #84: the prefix match stays on namespace boundaries.
+            (
+                "/images/create?fromImage=alpine-evil&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                not_allowed("alpine-evil"),
+            ),
+            // pullNoFromImageDeniedTest (#83)
+            ("/images/create".into(), None, Action::Deny, "", required.clone()),
+            // #83: the old contract, fromImage in a JSON body: a pull has no body.
+            (
+                "/images/create".into(),
+                Some(&old_body),
+                Action::Deny,
+                "",
+                body_msg.clone(),
+            ),
+            // pullBodyIgnoredDeniedTest (#83): the daemon would pull the query's image.
+            (
+                "/images/create?fromImage=attacker%2Fmalware&tag=latest".into(),
+                Some(&alpine_body),
+                Action::Deny,
+                "",
+                body_msg.clone(),
+            ),
+            // pullJsonBodyDeniedTest (#83): any body is denied, even one that agrees.
+            (
+                "/images/create?fromImage=alpine&tag=3.19".into(),
+                Some(&alpine_body),
+                Action::Deny,
+                "",
+                body_msg.clone(),
+            ),
+            // pullImportDeniedTest (#83): the daemon would import the tarball as alpine:latest.
+            (
+                "/images/create?fromSrc=http%3A%2F%2Fexample.com%2Fx.tar&repo=alpine&tag=latest".into(),
+                None,
+                Action::Deny,
+                "",
+                from_src.clone(),
+            ),
+            // pullImportWithImageDeniedTest (#83)
+            (
+                "/images/create?fromImage=alpine&tag=latest&fromSrc=-".into(),
+                None,
+                Action::Deny,
+                "",
+                from_src.clone(),
+            ),
+            // #83: a tag in fromImage and in tag is ambiguous.
+            (
+                "/images/create?fromImage=alpine%3A3.19&tag=3.20".into(),
+                None,
+                Action::Deny,
+                "",
+                "fromImage alpine:3.19 already has a tag or digest; the tag query parameter is ambiguous".into(),
+            ),
+            // #83: no tag and no digest pulls every tag.
+            (
+                "/images/create?fromImage=alpine".into(),
+                None,
+                Action::Deny,
+                "",
+                "image pull without a tag or digest pulls every tag and is not allowed".into(),
+            ),
+            // #84: upper case in the repository path is invalid.
+            (
+                "/images/create?fromImage=Alpine&tag=latest".into(),
+                None,
+                Action::Deny,
+                "",
+                r#"invalid image reference "Alpine""#.into(),
+            ),
+            // #83: a repeated parameter could be read two ways.
+            (
+                "/images/create?fromImage=alpine&fromImage=attacker%2Fmalware&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                "duplicate fromImage query parameter".into(),
+            ),
+            // #83: the daemon rejects a malformed query; so does the proxy.
+            (
+                "/images/create?fromImage=alpine%zz&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                "invalid query string".into(),
+            ),
+            // #53 still holds: the percent check reads the path, not the query.
+            (
+                "/images/%63reate?fromImage=alpine&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                "percent-encoded path not allowed".into(),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (path, body, want, service, want_msg) in &cases {
+            let got = router.route("POST", path, *body);
+            let got_service = got.service.as_deref().unwrap_or("");
+            let got_msg = got.deny_msg.as_deref().unwrap_or("");
+            if got.action != *want || got_service != *service || got_msg != want_msg {
+                mismatches.push(format!(
+                    "POST {}: got {:?}/{:?}/{:?}, want {:?}/{:?}/{:?}",
+                    path, got.action, got_service, got_msg, want, service, want_msg
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "pull routing mismatches:\n{}",
+            mismatches.join("\n")
+        );
     }
 
+    /// The normalisation table for #84, on the create route: each spelling
+    /// selects the policy its normalised repository matches, and a path with
+    /// upper case is invalid. The same table runs in Go and TypeScript.
     #[test]
-    fn test_route_image_pull_empty_body() {
-        let router = Router::new(make_manager(vec!["alpine"]));
-        let result = router.route("POST", "/images/create", None);
-        assert_eq!(result.action, Action::Deny);
-    }
-
-    #[test]
-    fn test_route_image_pull_no_fromimage() {
-        let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({"tag": "latest"})).unwrap();
-        let result = router.route("POST", "/images/create", Some(&map));
-        assert_eq!(result.action, Action::Deny);
-        assert!(result.deny_msg.unwrap().contains("fromImage"));
-    }
-
-    #[test]
-    fn test_route_image_pull_not_found() {
-        let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({"fromImage": "ubuntu"})).unwrap();
-        let result = router.route("POST", "/images/create", Some(&map));
-        assert_eq!(result.action, Action::Deny);
-        assert!(result.deny_msg.unwrap().contains("not allowed by any policy"));
+    fn test_route_image_normalization() {
+        let router = Router::new(pull_test_manager());
+        let not_allowed = |image: &str| format!("image {} not allowed by any policy", image);
+        let ghcr_digest = format!("ghcr.io/chainsafe/lodestar@{}", TEST_DIGEST);
+        let cases: Vec<(&str, Action, &str, String)> = vec![
+            ("alpine", Action::CreateContainer, "probe", String::new()),
+            ("library/alpine", Action::CreateContainer, "probe", String::new()),
+            (
+                "docker.io/library/alpine",
+                Action::CreateContainer,
+                "probe",
+                String::new(),
+            ),
+            ("docker.io/alpine", Action::CreateContainer, "probe", String::new()),
+            (
+                "index.docker.io/library/alpine:3.19",
+                Action::CreateContainer,
+                "probe",
+                String::new(),
+            ),
+            (
+                "docker.io/chainsafe/lodestar:v1",
+                Action::CreateContainer,
+                "beacon",
+                String::new(),
+            ),
+            (
+                "chainsafe/lodestar:v1",
+                Action::CreateContainer,
+                "beacon",
+                String::new(),
+            ),
+            (
+                "registry-1.docker.io/chainsafe/lodestar:v1",
+                Action::CreateContainer,
+                "beacon",
+                String::new(),
+            ),
+            (&ghcr_digest, Action::CreateContainer, "beacon", String::new()),
+            ("localhost:5000/x/y:2", Action::CreateContainer, "beacon", String::new()),
+            (
+                "registry.example.com:443/a",
+                Action::CreateContainer,
+                "beacon",
+                String::new(),
+            ),
+            (
+                "Alpine:latest",
+                Action::Deny,
+                "",
+                r#"invalid image reference "Alpine:latest""#.into(),
+            ),
+            (
+                "chainsafe/Lodestar:v1",
+                Action::Deny,
+                "",
+                r#"invalid image reference "chainsafe/Lodestar:v1""#.into(),
+            ),
+            ("alpine-evil", Action::Deny, "", not_allowed("alpine-evil")),
+            (
+                "ghcr.io/library/alpine",
+                Action::Deny,
+                "",
+                not_allowed("ghcr.io/library/alpine"),
+            ),
+            (
+                "ghcr.io/chainsafe/lodestar-evil",
+                Action::Deny,
+                "",
+                not_allowed("ghcr.io/chainsafe/lodestar-evil"),
+            ),
+            (
+                "localhost:5000/xy:1",
+                Action::Deny,
+                "",
+                not_allowed("localhost:5000/xy:1"),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (image, want, service, want_msg) in &cases {
+            let body: HashMap<String, serde_json::Value> =
+                serde_json::from_value(serde_json::json!({ "Image": image })).unwrap();
+            let got = router.route("POST", "/containers/create", Some(&body));
+            let got_service = got.service.as_deref().unwrap_or("");
+            let got_msg = got.deny_msg.as_deref().unwrap_or("");
+            if got.action != *want || got_service != *service || got_msg != want_msg {
+                mismatches.push(format!(
+                    "create {}: got {:?}/{:?}/{:?}, want {:?}/{:?}/{:?}",
+                    image, got.action, got_service, got_msg, want, service, want_msg
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "normalisation mismatches:\n{}",
+            mismatches.join("\n")
+        );
     }
 
     #[test]

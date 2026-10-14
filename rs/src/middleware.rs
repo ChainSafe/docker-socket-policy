@@ -1167,4 +1167,59 @@ mod tests {
             mismatches.join("\n")
         );
     }
+
+    /// Pins the registry gate's reference parser (#84): a registry port is
+    /// not a tag, Docker Hub spellings match the normalised prefix, and the
+    /// tag pattern sees only the tag. The policy's prefixes are normalised,
+    /// as the manager stores them. Same rows in Go and TypeScript.
+    #[test]
+    fn test_registry_gate_parses_references() {
+        let gate = RegistryGate;
+        let mut policy = make_policy(
+            "test",
+            vec![
+                "chainsafe/lodestar",
+                "localhost:5000/team",
+                "registry.example.com:443/a",
+            ],
+        );
+        policy.image_tag_pattern = Some("^(v[0-9]+|[0-9.]+)$".into());
+        let cases = [
+            ("localhost:5000/team/app:1.2", None),
+            ("localhost:5000/team/app", None),
+            ("docker.io/chainsafe/lodestar:v1", None),
+            ("registry.example.com:443/a", None),
+            ("Registry.Example.com:443/a:2", None),
+            (
+                "localhost:5000/team/app:latest",
+                Some(r#"image tag "latest" does not match pattern "^(v[0-9]+|[0-9.]+)$""#),
+            ),
+            (
+                "localhost:5000/other:1",
+                Some(r#"image "localhost:5000/other" is not in allowed prefixes"#),
+            ),
+            (
+                "chainsafe/Lodestar:v1",
+                Some(r#"invalid image reference "chainsafe/Lodestar:v1""#),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (image, want_err) in cases {
+            let body = body_from_json(serde_json::json!({ "Image": image }));
+            let got = gate.check("POST", "/containers/create", &policy, &body);
+            let ok = match (&got, want_err) {
+                (Ok(()), None) => true,
+                (Err(e), Some(want)) => e.contains(want),
+                _ => false,
+            };
+            if !ok {
+                mismatches.push(format!("{}: got {:?}, want {:?}", image, got, want_err));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "registry gate mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
 }
