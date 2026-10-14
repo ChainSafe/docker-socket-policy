@@ -495,12 +495,15 @@ mod tests {
 
     #[test]
     fn test_mount_source_gate_no_volumes_in_policy() {
+        // A policy with no volumes allows no binds (#88); before #88 the gate
+        // returned early and let every bind through.
         let gate = MountSourceGate;
         let policy = make_policy("test", vec!["alpine"]);
         let body = body_from_json(serde_json::json!({
             "HostConfig": {"Binds": ["/data:/data"]}
         }));
-        assert!(gate.check("POST", "/containers/create", &policy, &body).is_ok());
+        let result = gate.check("POST", "/containers/create", &policy, &body);
+        assert!(result.unwrap_err().contains("not in the whitelist"));
     }
 
     #[test]
@@ -672,11 +675,17 @@ mod tests {
 
     #[test]
     fn test_container_config_mutator_noop_when_no_config() {
+        // Without container_config the mutator still forces Privileged to
+        // false, and sets nothing else (#88).
         let mutator = ContainerConfigMutator;
         let policy = make_policy("test", vec!["alpine"]);
         let mut body = HashMap::new();
         mutator.mutate(&policy, &mut body);
-        assert!(body.is_empty());
+        assert_eq!(body.len(), 1);
+        assert_eq!(
+            body.get("HostConfig").unwrap(),
+            &serde_json::json!({"Privileged": false})
+        );
     }
 
     #[test]
@@ -1190,4 +1199,1019 @@ mod tests {
             mismatches.join("\n")
         );
     }
+    // HostConfig default-deny, Mounts and bind-mode rows (#88). The same rows,
+    // by name, are in go/internal/middleware/hostconfig_test.go and
+    // ts/src/middleware.test.ts.
+    //
+    // Policies: "std" has volumes /data (read_write) and /ro (read-only) and
+    // forces network_mode host; "secopt" is "std" plus security_options
+    // [no-new-privileges:true]; "bare" has no volumes and no
+    // container_config. `want` is "" for an allowed create, or a substring of
+    // the deny reason. `fwd`, when set, lists HostConfig fields the forwarded
+    // body must hold.
+    struct HostConfigRow {
+        name: &'static str,
+        policy: &'static str,
+        body: &'static str,
+        want: &'static str,
+        fwd: &'static str,
+    }
+
+    fn host_config_row_policy(name: &str) -> Policy {
+        let mut p = make_policy("svc", vec!["chainsafe/lodestar"]);
+        if name == "bare" {
+            return p;
+        }
+        p.volumes = Some(vec![
+            Volume {
+                host_path: "/data".into(),
+                container_path: "/data".into(),
+                read_write: true,
+            },
+            Volume {
+                host_path: "/ro".into(),
+                container_path: "/ro".into(),
+                read_write: false,
+            },
+        ]);
+        p.container_config = Some(ContainerConfig {
+            network_mode: Some("host".into()),
+            restart_policy: None,
+            security_options: if name == "secopt" {
+                Some(vec!["no-new-privileges:true".into()])
+            } else {
+                None
+            },
+            user: None,
+            log_driver: None,
+            log_options: None,
+        });
+        p
+    }
+
+    #[test]
+    fn test_host_config_rows() {
+        let chain = Chain::new();
+        let mut failures = Vec::new();
+        for row in HOST_CONFIG_ROWS {
+            let body: HashMap<String, serde_json::Value> = serde_json::from_str(row.body).unwrap();
+            let result = chain.execute("POST", "/containers/create", &host_config_row_policy(row.policy), &body);
+            if row.want.is_empty() {
+                if !result.allowed {
+                    failures.push(format!("{}: expected allow, got: {}", row.name, result.reason));
+                    continue;
+                }
+            } else {
+                if result.allowed || !result.reason.contains(row.want) {
+                    failures.push(format!(
+                        "{}: expected deny with {:?}, got allowed={} {}",
+                        row.name, row.want, result.allowed, result.reason
+                    ));
+                }
+                continue;
+            }
+            if row.fwd.is_empty() {
+                continue;
+            }
+            let want: serde_json::Map<String, serde_json::Value> = serde_json::from_str(row.fwd).unwrap();
+            let forwarded: serde_json::Value = serde_json::from_slice(&result.modified_body.unwrap()).unwrap();
+            for (k, v) in &want {
+                if forwarded["HostConfig"].get(k) != Some(v) {
+                    failures.push(format!(
+                        "{}: forwarded HostConfig.{} = {:?}, want {}",
+                        row.name,
+                        k,
+                        forwarded["HostConfig"].get(k),
+                        v
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} rows failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    const HOST_CONFIG_ROWS: &[HostConfigRow] = &[
+        HostConfigRow {
+            name: "capAddDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CapAdd":["SYS_ADMIN"]}}"##,
+            want: "HostConfig.CapAdd is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "devicesDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Devices":[{"PathOnHost":"/dev/sda","PathInContainer":"/dev/sda","CgroupPermissions":"rwm"}]}}"##,
+            want: "HostConfig.Devices is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "deviceRequestsDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"DeviceRequests":[{"Driver":"","Count":-1,"Capabilities":[["gpu"]]}]}}"##,
+            want: "HostConfig.DeviceRequests is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "deviceCgroupRulesDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"DeviceCgroupRules":["b 8:* rmw"]}}"##,
+            want: "HostConfig.DeviceCgroupRules is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "groupAddDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["docker"]}}"##,
+            want: "HostConfig.GroupAdd is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "volumesFromDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"VolumesFrom":["other"]}}"##,
+            want: "HostConfig.VolumesFrom is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "linksDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Links":["other:alias"]}}"##,
+            want: "HostConfig.Links is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "sysctlsDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Sysctls":{"kernel.shm_rmid_forced":"1"}}}"##,
+            want: "HostConfig.Sysctls is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cgroupParentDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CgroupParent":"/"}}"##,
+            want: "HostConfig.CgroupParent is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "runtimeDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Runtime":"other"}}"##,
+            want: "HostConfig.Runtime is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "volumeDriverDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"VolumeDriver":"local"}}"##,
+            want: "HostConfig.VolumeDriver is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "oomKillDisableDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"OomKillDisable":true}}"##,
+            want: "HostConfig.OomKillDisable is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "annotationsDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Annotations":{"a":"b"}}}"##,
+            want: "HostConfig.Annotations is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "storageOptDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"StorageOpt":{"size":"1G"}}}"##,
+            want: "HostConfig.StorageOpt is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "blkioDeviceReadBpsDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"BlkioDeviceReadBps":[{"Path":"/dev/sda","Rate":1}]}}"##,
+            want: "HostConfig.BlkioDeviceReadBps is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cpuRealtimeRuntimeDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CpuRealtimeRuntime":1000}}"##,
+            want: "HostConfig.CpuRealtimeRuntime is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "unknownFieldDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"FutureField":true}}"##,
+            want: "HostConfig.FutureField is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "maskedPathsEmptyDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"MaskedPaths":[]}}"##,
+            want: "HostConfig.MaskedPaths is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "readonlyPathsEmptyDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"ReadonlyPaths":[]}}"##,
+            want: "HostConfig.ReadonlyPaths is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "maskedPathsListDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"MaskedPaths":["/proc/kcore"]}}"##,
+            want: "HostConfig.MaskedPaths is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "zeroValuesAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CapAdd":null,"Devices":[],"GroupAdd":null,"Sysctls":{},"CgroupParent":"","OomKillDisable":false,"Runtime":"","VolumeDriver":"","FutureField":0,"MaskedPaths":null,"ReadonlyPaths":null,"PidMode":"","IpcMode":"","SecurityOpt":null,"OomScoreAdj":0,"Privileged":false}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "pidModeHostDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"PidMode":"host"}}"##,
+            want: "HostConfig.PidMode value \"host\" is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "pidModeContainerDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"PidMode":"container:abc"}}"##,
+            want: "HostConfig.PidMode value \"container:abc\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "ipcModeHostDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"IpcMode":"host"}}"##,
+            want: "HostConfig.IpcMode value \"host\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "ipcModeContainerDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"IpcMode":"container:abc"}}"##,
+            want: "HostConfig.IpcMode value \"container:abc\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "utsModeHostDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"UTSMode":"host"}}"##,
+            want: "HostConfig.UTSMode value \"host\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "usernsModeHostDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"UsernsMode":"host"}}"##,
+            want: "HostConfig.UsernsMode value \"host\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cgroupnsModeHostDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CgroupnsMode":"host"}}"##,
+            want: "HostConfig.CgroupnsMode value \"host\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cgroupContainerDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Cgroup":"container:abc"}}"##,
+            want: "HostConfig.Cgroup value \"container:abc\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "isolationHypervDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Isolation":"hyperv"}}"##,
+            want: "HostConfig.Isolation value \"hyperv\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "ipcModePrivateAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"IpcMode":"private"}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "ipcModeShareableAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"IpcMode":"shareable"}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "ipcModeNoneAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"IpcMode":"none"}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cgroupnsModePrivateAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CgroupnsMode":"private"}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "isolationDefaultAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Isolation":"default"}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "oomScoreAdjNegativeDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"OomScoreAdj":-1000}}"##,
+            want: "HostConfig.OomScoreAdj value -1000 is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "oomScoreAdjPositiveAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"OomScoreAdj":500}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "securityOptSeccompUnconfinedDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"SecurityOpt":["seccomp=unconfined"]}}"##,
+            want: "HostConfig.SecurityOpt entry \"seccomp=unconfined\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "securityOptApparmorUnconfinedDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"SecurityOpt":["apparmor=unconfined"]}}"##,
+            want: "HostConfig.SecurityOpt entry \"apparmor=unconfined\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "securityOptLabelDisableDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"SecurityOpt":["label=disable"]}}"##,
+            want: "HostConfig.SecurityOpt entry \"label=disable\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "securityOptNoNewPrivilegesFalseDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"SecurityOpt":["no-new-privileges:false"]}}"##,
+            want: "HostConfig.SecurityOpt entry \"no-new-privileges:false\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "securityOptNoNewPrivilegesAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"SecurityOpt":["no-new-privileges"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "securityOptNoNewPrivilegesTrueAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"SecurityOpt":["no-new-privileges:true"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "securityOptOverwrittenByPolicy",
+            policy: "secopt",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"SecurityOpt":["seccomp=unconfined"]}}"##,
+            want: "",
+            fwd: r##"{"SecurityOpt":["no-new-privileges:true"]}"##,
+        },
+        HostConfigRow {
+            name: "caseVariantPrivilegedDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"privileged":true}}"##,
+            want: "HostConfig.privileged is not allowed for service svc (the daemon reads it as HostConfig.Privileged)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "caseVariantZeroSecurityOptDenied",
+            policy: "secopt",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"securityopt":null}}"##,
+            want: "HostConfig.securityopt is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "caseVariantBindsDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"binds":["/:/host"]}}"##,
+            want: "HostConfig.binds is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "caseVariantLongSDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"\u017fecurityOpt":["seccomp=unconfined"]}}"##,
+            want: "(the daemon reads it as HostConfig.SecurityOpt)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "caseVariantKelvinDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Lin\u212as":["other:alias"]}}"##,
+            want: "(the daemon reads it as HostConfig.Links)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "topLevelHostConfigVariantDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","hostConfig":{"Privileged":true}}"##,
+            want: "hostConfig is not allowed for service svc (the daemon reads it as HostConfig)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "topLevelUserVariantDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","user":"root"}"##,
+            want: "user is not allowed for service svc (the daemon reads it as User)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "topLevelImageVariantDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","image":"alpine:3.20"}"##,
+            want: "image is not allowed for service svc (the daemon reads it as Image)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "networkingConfigVariantDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","NetworkingConfig":{"EndpointsConfig":{"default":{}},"endpointsconfig":{"evil-net":{}}}}"##,
+            want: "NetworkingConfig.endpointsconfig is not allowed for service svc (the daemon reads it as NetworkingConfig.EndpointsConfig)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "networkingConfigVariantBareDenied",
+            policy: "bare",
+            body: r##"{"Image":"chainsafe/lodestar:v1","NetworkingConfig":{"EndpointsConfig":{"default":{}},"endpointsconfig":{"evil-net":{}}}}"##,
+            want: "NetworkingConfig.endpointsconfig is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "networkingConfigVariantLongSDenied",
+            policy: "bare",
+            body: r##"{"Image":"chainsafe/lodestar:v1","NetworkingConfig":{"Endpoint\u017fConfig":{"evil-net":{}}}}"##,
+            want: "(the daemon reads it as NetworkingConfig.EndpointsConfig)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "networkingConfigUnforcedAllowed",
+            policy: "bare",
+            body: r##"{"Image":"chainsafe/lodestar:v1","NetworkingConfig":{"EndpointsConfig":{"default":{},"other":{}}}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "hostConfigNotObjectDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":"x"}"##,
+            want: "HostConfig must be an object",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "capDropAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CapDrop":["ALL"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "readonlyRootfsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"ReadonlyRootfs":true}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "initAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Init":true}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "autoRemoveAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"AutoRemove":true}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "consoleSizeAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"ConsoleSize":[24,80]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "shmSizeAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"ShmSize":67108864}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "portBindingsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"PortBindings":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "publishAllPortsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"PublishAllPorts":true}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "dnsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Dns":["1.1.1.1"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "dnsOptionsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"DnsOptions":["ndots:1"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "dnsSearchAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"DnsSearch":["example.com"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "extraHostsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"ExtraHosts":["host:10.0.0.1"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "tmpfsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Tmpfs":{"/run":"rw,noexec"}}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "ulimitsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Ulimits":[{"Name":"nofile","Soft":1024,"Hard":2048}]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "memoryAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Memory":268435456}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "memoryReservationAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"MemoryReservation":134217728}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "memorySwapAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"MemorySwap":-1}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "memorySwappinessAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"MemorySwappiness":-1}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "nanoCpusAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"NanoCpus":500000000}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cpuSharesAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CpuShares":512}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cpuPeriodAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CpuPeriod":100000}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cpuQuotaAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CpuQuota":50000}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cpusetCpusAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CpusetCpus":"0-1"}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "cpusetMemsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"CpusetMems":"0"}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "pidsLimitAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"PidsLimit":100}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "blkioWeightAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"BlkioWeight":10}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "containerIdFileAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"ContainerIDFile":"/tmp/cid"}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "networkModeAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"NetworkMode":"bridge"}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "restartPolicyAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"RestartPolicy":{"Name":"always","MaximumRetryCount":0}}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "logConfigAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"LogConfig":{"Type":"json-file","Config":{"max-size":"10m"}}}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "privilegedNeutralised",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Privileged":true}}"##,
+            want: "",
+            fwd: r##"{"Privileged":false}"##,
+        },
+        HostConfigRow {
+            name: "privilegedNeutralisedEmptyContainerConfig",
+            policy: "bare",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Privileged":true}}"##,
+            want: "",
+            fwd: r##"{"Privileged":false}"##,
+        },
+        HostConfigRow {
+            name: "emptyContainerConfigForcesPrivilegedFalse",
+            policy: "bare",
+            body: r##"{"Image":"chainsafe/lodestar:v1"}"##,
+            want: "",
+            fwd: r##"{"Privileged":false}"##,
+        },
+        HostConfigRow {
+            name: "mountBindRootDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/","Target":"/host"}]}}"##,
+            want: "mount source \"/\" is not in the whitelist for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountBindAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/data","Target":"/data"}]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountBindReadOnlyVolumeWritableDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/ro","Target":"/ro"}]}}"##,
+            want: "mount of \"/ro\" must be read-only (ReadOnly: true) for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountBindReadOnlyVolumeReadOnlyFalseDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/ro","Target":"/ro","ReadOnly":false}]}}"##,
+            want: "mount of \"/ro\" must be read-only",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountBindReadOnlyVolumeReadOnlyAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/ro","Target":"/ro","ReadOnly":true}]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountVolumeTypeDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"volume","Source":"myvol","Target":"/v"}]}}"##,
+            want: "mount type \"volume\" is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountImageTypeDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"image","Source":"alpine:3.20","Target":"/i"}]}}"##,
+            want: "mount type \"image\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountNpipeTypeDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"npipe","Source":"//./pipe/docker_engine","Target":"/p"}]}}"##,
+            want: "mount type \"npipe\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountMissingTypeDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Source":"/data","Target":"/data"}]}}"##,
+            want: "mount type \"\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountTmpfsAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"SizeBytes":1048576}}]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountTmpfsWithSourceDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"tmpfs","Source":"/","Target":"/run"}]}}"##,
+            want: "tmpfs mount must not have a Source",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountPropagationRsharedDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/data","Target":"/data","BindOptions":{"Propagation":"rshared"}}]}}"##,
+            want: "mount propagation \"rshared\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountPropagationSlaveDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/data","Target":"/data","BindOptions":{"Propagation":"slave"}}]}}"##,
+            want: "mount propagation \"slave\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountPropagationRprivateAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/data","Target":"/data","BindOptions":{"Propagation":"rprivate"}}]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountCreateMountpointAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/data","Target":"/data","BindOptions":{"CreateMountpoint":true}}]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountReadOnlyNonRecursiveDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/ro","Target":"/ro","ReadOnly":true,"BindOptions":{"ReadOnlyNonRecursive":true}}]}}"##,
+            want: "HostConfig.Mounts.BindOptions.ReadOnlyNonRecursive is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountVolumeOptionsDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/data","Target":"/data","VolumeOptions":{"NoCopy":true}}]}}"##,
+            want: "HostConfig.Mounts.VolumeOptions is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountCaseVariantDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/x","type":"bind","source":"/"}]}}"##,
+            want: "HostConfig.Mounts.source is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountNoVolumesDenied",
+            policy: "bare",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":[{"Type":"bind","Source":"/data","Target":"/data"}]}}"##,
+            want: "mount source \"/data\" is not in the whitelist",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "mountsNotListDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Mounts":{}}}"##,
+            want: "HostConfig.Mounts must be a list",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/data:/data"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindReadOnlyVolumeRwDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/ro:/ro:rw"]}}"##,
+            want: "volume mount \"/ro\" must be read-only (:ro) for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindReadOnlyVolumeNoModeDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/ro:/ro"]}}"##,
+            want: "volume mount \"/ro\" must be read-only (:ro)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindReadOnlyVolumeRoAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/ro:/ro:ro"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindReadOnlyVolumeRoZAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/ro:/ro:ro,Z"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindReadOnlyVolumeRoRwDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/ro:/ro:ro,rw"]}}"##,
+            want: "volume mount \"/ro\" must be read-only (:ro)",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindRsharedDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/data:/data:rshared"]}}"##,
+            want: "bind option \"rshared\" on volume mount \"/data\" is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindRslaveDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/data:/data:rw,rslave"]}}"##,
+            want: "bind option \"rslave\" on volume mount \"/data\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindConsistencyModeDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/data:/data:cached"]}}"##,
+            want: "bind option \"cached\" on volume mount \"/data\" is not allowed",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindRprivateAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/data:/data:rw,rprivate"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindPrivateZAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/data:/data:z,private"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindNocopyAllowed",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/data:/data:nocopy"]}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindUnlistedDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/etc:/etc:ro"]}}"##,
+            want: "volume mount \"/etc\" is not in the whitelist for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindNoVolumesDenied",
+            policy: "bare",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/data:/data"]}}"##,
+            want: "volume mount \"/data\" is not in the whitelist",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindNotStringDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":[1]}}"##,
+            want: "HostConfig.Binds must be a list of strings",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "bindTooManyPartsDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"Binds":["/data:/data:ro:x"]}}"##,
+            want: "bind \"/data:/data:ro:x\" is not a valid bind",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "topLevelVolumesNoVolumesDenied",
+            policy: "bare",
+            body: r##"{"Image":"chainsafe/lodestar:v1","Volumes":{"/data":{}}}"##,
+            want: "volume \"/data\" is not in the whitelist",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "topLevelVolumesEmptyAllowed",
+            policy: "bare",
+            body: r##"{"Image":"chainsafe/lodestar:v1","Volumes":{}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "dockerCliCreateBodyAllowed",
+            policy: "std",
+            body: r##"{"Hostname":"","Domainname":"","User":"","AttachStdin":false,"AttachStdout":true,"AttachStderr":true,"Tty":false,"OpenStdin":false,"StdinOnce":false,"Env":null,"Cmd":["true"],"Image":"chainsafe/lodestar:v1","Volumes":{},"WorkingDir":"","Entrypoint":null,"Labels":{},"HostConfig":{"Binds":null,"ContainerIDFile":"","LogConfig":{"Type":"","Config":{}},"NetworkMode":"default","PortBindings":{},"RestartPolicy":{"Name":"no","MaximumRetryCount":0},"AutoRemove":false,"VolumeDriver":"","VolumesFrom":null,"ConsoleSize":[0,0],"CapAdd":null,"CapDrop":null,"CgroupnsMode":"","Dns":null,"DnsOptions":[],"DnsSearch":[],"ExtraHosts":null,"GroupAdd":null,"IpcMode":"","Cgroup":"","Links":null,"OomScoreAdj":0,"PidMode":"","Privileged":false,"PublishAllPorts":false,"ReadonlyRootfs":false,"SecurityOpt":null,"UTSMode":"","UsernsMode":"","ShmSize":0,"Isolation":"","CpuShares":0,"Memory":0,"NanoCpus":0,"CgroupParent":"","BlkioWeight":0,"BlkioWeightDevice":[],"BlkioDeviceReadBps":[],"BlkioDeviceWriteBps":[],"BlkioDeviceReadIOps":[],"BlkioDeviceWriteIOps":[],"CpuPeriod":0,"CpuQuota":0,"CpuRealtimePeriod":0,"CpuRealtimeRuntime":0,"CpusetCpus":"","CpusetMems":"","Devices":[],"DeviceCgroupRules":null,"DeviceRequests":null,"MemoryReservation":0,"MemorySwap":0,"MemorySwappiness":-1,"OomKillDisable":false,"PidsLimit":0,"Ulimits":null,"CpuCount":0,"CpuPercent":0,"IOMaximumIOps":0,"IOMaximumBandwidth":0,"MaskedPaths":null,"ReadonlyPaths":null},"NetworkingConfig":{"EndpointsConfig":{"default":{"IPAMConfig":null,"Links":null,"Aliases":null,"DriverOpts":null,"GwPriority":0,"NetworkID":"","EndpointID":"","Gateway":"","IPAddress":"","MacAddress":"","IPPrefixLen":0,"IPv6Gateway":"","GlobalIPv6Address":"","GlobalIPv6PrefixLen":0,"DNSNames":null}}}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "dockerCliCreateBodyBareAllowed",
+            policy: "bare",
+            body: r##"{"Hostname":"","Domainname":"","User":"","AttachStdin":false,"AttachStdout":true,"AttachStderr":true,"Tty":false,"OpenStdin":false,"StdinOnce":false,"Env":null,"Cmd":["true"],"Image":"chainsafe/lodestar:v1","Volumes":{},"WorkingDir":"","Entrypoint":null,"Labels":{},"HostConfig":{"Binds":null,"ContainerIDFile":"","LogConfig":{"Type":"","Config":{}},"NetworkMode":"default","PortBindings":{},"RestartPolicy":{"Name":"no","MaximumRetryCount":0},"AutoRemove":false,"VolumeDriver":"","VolumesFrom":null,"ConsoleSize":[0,0],"CapAdd":null,"CapDrop":null,"CgroupnsMode":"","Dns":null,"DnsOptions":[],"DnsSearch":[],"ExtraHosts":null,"GroupAdd":null,"IpcMode":"","Cgroup":"","Links":null,"OomScoreAdj":0,"PidMode":"","Privileged":false,"PublishAllPorts":false,"ReadonlyRootfs":false,"SecurityOpt":null,"UTSMode":"","UsernsMode":"","ShmSize":0,"Isolation":"","CpuShares":0,"Memory":0,"NanoCpus":0,"CgroupParent":"","BlkioWeight":0,"BlkioWeightDevice":[],"BlkioDeviceReadBps":[],"BlkioDeviceWriteBps":[],"BlkioDeviceReadIOps":[],"BlkioDeviceWriteIOps":[],"CpuPeriod":0,"CpuQuota":0,"CpuRealtimePeriod":0,"CpuRealtimeRuntime":0,"CpusetCpus":"","CpusetMems":"","Devices":[],"DeviceCgroupRules":null,"DeviceRequests":null,"MemoryReservation":0,"MemorySwap":0,"MemorySwappiness":-1,"OomKillDisable":false,"PidsLimit":0,"Ulimits":null,"CpuCount":0,"CpuPercent":0,"IOMaximumIOps":0,"IOMaximumBandwidth":0,"MaskedPaths":null,"ReadonlyPaths":null},"NetworkingConfig":{"EndpointsConfig":{"default":{"IPAMConfig":null,"Links":null,"Aliases":null,"DriverOpts":null,"GwPriority":0,"NetworkID":"","EndpointID":"","Gateway":"","IPAddress":"","MacAddress":"","IPPrefixLen":0,"IPv6Gateway":"","GlobalIPv6Address":"","GlobalIPv6PrefixLen":0,"DNSNames":null}}}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "ansibleCreateBodyAllowed",
+            policy: "secopt",
+            body: r##"{"Image":"chainsafe/lodestar:v1","Cmd":["beacon"],"Env":[],"Labels":{"app":"beacon"},"HostConfig":{"Binds":["/data:/data:rw","/ro:/ro:ro"],"NetworkMode":"host","RestartPolicy":{"Name":"unless-stopped","MaximumRetryCount":0},"LogConfig":{"Type":"json-file","Config":{"max-size":"100m"}},"SecurityOpt":["no-new-privileges:true"],"Init":false,"AutoRemove":false,"Privileged":false,"ReadonlyRootfs":false,"CapDrop":["ALL"],"Memory":0}}"##,
+            want: "",
+            fwd: r##""##,
+        },
+    ];
 }
