@@ -621,3 +621,254 @@ module router_pre70 {
       route("GET", [".", "containers", "attach"]) == "allowRead",
     })
 }
+
+// ─── Module: pull_model ─────────────────────────────────────────────────
+//
+// The `POST /images/create` branch of the router (#83, #84), which
+// `router_model` leaves out. The path checks above it are the same for every
+// request here, so the model starts at the branch: a request is its body
+// (none, JSON or a form), the image the body names, the `fromImage` query
+// parameter, and whether the query carries `fromSrc`.
+//
+// The daemon reads the pull parameters with Go's `r.Form`: for a form body
+// (`Content-Type: application/x-www-form-urlencoded`) the body's values come
+// first and win over the query; a JSON body is ignored. With an image to
+// pull it pulls it; with none and `fromSrc` set it imports a tarball (from a
+// URL or the body) under the `repo` and `tag` the caller names. The Docker
+// CLI sends `fromImage` fully qualified (`docker.io/library/alpine`) in the
+// query, and no body.
+//
+// An image reference is a token. Quint cannot split strings, so parsing and
+// normalisation are a fixed table (CANONICAL) from each spelling to the
+// repository the daemon pulls: Docker Hub's `docker.io/` and `library/` are
+// dropped, any other registry stays. Policy prefixes are canonical (the
+// implementations normalise them at load time), and a match is equality: the
+// namespace-boundary prefix rule, tags, digests and the tag pattern are left
+// to the language tests.
+//
+// READ_PULL_FROM_BODY = true models all three before #83, which read
+// `fromImage` from a JSON body and never looked at the query: the Docker
+// CLI's empty body was denied, and a body naming an allowed image let any
+// query through. false models all three after the fix: the query decides
+// and `fromSrc` is denied.
+//
+// NORMALIZE_IMAGES = false models all three before #84, which compared the
+// spelling as sent with the prefix as written, so `docker.io/library/alpine`
+// did not match `alpine`. true models all three after the fix.
+//
+// ALLOW_PULL_BODY = true models the first #83 fix, which routed on the query
+// and forwarded any body unchanged, so a form body naming another image
+// overrode the query at the daemon. false models the final fix: a pull with
+// a body is denied. It only matters when READ_PULL_FROM_BODY is false.
+
+module pull_model {
+  const READ_PULL_FROM_BODY: bool
+  const NORMALIZE_IMAGES: bool
+  const ALLOW_PULL_BODY: bool
+
+  // bodyKind is "none", "json" or "form"; bodyImage is the `fromImage` the
+  // body names ("" for none).
+  type PullRequest = { bodyKind: str, bodyImage: str, queryImage: str, fromSrc: bool }
+
+  // Every spelling in the universe, "" for an absent parameter or body field.
+  pure val IMAGES = Set(
+    "", "alpine", "library/alpine", "docker.io/library/alpine",
+    "chainsafe/lodestar", "docker.io/chainsafe/lodestar",
+    "attacker/malware", "docker.io/attacker/malware", "localhost:5000/alpine",
+  )
+
+  // The repository the daemon pulls for each spelling, which is also what the
+  // implementations' normalisation returns. `localhost:5000/alpine` is on
+  // another registry, so it is not `alpine`.
+  pure val CANONICAL: str -> str = Map(
+    "alpine" -> "alpine",
+    "library/alpine" -> "alpine",
+    "docker.io/library/alpine" -> "alpine",
+    "chainsafe/lodestar" -> "chainsafe/lodestar",
+    "docker.io/chainsafe/lodestar" -> "chainsafe/lodestar",
+    "attacker/malware" -> "attacker/malware",
+    "docker.io/attacker/malware" -> "attacker/malware",
+    "localhost:5000/alpine" -> "localhost:5000/alpine",
+  )
+
+  // The policies' prefixes, canonical.
+  pure val ALLOWED_REPOS = Set("alpine", "chainsafe/lodestar")
+
+  pure def canonicalAllowed(s: str): bool =
+    s != "" and ALLOWED_REPOS.contains(CANONICAL.get(s))
+
+  // The router's image match: on the canonical form after #84, on the
+  // spelling as sent before it.
+  pure def imageAllowed(s: str): bool =
+    if (s == "") false
+    else if (NORMALIZE_IMAGES) canonicalAllowed(s)
+    else ALLOWED_REPOS.contains(s)
+
+  pure def routePull(req: PullRequest): str =
+    if (READ_PULL_FROM_BODY) {
+      if (req.bodyKind != "json" or req.bodyImage == "") "deny"
+      else if (imageAllowed(req.bodyImage)) "allowPull"
+      else "deny"
+    }
+    else if (not(ALLOW_PULL_BODY) and req.bodyKind != "none") "deny"
+    else if (req.fromSrc) "deny"
+    else if (req.queryImage == "") "deny"
+    else if (imageAllowed(req.queryImage)) "allowPull"
+    else "deny"
+
+  // The image the daemon reads: a form body's `fromImage` wins over the
+  // query's.
+  pure def daemonImage(req: PullRequest): str =
+    if (req.bodyKind == "form" and req.bodyImage != "") req.bodyImage else req.queryImage
+
+  // What the daemon does with a forwarded request.
+  pure def daemonAction(req: PullRequest): str =
+    if (daemonImage(req) != "") "pull"
+    else if (req.fromSrc) "import"
+    else "none"
+
+  pure def cliPull(s: str): PullRequest = { bodyKind: "none", bodyImage: "", queryImage: s, fromSrc: false }
+
+  pure val REQUESTS: Set[PullRequest] =
+    tuples(Set("none", "json", "form"), IMAGES, IMAGES, Set(false, true))
+      .filter(t => t._1 != "none" or t._2 == "")
+      .map(t => { bodyKind: t._1, bodyImage: t._2, queryImage: t._3, fromSrc: t._4 })
+
+  // ─── Properties ─────────────────────────────────────────────────────
+
+  // The security claim: a forwarded request makes the daemon pull an image a
+  // policy allows, never import and never pull another image (#83). It
+  // mentions no flag and reads only what the daemon reads: the form body
+  // over the query.
+  pure val pullForwardsOnlyAllowedImages: bool =
+    REQUESTS.forall(req =>
+      routePull(req) == "allowPull" implies and {
+        daemonAction(req) == "pull",
+        canonicalAllowed(daemonImage(req)),
+      }
+    )
+
+  // A pull with a body, of any kind, is never forwarded.
+  pure val pullWithBodyNeverForwarded: bool =
+    REQUESTS.forall(req => req.bodyKind != "none" implies routePull(req) == "deny")
+
+  // A pull of an allowed image sent the Docker CLI way (no body, image in
+  // the query), in any spelling of it, is forwarded (#83, #84).
+  pure val cliPullOfAllowedImageForwarded: bool =
+    IMAGES.forall(s => canonicalAllowed(s) implies routePull(cliPull(s)) == "allowPull")
+
+  // Two spellings of the same image in the query get the same outcome (#84).
+  pure val pullDecidedOnCanonicalImage: bool =
+    REQUESTS.forall(req => IMAGES.forall(s =>
+      (req.queryImage != "" and s != "" and CANONICAL.get(req.queryImage) == CANONICAL.get(s))
+        implies routePull(req) == routePull({ ...req, queryImage: s })
+    ))
+
+  // ─── Tests: one run per table row ───────────────────────────────────
+
+  // Rows whose outcome depends on no flag run on every pull instance.
+
+  run pullDisallowedCliDeniedTest =
+    assert(routePull(cliPull("docker.io/attacker/malware")) == "deny")
+
+  run pullOtherRegistryDeniedTest =
+    assert(routePull(cliPull("localhost:5000/alpine")) == "deny")
+}
+
+// ─── Pull instances ─────────────────────────────────────────────────────
+
+// All three after #83 and #84: the query decides, a body is denied, and
+// images are compared in canonical form.
+module pull {
+  import pull_model(READ_PULL_FROM_BODY = false, NORMALIZE_IMAGES = true, ALLOW_PULL_BODY = false).*
+
+  // `docker pull alpine:3.19`, as the CLI sends it.
+  run pullCliAllowedTest =
+    assert(routePull(cliPull("docker.io/library/alpine")) == "allowPull")
+
+  run pullCliOrgAllowedTest =
+    assert(routePull(cliPull("docker.io/chainsafe/lodestar")) == "allowPull")
+
+  run pullShortNameAllowedTest =
+    assert(routePull(cliPull("alpine")) == "allowPull")
+
+  run pullLibraryNameAllowedTest =
+    assert(routePull(cliPull("library/alpine")) == "allowPull")
+
+  run pullNoFromImageDeniedTest =
+    assert(routePull(cliPull("")) == "deny")
+
+  // A JSON body naming an allowed image does not let a disallowed query through.
+  run pullBodyIgnoredDeniedTest =
+    assert(routePull({ bodyKind: "json", bodyImage: "alpine", queryImage: "attacker/malware", fromSrc: false }) == "deny")
+
+  // A form body would override the query at the daemon.
+  run pullFormBodyDeniedTest =
+    assert(routePull({ bodyKind: "form", bodyImage: "attacker/malware", queryImage: "alpine", fromSrc: false }) == "deny")
+
+  // Any body is denied, even one that agrees with an allowed query.
+  run pullJsonBodyDeniedTest =
+    assert(routePull({ bodyKind: "json", bodyImage: "alpine", queryImage: "alpine", fromSrc: false }) == "deny")
+
+  run pullImportDeniedTest =
+    assert(routePull({ bodyKind: "none", bodyImage: "", queryImage: "", fromSrc: true }) == "deny")
+
+  run pullImportWithImageDeniedTest =
+    assert(routePull({ bodyKind: "none", bodyImage: "", queryImage: "alpine", fromSrc: true }) == "deny")
+
+  run pullSoundTest =
+    assert(and {
+      pullForwardsOnlyAllowedImages,
+      pullWithBodyNeverForwarded,
+      cliPullOfAllowedImageForwarded,
+      pullDecidedOnCanonicalImage,
+    })
+}
+
+// All three before #83: `fromImage` was read from a JSON body. The CLI's
+// empty body was denied, and an allowed image in the body forwarded a pull
+// of any image in the query, or an import. Normalisation is on, so that this
+// instance isolates #83.
+module pull_pre83 {
+  import pull_model(READ_PULL_FROM_BODY = true, NORMALIZE_IMAGES = true, ALLOW_PULL_BODY = false).*
+
+  run pre83UnsoundTest =
+    assert(and {
+      not(pullForwardsOnlyAllowedImages),
+      not(cliPullOfAllowedImageForwarded),
+      routePull(cliPull("docker.io/library/alpine")) == "deny",
+      routePull({ bodyKind: "json", bodyImage: "alpine", queryImage: "attacker/malware", fromSrc: false }) == "allowPull",
+      routePull({ bodyKind: "json", bodyImage: "alpine", queryImage: "", fromSrc: true }) == "allowPull",
+    })
+}
+
+// The first #83 fix: the query decided, but the body was forwarded
+// unchanged, so a form body naming any image overrode an allowed query at
+// the daemon. Normalisation is on.
+module pull_body_ignored {
+  import pull_model(READ_PULL_FROM_BODY = false, NORMALIZE_IMAGES = true, ALLOW_PULL_BODY = true).*
+
+  run bodyIgnoredUnsoundTest =
+    assert(and {
+      not(pullForwardsOnlyAllowedImages),
+      not(pullWithBodyNeverForwarded),
+      cliPullOfAllowedImageForwarded,
+      routePull({ bodyKind: "form", bodyImage: "attacker/malware", queryImage: "alpine", fromSrc: false }) == "allowPull",
+    })
+}
+
+// All three before #84, with #83 fixed: the spelling as sent was compared
+// with the prefix as written. That only adds denials; a disallowed image is
+// still never forwarded.
+module pull_pre84 {
+  import pull_model(READ_PULL_FROM_BODY = false, NORMALIZE_IMAGES = false, ALLOW_PULL_BODY = false).*
+
+  run pre84UnsoundTest =
+    assert(and {
+      pullForwardsOnlyAllowedImages,
+      not(cliPullOfAllowedImageForwarded),
+      not(pullDecidedOnCanonicalImage),
+      routePull(cliPull("docker.io/library/alpine")) == "deny",
+      routePull(cliPull("alpine")) == "allowPull",
+    })
+}

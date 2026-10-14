@@ -108,6 +108,10 @@ test-spec:
 	$(QUINT) test $(ROUTER_SPEC) --main=router_pre70
 	$(QUINT) test $(SPEC) --main=network_endpoints
 	$(QUINT) test $(SPEC) --main=network_endpoints_pre87
+	$(QUINT) test $(ROUTER_SPEC) --main=pull
+	$(QUINT) test $(ROUTER_SPEC) --main=pull_pre83
+	$(QUINT) test $(ROUTER_SPEC) --main=pull_body_ignored
+	$(QUINT) test $(ROUTER_SPEC) --main=pull_pre84
 
 verify-ts:
 	$(QUINT) run $(SPEC) --max-steps=50 --invariants allInvariants --backend typescript
