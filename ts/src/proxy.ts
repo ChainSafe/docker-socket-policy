@@ -1,5 +1,5 @@
-import type { Policy } from "./policy.js";
-import { Manager } from "./policy.js";
+import type { ImageRef, Policy } from "./policy.js";
+import { Manager, checkImageTag, parseImageRef } from "./policy.js";
 
 export enum Action {
   Deny,
@@ -28,13 +28,18 @@ export class Router {
     return this;
   }
 
-  route(method: string, path: string, body?: Record<string, unknown>): RouteResult {
+  // Routes a request. path is the raw request target: the path, still
+  // percent-encoded, and the query string, if any. hasBody reports a
+  // non-empty raw body of any Content-Type (by default, a parsed JSON body);
+  // body is that body parsed as JSON, if it was.
+  route(method: string, path: string, body?: Record<string, unknown>, hasBody = body !== undefined): RouteResult {
     // Read-only mode denies every write, for every path (#75).
     if (this.readonlyMode && method !== "GET" && method !== "HEAD") {
       return { action: Action.Deny, denyMsg: `read-only mode: ${method} requests are not allowed` };
     }
     const qmIdx = path.indexOf("?");
     const cleanPath = qmIdx !== -1 ? path.slice(0, qmIdx) : path;
+    const query = qmIdx !== -1 ? path.slice(qmIdx + 1) : "";
     // The daemon decodes the path before routing, so deny any escape (#53).
     if (cleanPath.includes("%")) return { action: Action.Deny, denyMsg: "percent-encoded path not allowed" };
     // An empty interior segment can hide a denied prefix such as /exec (#55).
@@ -75,7 +80,7 @@ export class Router {
 
     // Image pull
     if (method === "POST" && path === "/images/create") {
-      return this.routeImagePull(body);
+      return this.routeImagePull(query, hasBody);
     }
 
     // Default GET/HEAD passthrough
@@ -95,6 +100,11 @@ export class Router {
     if (!image) {
       return { action: Action.Deny, denyMsg: "image field is required" };
     }
+    try {
+      parseImageRef(image);
+    } catch (err) {
+      return { action: Action.Deny, denyMsg: (err as Error).message };
+    }
 
     const policy = this.manager.getByImage(image);
     if (!policy) {
@@ -112,23 +122,85 @@ export class Router {
     return { action: Action.Allow, container: name };
   }
 
-  private routeImagePull(body?: Record<string, unknown>): RouteResult {
-    if (!body || !Object.keys(body).length) {
-      return { action: Action.Deny, denyMsg: "empty request body" };
+  // Image pull (#83). The Docker CLI sends fromImage and tag in the query
+  // string and no body. The image then
+  // gets the create checks: a policy prefix on the normalised repository
+  // (#84), and that policy's tag and digest rules.
+  private routeImagePull(rawQuery: string, hasBody: boolean): RouteResult {
+    const deny = (denyMsg: string): RouteResult => ({ action: Action.Deny, denyMsg });
+    // The daemon reads a form body's fromImage over the query's, so a body
+    // could name any image: a pull has no body, whatever its Content-Type.
+    if (hasBody) return deny("image pull must not have a request body");
+    const params = parseQuery(rawQuery);
+    if (!params) return deny("invalid query string");
+    for (const key of ["fromImage", "tag", "fromSrc"]) {
+      if (params.filter(([k]) => k === key).length > 1) return deny(`duplicate ${key} query parameter`);
     }
-
-    const fromImage = body["fromImage"] as string | undefined;
-    if (!fromImage) {
-      return { action: Action.Deny, denyMsg: "fromImage field is required for image pull" };
+    const get = (key: string) => params.find(([k]) => k === key)?.[1];
+    if (get("fromSrc") !== undefined) return deny("image import (fromSrc) is not allowed");
+    const fromImage = get("fromImage") ?? "";
+    if (!fromImage) return deny("fromImage query parameter is required for image pull");
+    let ref: ImageRef;
+    try {
+      ref = parseImageRef(fromImage);
+      const tag = get("tag") ?? "";
+      if (tag) {
+        if (ref.tag || ref.digest) {
+          return deny(`fromImage ${fromImage} already has a tag or digest; the tag query parameter is ambiguous`);
+        }
+        // The CLI sends a digest in tag; a tag never contains ':'.
+        ref = parseImageRef(fromImage + (tag.includes(":") ? "@" : ":") + tag);
+      }
+    } catch (err) {
+      return deny((err as Error).message);
     }
-
-    const policy = this.manager.getByImage(fromImage);
-    if (!policy) {
-      return { action: Action.Deny, denyMsg: `image ${fromImage} not allowed by any policy` };
-    }
-
-    return { action: Action.Allow, image: fromImage };
+    // With neither, the daemon pulls every tag of the repository.
+    if (!ref.tag && !ref.digest) return deny("image pull without a tag or digest pulls every tag and is not allowed");
+    const policy = this.manager.getByImage(ref.name);
+    if (!policy) return deny(`image ${fromImage} not allowed by any policy`);
+    const reason = checkImageTag(policy, ref);
+    if (reason !== null) return deny(reason);
+    return { action: Action.Allow, service: policy.service_name, image: fromImage };
   }
+}
+
+// Parses a query string as Go's url.ParseQuery does, which is what the daemon
+// uses: & separates pairs, + is a space, and a ; or a bad % escape fails the
+// whole query (undefined).
+function parseQuery(raw: string): [string, string][] | undefined {
+  const out: [string, string][] = [];
+  for (const part of raw.split("&")) {
+    if (part.includes(";")) return undefined;
+    if (!part) continue;
+    const eq = part.indexOf("=");
+    const k = queryUnescape(eq === -1 ? part : part.slice(0, eq));
+    const v = queryUnescape(eq === -1 ? "" : part.slice(eq + 1));
+    if (k === undefined || v === undefined) return undefined;
+    out.push([k, v]);
+  }
+  return out;
+}
+
+function queryUnescape(s: string): string | undefined {
+  const bytes: number[] = [];
+  for (let i = 0; i < s.length;) {
+    const c = s[i];
+    if (c === "%") {
+      const hex = s.slice(i + 1, i + 3);
+      if (!/^[0-9A-Fa-f]{2}$/.test(hex)) return undefined;
+      bytes.push(parseInt(hex, 16));
+      i += 3;
+    } else if (c === "+") {
+      bytes.push(0x20);
+      i += 1;
+    } else {
+      const cp = s.codePointAt(i)!;
+      const ch = String.fromCodePoint(cp);
+      bytes.push(...Buffer.from(ch, "utf-8"));
+      i += ch.length;
+    }
+  }
+  return Buffer.from(bytes).toString("utf-8");
 }
 
 function stripAPIVersion(path: string): string {

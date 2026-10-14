@@ -1,4 +1,5 @@
-import type { Policy } from "./policy.js";
+import type { ImageRef, Policy } from "./policy.js";
+import { checkImageTag, matchesImagePrefix, parseImageRef } from "./policy.js";
 
 export interface Gate {
   check(method: string, path: string, policy: Policy, body: Record<string, unknown>): string | null;
@@ -51,36 +52,17 @@ export class RegistryGate implements Gate {
     const image = body["Image"] as string | undefined;
     if (!image) return null;
 
-    const colonIdx = image.lastIndexOf(":");
-    const atIdx = image.lastIndexOf("@");
-    const sepIdx = atIdx !== -1 ? atIdx : colonIdx;
-    const tagOrDigest = sepIdx !== -1 && sepIdx > image.lastIndexOf("/") ? image.slice(sepIdx + 1) : "";
-    const imageName = sepIdx !== -1 && sepIdx > image.lastIndexOf("/") ? image.slice(0, sepIdx) : image;
-
-    const allowed = policy.allowed_image_prefixes.some(
-      (prefix) => imageName === prefix || imageName.startsWith(prefix + "/"),
-    );
-    if (!allowed) return `image "${imageName}" is not in allowed prefixes`;
-
-    if (tagOrDigest) {
-      if (tagOrDigest.length > 128) {
-        return `image tag/digest exceeds 128 characters`;
-      }
-      if (tagOrDigest.startsWith("sha256:")) {
-        if (!policy.image_digest_allowed) {
-          return `image digests not allowed for service ${policy.service_name}`;
-        }
-        if (!/^sha256:[a-f0-9]{64}$/.test(tagOrDigest)) {
-          return `invalid digest format: ${tagOrDigest}`;
-        }
-      } else if (policy.image_tag_pattern) {
-        if (!new RegExp(policy.image_tag_pattern).test(tagOrDigest)) {
-          return `image tag "${tagOrDigest}" does not match pattern "${policy.image_tag_pattern}"`;
-        }
-      }
+    // The same parser as the router, so a registry port is not a tag (#84).
+    let ref: ImageRef;
+    try {
+      ref = parseImageRef(image);
+    } catch (err) {
+      return (err as Error).message;
     }
-
-    return null;
+    if (!matchesImagePrefix(ref.name, policy.allowed_image_prefixes)) {
+      return `image "${ref.name}" is not in allowed prefixes`;
+    }
+    return checkImageTag(policy, ref);
   }
 }
 

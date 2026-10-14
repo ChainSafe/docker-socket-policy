@@ -1,4 +1,4 @@
-use crate::policy::Policy;
+use crate::policy::{check_image_tag, matches_image_prefix, parse_image_ref, Policy};
 use std::collections::HashMap;
 
 #[cfg(test)]
@@ -98,44 +98,12 @@ impl Gate for RegistryGate {
             _ => return Ok(()),
         };
 
-        let (image_name, tag_or_digest) = if let Some(idx) = image.find(|c: char| c == ':' || c == '@') {
-            (&image[..idx], &image[idx + 1..])
-        } else {
-            (image, "")
-        };
-
-        let allowed = policy
-            .allowed_image_prefixes
-            .iter()
-            .any(|prefix| image_name == prefix || image_name.starts_with(&format!("{}/", prefix)));
-        if !allowed {
-            return Err(format!("image {:?} is not in allowed prefixes", image_name));
+        // The same parser as the router, so a registry port is not a tag (#84).
+        let image_ref = parse_image_ref(image)?;
+        if !matches_image_prefix(&image_ref.name, &policy.allowed_image_prefixes) {
+            return Err(format!("image {:?} is not in allowed prefixes", image_ref.name));
         }
-
-        if !tag_or_digest.is_empty() {
-            if tag_or_digest.len() > 128 {
-                return Err("image tag/digest exceeds 128 characters".into());
-            }
-
-            if tag_or_digest.starts_with("sha256:") {
-                if !policy.image_digest_allowed {
-                    return Err(format!("image digests not allowed for service {}", policy.service_name));
-                }
-                let re =
-                    regex::Regex::new(r"^sha256:[a-f0-9]{64}$").map_err(|e| format!("invalid digest regex: {}", e))?;
-                if !re.is_match(tag_or_digest) {
-                    return Err(format!("invalid digest format: {}", tag_or_digest));
-                }
-            } else if let Some(ref pattern) = policy.image_tag_pattern {
-                let re = regex::Regex::new(pattern).map_err(|e| format!("invalid tag pattern regex: {}", e))?;
-                if !re.is_match(tag_or_digest) {
-                    return Err(format!(
-                        "image tag {:?} does not match pattern {:?}",
-                        tag_or_digest, pattern
-                    ));
-                }
-            }
-        }
+        check_image_tag(policy, &image_ref)?;
 
         Ok(())
     }

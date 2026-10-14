@@ -1,4 +1,4 @@
-use crate::policy::{Manager, Policy};
+use crate::policy::{check_image_tag, parse_image_ref, Manager, Policy};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,11 +38,30 @@ impl Router {
         self
     }
 
-    pub fn route(&self, method: &str, path: &str, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
+    /// Routes a request whose body, if any, is the parsed JSON body. It is
+    /// `route_request` with `has_body` set when `body` is `Some`.
+    pub fn route(&self, method: &str, target: &str, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
+        self.route_request(method, target, body.is_some(), body)
+    }
+
+    /// Routes a request. `target` is the raw request target: the path, still
+    /// percent-encoded, and the query string, if any. The path checks read
+    /// the path only; the image pull reads the query (#83). `has_body`
+    /// reports a non-empty raw body of any Content-Type; `body` is that body
+    /// parsed as JSON, or `None`.
+    pub fn route_request(
+        &self,
+        method: &str,
+        target: &str,
+        has_body: bool,
+        body: Option<&HashMap<String, serde_json::Value>>,
+    ) -> RouteResult {
         // Read-only mode denies every write, for every path (#75).
         if self.readonly && method != "GET" && method != "HEAD" {
             return deny(&format!("read-only mode: {} requests are not allowed", method));
         }
+
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
         // The daemon decodes the path before routing, so deny any escape (#53).
         if path.contains('%') {
@@ -103,7 +122,7 @@ impl Router {
 
         // Image pull
         if method == "POST" && path == "/images/create" {
-            return self.route_image_pull(body);
+            return self.route_image_pull(query, has_body);
         }
 
         // Default GET/HEAD passthrough
@@ -123,6 +142,9 @@ impl Router {
         let image = body.get("Image").and_then(|v| v.as_str()).unwrap_or("");
         if image.is_empty() {
             return deny("image field is required");
+        }
+        if let Err(msg) = parse_image_ref(image) {
+            return deny(&msg);
         }
 
         match self.manager.get_by_image(image) {
@@ -162,30 +184,118 @@ impl Router {
         }
     }
 
-    fn route_image_pull(&self, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
-        let body = match body {
-            Some(b) if !b.is_empty() => b,
-            _ => return deny("empty request body"),
-        };
-
-        let from_image = body.get("fromImage").and_then(|v| v.as_str()).unwrap_or("");
-        if from_image.is_empty() {
-            return deny("fromImage field is required for image pull");
+    /// Image pull (#83). The Docker CLI sends `fromImage` and `tag` in the
+    /// query string and no body.
+    /// The image then gets the create checks: a policy prefix on the
+    /// normalised repository (#84), and that policy's tag and digest rules.
+    fn route_image_pull(&self, raw_query: &str, has_body: bool) -> RouteResult {
+        // The daemon reads a form body's fromImage over the query's, so a
+        // body could name any image: a pull has no body, whatever its
+        // Content-Type.
+        if has_body {
+            return deny("image pull must not have a request body");
         }
-
-        match self.manager.get_by_image(from_image) {
-            Some(_) => RouteResult {
-                action: Action::Allow,
-                service: None,
-                policy: None,
-                body: None,
-                container: None,
-                image: Some(from_image.to_string()),
-                deny_msg: None,
-            },
-            None => deny(&format!("image {} not allowed by any policy", from_image)),
+        let params = match parse_query(raw_query) {
+            Some(p) => p,
+            None => return deny("invalid query string"),
+        };
+        for key in ["fromImage", "tag", "fromSrc"] {
+            if params.iter().filter(|(k, _)| k == key).count() > 1 {
+                return deny(&format!("duplicate {} query parameter", key));
+            }
+        }
+        let get = |key: &str| params.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+        if get("fromSrc").is_some() {
+            return deny("image import (fromSrc) is not allowed");
+        }
+        let from_image = get("fromImage").unwrap_or("");
+        if from_image.is_empty() {
+            return deny("fromImage query parameter is required for image pull");
+        }
+        let mut image_ref = match parse_image_ref(from_image) {
+            Ok(r) => r,
+            Err(msg) => return deny(&msg),
+        };
+        let tag = get("tag").unwrap_or("");
+        if !tag.is_empty() {
+            if !image_ref.tag.is_empty() || !image_ref.digest.is_empty() {
+                return deny(&format!(
+                    "fromImage {} already has a tag or digest; the tag query parameter is ambiguous",
+                    from_image
+                ));
+            }
+            // The CLI sends a digest in tag; a tag never contains ':'.
+            let sep = if tag.contains(':') { '@' } else { ':' };
+            image_ref = match parse_image_ref(&format!("{}{}{}", from_image, sep, tag)) {
+                Ok(r) => r,
+                Err(msg) => return deny(&msg),
+            };
+        }
+        // With neither, the daemon pulls every tag of the repository.
+        if image_ref.tag.is_empty() && image_ref.digest.is_empty() {
+            return deny("image pull without a tag or digest pulls every tag and is not allowed");
+        }
+        let policy = match self.manager.get_by_image(&image_ref.name) {
+            Some(p) => p,
+            None => return deny(&format!("image {} not allowed by any policy", from_image)),
+        };
+        if let Err(msg) = check_image_tag(policy, &image_ref) {
+            return deny(&msg);
+        }
+        RouteResult {
+            action: Action::Allow,
+            service: Some(policy.service_name.clone()),
+            policy: None,
+            body: None,
+            container: None,
+            image: Some(from_image.to_string()),
+            deny_msg: None,
         }
     }
+}
+
+/// Parses a query string as Go's `url.ParseQuery` does, which is what the
+/// daemon uses: `&` separates pairs, `+` is a space, and a `;` or a bad
+/// `%` escape fails the whole query.
+fn parse_query(raw: &str) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for part in raw.split('&') {
+        if part.contains(';') {
+            return None;
+        }
+        if part.is_empty() {
+            continue;
+        }
+        let (k, v) = part.split_once('=').unwrap_or((part, ""));
+        out.push((query_unescape(k)?, query_unescape(v)?));
+    }
+    Some(out)
+}
+
+fn query_unescape(s: &str) -> Option<String> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hi = hex(*bytes.get(i + 1)?)?;
+                let lo = hex(*bytes.get(i + 2)?)?;
+                out.push(hi << 4 | lo);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn allow() -> RouteResult {

@@ -419,3 +419,31 @@ describe("Handler", () => {
     }
   });
 });
+
+// #83: the handler hands the request target, query included, to the router.
+// A pull sent the Docker CLI way, empty body and image in the query, is
+// forwarded, and a disallowed one is not.
+describe("Handler image pull (#83)", () => {
+  it("routes a pull on its query string", async () => {
+    const dir = makeEnv({ "probe.yaml": "service_name: probe\nallowed_image_prefixes:\n  - alpine\n" });
+    try {
+      let { handler, transport } = newHandler(dir);
+      let { res, recorder } = makeResponse();
+      await handler.handle(
+        makeRequest("POST", "/v1.56/images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.19"),
+        res,
+      );
+      assert.equal(recorder.statusCode, 200);
+      assert.equal(transport.lastRequest?.url, "/v1.56/images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.19");
+
+      ({ handler, transport } = newHandler(dir));
+      ({ res, recorder } = makeResponse());
+      await handler.handle(makeRequest("POST", "/v1.56/images/create?fromImage=busybox&tag=latest"), res);
+      assert.equal(recorder.statusCode, 403);
+      assert.equal(recorder.body, "image busybox not allowed by any policy");
+      assert.equal(transport.lastRequest, undefined);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

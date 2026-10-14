@@ -568,3 +568,34 @@ func TestHandlerRefusesConnect(t *testing.T) {
 		t.Fatalf("CONNECT mismatches:\n%s", strings.Join(mismatches, "\n"))
 	}
 }
+
+// TestHandler_PullRoutesOnQuery checks that the handler hands the query to
+// the router (#83): a pull sent the Docker CLI way, empty body and image in
+// the query, is forwarded with its query unchanged, and a disallowed one is
+// not forwarded.
+func TestHandler_PullRoutesOnQuery(t *testing.T) {
+	files := map[string]string{"probe.yaml": "service_name: probe\nallowed_image_prefixes:\n  - alpine\n"}
+	const query = "fromImage=docker.io%2Flibrary%2Falpine&tag=3.19"
+
+	rec := &recorderTransport{}
+	h := newTestHandler(t, files, rec)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/v1.56/images/create?"+query, nil))
+	if w.Code != http.StatusOK || rec.lastRequest == nil {
+		t.Fatalf("allowed pull: status %d, forwarded %v: %s", w.Code, rec.lastRequest != nil, w.Body.String())
+	}
+	if rec.lastRequest.URL.RawQuery != query {
+		t.Errorf("forwarded query = %q, want %q", rec.lastRequest.URL.RawQuery, query)
+	}
+
+	rec = &recorderTransport{}
+	h = newTestHandler(t, files, rec)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/v1.56/images/create?fromImage=busybox&tag=latest", nil))
+	if w.Code != http.StatusForbidden || rec.lastRequest != nil {
+		t.Fatalf("disallowed pull: status %d, forwarded %v", w.Code, rec.lastRequest != nil)
+	}
+	if !strings.Contains(w.Body.String(), "image busybox not allowed by any policy") {
+		t.Errorf("deny body = %q", w.Body.String())
+	}
+}

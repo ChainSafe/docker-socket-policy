@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Policy {
@@ -81,6 +82,20 @@ impl Manager {
             if policy.allowed_image_prefixes.is_empty() {
                 return Err("missing allowed_image_prefixes".into());
             }
+            // Prefixes are compared in normalised form (#84).
+            let mut policy = policy;
+            let mut prefixes = Vec::with_capacity(policy.allowed_image_prefixes.len());
+            for prefix in &policy.allowed_image_prefixes {
+                let normalized = normalize_image_prefix(prefix).map_err(|_| {
+                    format!(
+                        "policy file {} has an invalid allowed_image_prefixes entry \"{}\"",
+                        path.display(),
+                        prefix
+                    )
+                })?;
+                prefixes.push(normalized);
+            }
+            policy.allowed_image_prefixes = prefixes;
             policies_by_name.insert(policy.service_name.clone(), policy);
         }
 
@@ -91,13 +106,13 @@ impl Manager {
         self.policies_by_name.get(name)
     }
 
+    /// The policy whose prefixes match the reference's normalised repository
+    /// (#84). An invalid reference matches nothing.
     pub fn get_by_image(&self, image_ref: &str) -> Option<&Policy> {
-        let image_name = extract_image_name(image_ref);
-        self.policies_by_name.values().find(|p| {
-            p.allowed_image_prefixes
-                .iter()
-                .any(|prefix| image_name == *prefix || image_name.starts_with(&format!("{}/", prefix)))
-        })
+        let name = parse_image_ref(image_ref).ok()?.name;
+        self.policies_by_name
+            .values()
+            .find(|p| matches_image_prefix(&name, &p.allowed_image_prefixes))
     }
 
     pub fn list(&self) -> Vec<&str> {
@@ -105,12 +120,151 @@ impl Manager {
     }
 }
 
-pub(crate) fn extract_image_name(image_ref: &str) -> &str {
-    if let Some(idx) = image_ref.find(|c: char| c == ':' || c == '@') {
-        &image_ref[..idx]
-    } else {
-        image_ref
+/// A parsed image reference (#84). `name` is the normalised repository: the
+/// registry host, lower-cased, and the path; Docker Hub's host is dropped,
+/// and so is `library/` before a single-component name, so `alpine`,
+/// `library/alpine` and `docker.io/library/alpine` are all `alpine`. `tag`
+/// and `digest` are empty when absent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRef {
+    pub name: String,
+    pub tag: String,
+    pub digest: String,
+}
+
+const DEFAULT_REGISTRIES: [&str; 3] = ["docker.io", "index.docker.io", "registry-1.docker.io"];
+
+fn domain_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*(?::[0-9]+)?$",
+        )
+        .unwrap()
+    })
+}
+
+fn path_component_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$").unwrap())
+}
+
+fn tag_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$").unwrap())
+}
+
+fn sha256_digest_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^sha256:[a-f0-9]{64}$").unwrap())
+}
+
+/// Parses `[registry/]repository[:tag][@digest]` the way Docker does (#84).
+/// The digest follows the first `@`; the tag follows the last `:` after the
+/// last `/`, so a registry port is not a tag. The first path component is a
+/// registry host when it contains `.` or `:` or is `localhost`. Only the
+/// host is lower-cased: upper case in the path is invalid. The digest is
+/// checked by `check_image_tag`, not here.
+pub fn parse_image_ref(reference: &str) -> Result<ImageRef, String> {
+    let invalid = || format!("invalid image reference \"{}\"", reference);
+    let (rest, digest) = match reference.split_once('@') {
+        Some((_, "")) => return Err(invalid()),
+        Some((r, d)) => (r, d),
+        None => (reference, ""),
+    };
+    let after_slash = rest.rfind('/').map_or(0, |i| i + 1);
+    let (name, tag) = match rest[after_slash..].rfind(':') {
+        Some(i) => {
+            let tag = &rest[after_slash + i + 1..];
+            if !tag_re().is_match(tag) {
+                return Err(invalid());
+            }
+            (&rest[..after_slash + i], tag)
+        }
+        None => (rest, ""),
+    };
+    let name = normalize_name(name).ok_or_else(invalid)?;
+    Ok(ImageRef {
+        name,
+        tag: tag.to_string(),
+        digest: digest.to_string(),
+    })
+}
+
+fn normalize_name(name: &str) -> Option<String> {
+    let (domain, path) = match name.split_once('/') {
+        Some((first, path)) if first.contains('.') || first.contains(':') || first == "localhost" => {
+            (Some(first.to_ascii_lowercase()), path)
+        }
+        _ => (None, name),
+    };
+    if let Some(d) = &domain {
+        if !domain_re().is_match(d) {
+            return None;
+        }
     }
+    if !path.split('/').all(|c| path_component_re().is_match(c)) {
+        return None;
+    }
+    let domain = domain.filter(|d| !DEFAULT_REGISTRIES.contains(&d.as_str()));
+    let full = match domain {
+        Some(d) => format!("{}/{}", d, path),
+        None => match path.strip_prefix("library/") {
+            Some(official) if !official.contains('/') => official.to_string(),
+            _ => path.to_string(),
+        },
+    };
+    if full.len() > 255 {
+        return None;
+    }
+    Some(full)
+}
+
+/// Normalises a policy prefix at load time (#84). A prefix names a
+/// repository or a namespace, so a tag or digest makes it invalid.
+pub fn normalize_image_prefix(prefix: &str) -> Result<String, String> {
+    let r = parse_image_ref(prefix)?;
+    if !r.tag.is_empty() || !r.digest.is_empty() {
+        return Err(format!("image prefix \"{}\" has a tag or digest", prefix));
+    }
+    Ok(r.name)
+}
+
+/// Matches a normalised repository against normalised prefixes on namespace
+/// boundaries ("prefix" or "prefix/..."), never a bare substring.
+pub fn matches_image_prefix(name: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|p| name == p || (name.starts_with(p.as_str()) && name.as_bytes().get(p.len()) == Some(&b'/')))
+}
+
+/// Applies a policy's digest and tag rules to a parsed reference: the digest
+/// must be allowed and well-formed, the tag must match `image_tag_pattern`.
+/// Shared by the registry gate (create) and the router (pull, #83).
+pub fn check_image_tag(policy: &Policy, r: &ImageRef) -> Result<(), String> {
+    if !r.digest.is_empty() {
+        if r.digest.len() > 128 {
+            return Err("image tag/digest exceeds 128 characters".into());
+        }
+        if !policy.image_digest_allowed {
+            return Err(format!("image digests not allowed for service {}", policy.service_name));
+        }
+        if !sha256_digest_re().is_match(&r.digest) {
+            return Err(format!("invalid digest format: {}", r.digest));
+        }
+    }
+    if !r.tag.is_empty() {
+        if r.tag.len() > 128 {
+            return Err("image tag/digest exceeds 128 characters".into());
+        }
+        if let Some(ref pattern) = policy.image_tag_pattern {
+            let re = regex::Regex::new(pattern).map_err(|e| format!("invalid tag pattern regex: {}", e))?;
+            if !re.is_match(&r.tag) {
+                return Err(format!("image tag {:?} does not match pattern {:?}", r.tag, pattern));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -183,27 +337,95 @@ denied_flags:
         assert_eq!(vols[0].host_path, "/data");
     }
 
+    /// The #84 normalisation table, on the parser itself. The same rows run
+    /// in Go and TypeScript.
     #[test]
-    fn test_extract_image_name_no_tag() {
-        assert_eq!(extract_image_name("myimage"), "myimage");
+    fn test_parse_image_ref_table() {
+        let digest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let ghcr = format!("ghcr.io/chainsafe/lodestar@{}", digest);
+        let both = format!("alpine:3.19@{}", digest);
+        let cases: Vec<(&str, Option<(&str, &str, &str)>)> = vec![
+            ("alpine", Some(("alpine", "", ""))),
+            ("library/alpine", Some(("alpine", "", ""))),
+            ("docker.io/library/alpine", Some(("alpine", "", ""))),
+            ("index.docker.io/library/alpine:3.19", Some(("alpine", "3.19", ""))),
+            ("registry-1.docker.io/library/alpine", Some(("alpine", "", ""))),
+            (
+                "docker.io/chainsafe/lodestar:v1",
+                Some(("chainsafe/lodestar", "v1", "")),
+            ),
+            (&ghcr, Some(("ghcr.io/chainsafe/lodestar", "", digest))),
+            ("localhost:5000/x/y:2", Some(("localhost:5000/x/y", "2", ""))),
+            (
+                "registry.example.com:443/a",
+                Some(("registry.example.com:443/a", "", "")),
+            ),
+            (
+                "REGISTRY.Example.com:443/a:V1",
+                Some(("registry.example.com:443/a", "V1", "")),
+            ),
+            ("docker.io/library/a/b", Some(("library/a/b", "", ""))),
+            ("ghcr.io/library/alpine", Some(("ghcr.io/library/alpine", "", ""))),
+            ("localhost/x", Some(("localhost/x", "", ""))),
+            ("localhost", Some(("localhost", "", ""))),
+            (&both, Some(("alpine", "3.19", digest))),
+            ("Alpine", None),
+            ("chainsafe/Lodestar", None),
+            ("alpine:", None),
+            ("alpine@", None),
+            ("", None),
+            ("a//b", None),
+            ("/alpine", None),
+            ("alpine/", None),
+            ("-alpine", None),
+            ("alpine:a/b", None),
+            ("a:b/c", None),
+            ("alpine:t$g", None),
+        ];
+        let mut mismatches = Vec::new();
+        for (input, want) in &cases {
+            let got = parse_image_ref(input);
+            let ok = match (&got, want) {
+                (Ok(r), Some((name, tag, digest))) => r.name == *name && r.tag == *tag && r.digest == *digest,
+                (Err(e), None) => *e == format!("invalid image reference \"{}\"", input),
+                _ => false,
+            };
+            if !ok {
+                mismatches.push(format!("{:?}: got {:?}, want {:?}", input, got, want));
+            }
+        }
+        assert!(mismatches.is_empty(), "parse mismatches:\n{}", mismatches.join("\n"));
     }
 
+    /// #84: prefixes are normalised at load time, and a prefix with a tag or
+    /// an invalid one fails the load.
     #[test]
-    fn test_extract_image_name_with_tag() {
-        assert_eq!(extract_image_name("myimage:latest"), "myimage");
-    }
-
-    #[test]
-    fn test_extract_image_name_with_digest() {
-        assert_eq!(extract_image_name("myimage@sha256:abc123"), "myimage");
-    }
-
-    #[test]
-    fn test_extract_image_name_registry_path() {
+    fn test_manager_normalizes_prefixes() {
+        let dir = std::env::temp_dir().join(format!("dsp-prefix-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.yaml"),
+            "service_name: a\nallowed_image_prefixes:\n  - docker.io/library/alpine\n  - GHCR.io/team\n",
+        )
+        .unwrap();
+        let mgr = Manager::new(dir.to_str().unwrap()).unwrap();
         assert_eq!(
-            extract_image_name("registry.example.com/myimage:tag"),
-            "registry.example.com/myimage"
+            mgr.get("a").unwrap().allowed_image_prefixes,
+            vec!["alpine", "ghcr.io/team"]
         );
+        for bad in ["alpine:3.19", "Alpine"] {
+            std::fs::write(
+                dir.join("a.yaml"),
+                format!("service_name: a\nallowed_image_prefixes:\n  - \"{}\"\n", bad),
+            )
+            .unwrap();
+            let err = Manager::new(dir.to_str().unwrap())
+                .err()
+                .expect("load must fail")
+                .to_string();
+            assert!(err.contains("invalid allowed_image_prefixes entry"), "{}: {}", bad, err);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
