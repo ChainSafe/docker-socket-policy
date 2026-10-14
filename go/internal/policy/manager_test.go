@@ -19,11 +19,13 @@ func TestNewManager_LoadsValidPolicies(t *testing.T) {
 	dir := t.TempDir()
 	writePolicyFile(t, dir, "beacon.yaml", `
 service_name: beacon
+container_names: [beacon]
 allowed_image_prefixes:
   - chainsafe/lodestar
 `)
 	writePolicyFile(t, dir, "validator.yaml", `
 service_name: validator
+container_names: [validator]
 allowed_image_prefixes:
   - chainsafe/lodestar
 `)
@@ -283,6 +285,113 @@ func TestManagerNormalizesPrefixes(t *testing.T) {
 		write("service_name: a\nallowed_image_prefixes:\n  - \"" + bad + "\"\n")
 		if _, err := NewManager(dir); err == nil || !strings.Contains(err.Error(), "invalid allowed_image_prefixes entry") {
 			t.Errorf("%s: NewManager error = %v, want an invalid entry error", bad, err)
+		}
+	}
+}
+
+// TestNewManager_LoadTimeValidation is the cross-language parity guard for
+// the #85 load-time checks. Two policies conflict when their image prefixes
+// share a namespace and one has no container_names or their container_names
+// intersect. Before #85 every row loaded, and a duplicate service_name
+// silently replaced the first file.
+func TestNewManager_LoadTimeValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		files   map[string]string
+		wantErr string // "" means it loads
+	}{
+		{"same prefix, no container_names", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\n",
+			"b.yaml": "service_name: b\nallowed_image_prefixes: [alpine]\n",
+		}, `conflicting policies "a" (a.yaml) and "b" (b.yaml): image prefixes "alpine" and "alpine" overlap and "a" has no container_names`},
+		{"one side has no container_names", map[string]string{
+			"a.yaml": "service_name: a\ncontainer_names: [x]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+			"b.yaml": "service_name: b\nallowed_image_prefixes: [chainsafe]\n",
+		}, `conflicting policies "a" (a.yaml) and "b" (b.yaml): image prefixes "chainsafe/lodestar" and "chainsafe" overlap and "b" has no container_names`},
+		{"shared container name", map[string]string{
+			"a.yaml": "service_name: a\ncontainer_names: [x, y]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+			"b.yaml": "service_name: b\ncontainer_names: [z, y]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+		}, `conflicting policies "a" (a.yaml) and "b" (b.yaml): image prefixes "chainsafe/lodestar" and "chainsafe/lodestar" overlap and both accept container name "y"`},
+		{"disjoint container names", map[string]string{
+			"a.yaml": "service_name: a\ncontainer_names: [beacon]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+			"b.yaml": "service_name: b\ncontainer_names: [validator]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+		}, ""},
+		{"sibling prefixes do not overlap", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+			"b.yaml": "service_name: b\nallowed_image_prefixes: [chainsafe/lodestar-backup]\n",
+		}, ""},
+		{"duplicate service_name", map[string]string{
+			"a.yaml": "service_name: svc\nallowed_image_prefixes: [alpine]\n",
+			"b.yaml": "service_name: svc\nallowed_image_prefixes: [busybox]\n",
+		}, `policies in a.yaml and b.yaml both use service_name "svc"`},
+		{"invalid container name", map[string]string{
+			"a.yaml": "service_name: a\ncontainer_names: [-bad]\nallowed_image_prefixes: [alpine]\n",
+		}, `invalid container name "-bad" in container_names`},
+		{"container name with a slash", map[string]string{
+			"a.yaml": "service_name: a\ncontainer_names: [a/b]\nallowed_image_prefixes: [alpine]\n",
+		}, `invalid container name "a/b" in container_names`},
+		{"empty container_names", map[string]string{
+			"a.yaml": "service_name: a\ncontainer_names: []\nallowed_image_prefixes: [alpine]\n",
+		}, `container_names must not be empty`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, content := range tt.files {
+				writePolicyFile(t, dir, name, content)
+			}
+			_, err := NewManager(dir)
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("NewManager failed: %v", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("NewManager loaded, want error %q", tt.wantErr)
+			case tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr):
+				t.Fatalf("NewManager error %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestSelectForCreate covers #85 selection: the one policy matching the
+// image and accepting the name, the nameless create, and ambiguity.
+func TestSelectForCreate(t *testing.T) {
+	m := NewManagerFromPolicies(
+		&Policy{ServiceName: "validator", ContainerNames: []string{"validator"}, AllowedImagePrefixes: []string{"chainsafe/lodestar"}},
+		&Policy{ServiceName: "beacon", ContainerNames: []string{"beacon"}, AllowedImagePrefixes: []string{"chainsafe/lodestar"}},
+		&Policy{ServiceName: "any", AllowedImagePrefixes: []string{"chainsafe"}},
+	)
+	for i := 0; i < 50; i++ {
+		for _, name := range []string{"beacon", "validator"} {
+			_, err := m.SelectForCreate("chainsafe/lodestar:v1", name)
+			want := "ambiguous policy for image chainsafe/lodestar:v1 and name " + name + ": any, " + name
+			if err == nil || err.Error() != want {
+				t.Fatalf("SelectForCreate(%s) error = %v, want %q", name, err, want)
+			}
+		}
+	}
+	if p, err := m.SelectForCreate("chainsafe/lodestar:v1", ""); err != nil || p.ServiceName != "any" {
+		t.Fatalf("nameless: got %v, %v; want any", p, err)
+	}
+
+	m = NewManagerFromPolicies(m.policiesByName["beacon"], m.policiesByName["validator"])
+	for i := 0; i < 50; i++ {
+		for _, name := range []string{"beacon", "validator"} {
+			if p, err := m.SelectForCreate("chainsafe/lodestar:v1", name); err != nil || p.ServiceName != name {
+				t.Fatalf("iteration %d: SelectForCreate(%s) = %v, %v", i, name, p, err)
+			}
+		}
+	}
+}
+
+func TestCovering(t *testing.T) {
+	m := NewManagerFromPolicies(
+		&Policy{ServiceName: "beacon", AllowedImagePrefixes: []string{"chainsafe/lodestar"}},
+		&Policy{ServiceName: "vc", ContainerNames: []string{"validator"}, AllowedImagePrefixes: []string{"chainsafe/lodestar"}},
+	)
+	for name, want := range map[string]int{"beacon": 1, "validator": 1, "vc": 0, "other": 0} {
+		if got := len(m.Covering(name)); got != want {
+			t.Errorf("Covering(%q) = %d policies, want %d", name, got, want)
 		}
 	}
 }

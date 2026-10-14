@@ -268,7 +268,7 @@ pub fn check_image_tag(policy: &Policy, r: &ImageRef) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -435,6 +435,7 @@ denied_flags:
             "svc1".into(),
             Policy {
                 service_name: "svc1".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: vec!["alpine".into()],
@@ -462,6 +463,7 @@ denied_flags:
             "svc1".into(),
             Policy {
                 service_name: "svc1".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: vec!["alpine".into()],
@@ -489,6 +491,7 @@ denied_flags:
             "svc1".into(),
             Policy {
                 service_name: "svc1".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: vec!["myregistry.io/team".into()],
@@ -522,6 +525,7 @@ denied_flags:
             "svc1".into(),
             Policy {
                 service_name: "svc1".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: vec!["alpine".into()],
@@ -548,6 +552,7 @@ denied_flags:
             "a".into(),
             Policy {
                 service_name: "a".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: vec!["img".into()],
@@ -566,6 +571,7 @@ denied_flags:
             "b".into(),
             Policy {
                 service_name: "b".into(),
+                container_names: None,
                 user_id: None,
                 group_id: None,
                 allowed_image_prefixes: vec!["img".into()],
@@ -628,5 +634,208 @@ value_pattern: ^\d+[kmg]$
         let rule: FlagRule = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(rule.flag, "--memory");
         assert_eq!(rule.value_pattern, "^\\d+[kmg]$");
+    }
+
+    /// Writes policy files into a fresh directory and loads it.
+    pub(crate) fn load_dir(files: &[(&str, &str)]) -> Result<Manager, String> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "dsp-policy-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Listener tests change the process umask concurrently; set the mode.
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+        let result = Manager::new(dir.to_str().unwrap()).map_err(|e| e.to_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+        result
+    }
+
+    fn policy(service: &str, names: Option<&[&str]>, prefixes: &[&str]) -> Policy {
+        Policy {
+            service_name: service.into(),
+            container_names: names.map(|n| n.iter().map(|s| s.to_string()).collect()),
+            user_id: None,
+            group_id: None,
+            allowed_image_prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
+            image_tag_pattern: None,
+            image_digest_allowed: false,
+            container_config: None,
+            volumes: None,
+            ports: None,
+            env_file: None,
+            allowed_cli_flags: None,
+            flag_rules: None,
+            denied_flags: None,
+        }
+    }
+
+    fn manager_of(policies: Vec<Policy>) -> Manager {
+        Manager::from_map(policies.into_iter().map(|p| (p.service_name.clone(), p)).collect())
+    }
+
+    /// The cross-language parity guard for the #85 load-time checks. Two
+    /// policies conflict when their image prefixes share a namespace and one
+    /// has no container_names or their container_names intersect. Before #85
+    /// every row loaded, and a duplicate service_name silently replaced the
+    /// first file.
+    #[test]
+    fn test_manager_load_time_validation() {
+        let cases: Vec<(&str, Vec<(&str, &str)>, &str)> = vec![
+            (
+                "same prefix, no container_names",
+                vec![
+                    ("a.yaml", "service_name: a\nallowed_image_prefixes: [alpine]\n"),
+                    ("b.yaml", "service_name: b\nallowed_image_prefixes: [alpine]\n"),
+                ],
+                r#"conflicting policies "a" (a.yaml) and "b" (b.yaml): image prefixes "alpine" and "alpine" overlap and "a" has no container_names"#,
+            ),
+            (
+                "one side has no container_names",
+                vec![
+                    (
+                        "a.yaml",
+                        "service_name: a\ncontainer_names: [x]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+                    ),
+                    ("b.yaml", "service_name: b\nallowed_image_prefixes: [chainsafe]\n"),
+                ],
+                r#"conflicting policies "a" (a.yaml) and "b" (b.yaml): image prefixes "chainsafe/lodestar" and "chainsafe" overlap and "b" has no container_names"#,
+            ),
+            (
+                "shared container name",
+                vec![
+                    (
+                        "a.yaml",
+                        "service_name: a\ncontainer_names: [x, y]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+                    ),
+                    (
+                        "b.yaml",
+                        "service_name: b\ncontainer_names: [z, y]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+                    ),
+                ],
+                r#"conflicting policies "a" (a.yaml) and "b" (b.yaml): image prefixes "chainsafe/lodestar" and "chainsafe/lodestar" overlap and both accept container name "y""#,
+            ),
+            (
+                "disjoint container names",
+                vec![
+                    (
+                        "a.yaml",
+                        "service_name: a\ncontainer_names: [beacon]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+                    ),
+                    (
+                        "b.yaml",
+                        "service_name: b\ncontainer_names: [validator]\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+                    ),
+                ],
+                "",
+            ),
+            (
+                "sibling prefixes do not overlap",
+                vec![
+                    (
+                        "a.yaml",
+                        "service_name: a\nallowed_image_prefixes: [chainsafe/lodestar]\n",
+                    ),
+                    (
+                        "b.yaml",
+                        "service_name: b\nallowed_image_prefixes: [chainsafe/lodestar-backup]\n",
+                    ),
+                ],
+                "",
+            ),
+            (
+                "duplicate service_name",
+                vec![
+                    ("a.yaml", "service_name: svc\nallowed_image_prefixes: [alpine]\n"),
+                    ("b.yaml", "service_name: svc\nallowed_image_prefixes: [busybox]\n"),
+                ],
+                r#"policies in a.yaml and b.yaml both use service_name "svc""#,
+            ),
+            (
+                "invalid container name",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\ncontainer_names: [-bad]\nallowed_image_prefixes: [alpine]\n",
+                )],
+                r#"invalid container name "-bad" in container_names"#,
+            ),
+            (
+                "container name with a slash",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\ncontainer_names: [a/b]\nallowed_image_prefixes: [alpine]\n",
+                )],
+                r#"invalid container name "a/b" in container_names"#,
+            ),
+            (
+                "empty container_names",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\ncontainer_names: []\nallowed_image_prefixes: [alpine]\n",
+                )],
+                "container_names must not be empty",
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, files, want) in cases {
+            match (load_dir(&files), want) {
+                (Ok(_), "") => {}
+                (Ok(_), want) => mismatches.push(format!("{name}: loaded, want error {want:?}")),
+                (Err(e), "") => mismatches.push(format!("{name}: {e}")),
+                (Err(e), want) if !e.contains(want) => mismatches.push(format!("{name}: error {e:?}, want {want:?}")),
+                _ => {}
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// #85 selection: the one policy matching the image and accepting the
+    /// name, the nameless create, and ambiguity.
+    #[test]
+    fn test_manager_select_for_create() {
+        let m = manager_of(vec![
+            policy("validator", Some(&["validator"]), &["chainsafe/lodestar"]),
+            policy("beacon", Some(&["beacon"]), &["chainsafe/lodestar"]),
+            policy("any", None, &["chainsafe"]),
+        ]);
+        for _ in 0..50 {
+            for name in ["beacon", "validator"] {
+                let want = format!("ambiguous policy for image chainsafe/lodestar:v1 and name {name}: any, {name}");
+                assert_eq!(m.select_for_create("chainsafe/lodestar:v1", name).err(), Some(want));
+            }
+        }
+        assert_eq!(
+            m.select_for_create("chainsafe/lodestar:v1", "").unwrap().service_name,
+            "any"
+        );
+
+        let m = manager_of(vec![
+            policy("validator", Some(&["validator"]), &["chainsafe/lodestar"]),
+            policy("beacon", Some(&["beacon"]), &["chainsafe/lodestar"]),
+        ]);
+        for _ in 0..50 {
+            for name in ["beacon", "validator"] {
+                assert_eq!(
+                    m.select_for_create("chainsafe/lodestar:v1", name).unwrap().service_name,
+                    name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_manager_covering() {
+        let m = manager_of(vec![
+            policy("beacon", None, &["chainsafe/lodestar"]),
+            policy("vc", Some(&["validator"]), &["chainsafe/lodestar"]),
+        ]);
+        for (name, want) in [("beacon", 1), ("validator", 1), ("vc", 0), ("other", 0)] {
+            assert_eq!(m.covering(name).len(), want, "covering({name})");
+        }
     }
 }

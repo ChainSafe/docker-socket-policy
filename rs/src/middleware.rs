@@ -982,6 +982,7 @@ impl Mutator for ContainerConfigMutator {
 fn make_policy(name: &str, prefixes: Vec<&str>) -> Policy {
     Policy {
         service_name: name.to_string(),
+        container_names: None,
         user_id: None,
         group_id: None,
         allowed_image_prefixes: prefixes.iter().map(|s| s.to_string()).collect(),

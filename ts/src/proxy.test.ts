@@ -103,9 +103,10 @@ describe("Router", () => {
     assert.equal(r.service, "nginx-svc");
   });
 
-  it("allows POST /containers/:name/start for unknown container", () => {
+  it("resolves POST /containers/:name/start for an uncovered container", () => {
+    // Not covered: resolved by the handler, never allowed directly (#86).
     const r = router.route("POST", "/containers/my-arbitrary/start");
-    assert.equal(r.action, Action.Allow);
+    assert.equal(r.action, Action.ResolveContainer);
     assert.equal(r.container, "my-arbitrary");
   });
 
@@ -174,9 +175,11 @@ describe("Router", () => {
       ["DELETE", "/containers/exec", Action.Deny, "exec is not allowed"],
       // Listing stays allowed, via the GET/HEAD passthrough.
       ["GET", "/containers/json", Action.Allow],
-      // A real container name is still routed as a container.
-      // realNameDeleteAllowedTest
-      ["DELETE", "/containers/mycontainer", Action.Allow],
+      // A real container name is still routed as a container. No policy
+      // covers it, so the daemon is asked which container it is, and the
+      // handler denies it (#86).
+      // realNameDeleteDeniedTest
+      ["DELETE", "/containers/mycontainer", Action.ResolveContainer],
       ["GET", "/containers/mycontainer", Action.Allow],
       // Reserved words are only reserved in the name position.
       // reservedInSubpathAllowedTest
@@ -224,20 +227,20 @@ describe("Router", () => {
   // ^/v\d+(\.\d+)?/ with ASCII digits, in all three languages (#52, #57).
   it("routes dotted API-version paths like the unversioned ones", () => {
     const cases: [string, string, Record<string, unknown> | undefined, Action][] = [
-      // #52: dotted version, container lifecycle delete.
-      ["DELETE", "/v1.43/containers/foo", undefined, Action.Allow],
-      // #52: dotted version, container lifecycle start.
-      ["POST", "/v1.43/containers/beacon/start", undefined, Action.Allow],
+      // #52: dotted version, container lifecycle delete (uncovered, #86).
+      ["DELETE", "/v1.43/containers/foo", undefined, Action.ResolveContainer],
+      // #52: dotted version, container lifecycle start (covered).
+      ["POST", "/v1.43/containers/nginx-svc/start", undefined, Action.Allow],
       // #52: dotted version, create with a policy-allowed image.
       ["POST", "/v1.43/containers/create", { Image: "nginx:latest" }, Action.CreateContainer],
       // #52: undotted control — stripped correctly everywhere already.
-      ["POST", "/v1/containers/beacon/start", undefined, Action.Allow],
+      ["POST", "/v1/containers/nginx-svc/start", undefined, Action.Allow],
       // #52: the reserved segment survives the strip (#24 parity).
       ["DELETE", "/v1.43/containers/json", undefined, Action.Deny],
-      // #57: undotted version, container lifecycle delete.
-      ["DELETE", "/v1/containers/foo", undefined, Action.Allow],
+      // #57: undotted version, container lifecycle delete (uncovered, #86).
+      ["DELETE", "/v1/containers/foo", undefined, Action.ResolveContainer],
       // #57: multi-digit major version.
-      ["DELETE", "/v10.0/containers/foo", undefined, Action.Allow],
+      ["DELETE", "/v10.0/containers/foo", undefined, Action.ResolveContainer],
       // #57: /volumes/ is not a version; the daemon routes this as a volume removal.
       ["DELETE", "/volumes/containers/foo", undefined, Action.Deny],
       // #57: /version/ is not a version prefix.
@@ -295,13 +298,13 @@ describe("Router", () => {
       ["DELETE", "/v%31/containers/foo", Action.Deny],
       // #53: network names that need escaping are denied, GET included.
       ["GET", "/networks/a%20b", Action.Deny],
-      // #53 control: a plain name is still routed as a container.
-      ["DELETE", "/containers/foo", Action.Allow],
+      // #53 control: a plain name is still routed as a container (#86).
+      ["DELETE", "/containers/foo", Action.ResolveContainer],
       // #53, TS-only: only the TS router receives the query string (Go and Rust
       // route URL.EscapedPath() / uri.path()). A % in the query is not checked.
       ["GET", "/containers/json?filters=%7B%7D", Action.Allow],
       // Non-GET, so the GET passthrough cannot hide a check placed before the split.
-      ["DELETE", "/containers/foo?force=%31", Action.Allow],
+      ["DELETE", "/containers/foo?force=%31", Action.ResolveContainer],
     ];
     const mismatches: string[] = [];
     for (const [method, path, want] of cases) {
@@ -330,10 +333,11 @@ describe("Router", () => {
       ["DELETE", "/containers/mycontainer/exec", undefined, Action.Deny, exec],
       // execSubpathPostDeniedTest (#49)
       ["POST", "/containers/mycontainer/exec", undefined, Action.Deny, exec],
-      // execPrefixNameStartAllowedTest (#49): an unknown container.
-      ["POST", "/containers/exec-runner/start", undefined, Action.Allow, undefined],
-      // execPrefixNameDeleteAllowedTest (#49): an unknown container.
-      ["DELETE", "/containers/exec-runner", undefined, Action.Allow, undefined],
+      // execPrefixNameStartDeniedTest (#49, #86): an uncovered container,
+      // routed for resolution; the handler denies it.
+      ["POST", "/containers/exec-runner/start", undefined, Action.ResolveContainer, undefined],
+      // execPrefixNameDeleteDeniedTest (#49, #86)
+      ["DELETE", "/containers/exec-runner", undefined, Action.ResolveContainer, undefined],
       // execPrefixNameGetAllowedTest (#49)
       ["GET", "/containers/exec-runner/json", undefined, Action.Allow, undefined],
       // execNamespaceGetDeniedTest (#49): exec inspect leaks command lines.
@@ -349,7 +353,7 @@ describe("Router", () => {
       // A name ending in exec is a plain name (#49, language-only).
       ["GET", "/containers/myexec/json", undefined, Action.Allow, undefined],
       // A name starting with exec is a plain name (#49, language-only).
-      ["DELETE", "/containers/executor", undefined, Action.Allow, undefined],
+      ["DELETE", "/containers/executor", undefined, Action.ResolveContainer, undefined],
       // The reserved name, decided by the exec check (#49, language-only).
       ["GET", "/containers/exec/json", undefined, Action.Deny, exec],
       // A top-level name starting with exec is not the exec namespace (#49, language-only).
@@ -816,5 +820,190 @@ describe("Router image pull and normalisation (#83, #84)", () => {
       }
     }
     assert.deepEqual(mismatches, []);
+  });
+});
+
+// The #85 layout: beacon and validator run one image.
+const LODESTAR_POLICIES: Record<string, string> = {
+  "beacon.yaml": "service_name: beacon\ncontainer_names: [beacon]\nallowed_image_prefixes:\n  - chainsafe/lodestar\n",
+  "validator.yaml":
+    "service_name: validator\ncontainer_names: [validator, validator-2]\nallowed_image_prefixes:\n  - chainsafe/lodestar\n",
+  "monitoring.yaml": "service_name: monitoring\nallowed_image_prefixes:\n  - prom/prometheus\n",
+};
+
+function loadManager(files: Record<string, string>): Manager {
+  const dir = mkdtempSync(join(tmpdir(), "proxy-names-"));
+  try {
+    for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
+    return new Manager(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("Router container names", () => {
+  // The cross-language parity guard for #85. POST /containers/create selects
+  // the one policy whose image prefixes match and whose container_names
+  // contain ?name=; a policy without container_names accepts any name. Before
+  // #85 the policy was whichever matched the image first in map order (Go,
+  // Rust) or load order (TypeScript).
+  it("selects the create policy by image and name", () => {
+    const router = new Router(loadManager(LODESTAR_POLICIES));
+    const lodestar = { Image: "chainsafe/lodestar:v1.20.0" };
+    const prom = { Image: "prom/prometheus:latest" };
+    const cases: [string, Record<string, unknown>, Action, string | undefined, string | undefined][] = [
+      ["name=beacon", lodestar, Action.CreateContainer, "beacon", undefined],
+      ["name=validator", lodestar, Action.CreateContainer, "validator", undefined],
+      ["name=validator-2", lodestar, Action.CreateContainer, "validator", undefined],
+      // The daemon strips one leading slash, and the name is decoded.
+      ["name=/validator", lodestar, Action.CreateContainer, "validator", undefined],
+      ["name=%2Fbeacon&platform=", lodestar, Action.CreateContainer, "beacon", undefined],
+      ["platform=linux&name=beacon", lodestar, Action.CreateContainer, "beacon", undefined],
+      // A name no policy for the image accepts.
+      [
+        "name=other",
+        lodestar,
+        Action.Deny,
+        undefined,
+        "container name other not allowed for image chainsafe/lodestar:v1.20.0 by any policy",
+      ],
+      // A create without ?name= only matches a policy without container_names.
+      ["", lodestar, Action.Deny, undefined, "image chainsafe/lodestar:v1.20.0 requires a container name"],
+      ["name=", lodestar, Action.Deny, undefined, "image chainsafe/lodestar:v1.20.0 requires a container name"],
+      ["", prom, Action.CreateContainer, "monitoring", undefined],
+      ["name=anything", prom, Action.CreateContainer, "monitoring", undefined],
+      // The image decides first.
+      [
+        "name=beacon",
+        { Image: "alpine:latest" },
+        Action.Deny,
+        undefined,
+        "image alpine:latest not allowed by any policy",
+      ],
+      // An invalid or undecodable name is denied.
+      ["name=-beacon", lodestar, Action.Deny, undefined, "invalid container name"],
+      ["name=bea%2Fcon", lodestar, Action.Deny, undefined, "invalid container name"],
+      ["name=%zz", lodestar, Action.Deny, undefined, "invalid query string"],
+    ];
+    const mismatches: string[] = [];
+    for (const [query, body, want, service, msg] of cases) {
+      const target = "/v1.45/containers/create" + (query ? `?${query}` : "");
+      const r = router.route("POST", target, body);
+      if (r.action !== want || r.service !== service || r.denyMsg !== msg) {
+        mismatches.push(
+          `create ?${query}: got ${Action[r.action]}/${r.service}/${r.denyMsg}, want ${Action[want]}/${service}/${msg}`,
+        );
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
+
+  // The #85 reproduction: with two policies for one image, every create gets
+  // its own policy, every time.
+  it("selects the same policy for a name every time", () => {
+    const router = new Router(loadManager(LODESTAR_POLICIES));
+    for (let i = 0; i < 50; i++) {
+      for (const name of ["beacon", "validator"]) {
+        const r = router.route("POST", `/containers/create?name=${name}`, { Image: "chainsafe/lodestar:v1.20.0" });
+        assert.equal(r.action, Action.CreateContainer, `iteration ${i}: ${r.denyMsg}`);
+        assert.equal(r.service, name, `iteration ${i}`);
+      }
+    }
+  });
+
+  // Two policies that both accept one image and name are refused at load
+  // time; built without that check, the router denies.
+  it("denies an ambiguous create", () => {
+    const router = new Router(
+      Manager.fromPolicies([
+        { service_name: "b", allowed_image_prefixes: ["chainsafe/lodestar"] },
+        { service_name: "a", allowed_image_prefixes: ["chainsafe"], container_names: ["beacon"] },
+      ]),
+    );
+    const body = { Image: "chainsafe/lodestar:v1" };
+    let r = router.route("POST", "/containers/create?name=beacon", body);
+    assert.equal(r.action, Action.Deny);
+    assert.equal(r.denyMsg, "ambiguous policy for image chainsafe/lodestar:v1 and name beacon: a, b");
+    r = router.route("POST", "/containers/create?name=validator", body);
+    assert.equal(r.action, Action.CreateContainer);
+    assert.equal(r.service, "b");
+  });
+
+  // The cross-language parity guard for #86. A lifecycle action or DELETE is
+  // allowed directly only on a name that exactly one policy covers
+  // (container_names, or service_name when unset). Any other target is routed
+  // for resolution: the handler asks the daemon which container it is. Rows
+  // mirror the covered* and uncovered* runs in spec/router.qnt.
+  it("allows lifecycle actions directly only on covered names", () => {
+    const files = {
+      "validator.yaml": LODESTAR_POLICIES["validator.yaml"]!,
+      "monitoring.yaml": LODESTAR_POLICIES["monitoring.yaml"]!,
+      "vc.yaml": "service_name: vc-svc\ncontainer_names: [vc-1]\nallowed_image_prefixes:\n  - example/vc\n",
+      "cafe.yaml": "service_name: cafe\nallowed_image_prefixes:\n  - cafe/app\n",
+    };
+    const router = new Router(loadManager(files));
+    const resolve = Action.ResolveContainer;
+    const cases: [string, string, Action, string | undefined][] = [
+      // coveredNameStartAllowedTest
+      ["POST", "/containers/validator/start", Action.Allow, "validator"],
+      ["POST", "/v1.45/containers/validator-2/kill", Action.Allow, "validator"],
+      ["DELETE", "/containers/validator", Action.Allow, "validator"],
+      // A policy without container_names covers its service_name.
+      ["POST", "/containers/monitoring/restart", Action.Allow, "monitoring"],
+      // With container_names set, service_name is not covered.
+      ["POST", "/containers/vc-svc/stop", resolve, undefined],
+      ["POST", "/containers/vc-1/stop", Action.Allow, "vc-svc"],
+      // uncoveredNameStopDeniedTest: an operator container, resolved first.
+      ["POST", "/containers/mycontainer/stop", resolve, undefined],
+      // An ID (full or short) is resolved by the daemon.
+      ["POST", "/containers/4f6e1d2c9a7b/kill", resolve, undefined],
+      ["DELETE", "/containers/4f6e1d2c9a7b8c3d4e5f60718293a4b5c6d7e8f9012345678901234567890abc", resolve, undefined],
+      // A covered name that could also be an ID prefix is resolved too.
+      ["POST", "/containers/cafe/start", resolve, undefined],
+      // Reads are not lifecycle actions.
+      ["GET", "/containers/mycontainer/json", Action.Allow, undefined],
+    ];
+    const mismatches: string[] = [];
+    for (const [method, path, want, service] of cases) {
+      const r = router.route(method, path);
+      if (r.action !== want || r.service !== service) {
+        mismatches.push(`${method} ${path}: got ${Action[r.action]}/${r.service}, want ${Action[want]}/${service}`);
+      }
+    }
+    assert.deepEqual(mismatches, []);
+
+    // --readonly still denies first (#75).
+    const ro = new Router(loadManager(files)).withReadonly(true);
+    assert.equal(ro.route("POST", "/containers/validator/start").action, Action.Deny);
+  });
+});
+
+describe("Router pull with shared images", () => {
+  // Several policies may allow one image once container_names tells their
+  // creates apart (#85). A pull creates no container, so it is allowed when
+  // any policy for the image accepts its tag or digest, and denied with the
+  // first policy's reason (sorted by service_name) when none does.
+  it("allows a pull that any policy for the image accepts", () => {
+    const router = new Router(
+      loadManager({
+        "vc-b.yaml":
+          "service_name: vc-b\ncontainer_names: [vc-b]\nallowed_image_prefixes: [example/vc]\nimage_tag_pattern: '^v2$'\n",
+        "vc-a.yaml":
+          "service_name: vc-a\ncontainer_names: [vc-a]\nallowed_image_prefixes: [example/vc]\nimage_tag_pattern: '^v1$'\n",
+      }),
+    );
+    const cases: [string, Action, string | undefined, string | undefined][] = [
+      ["v1", Action.Allow, "vc-a", undefined],
+      ["v2", Action.Allow, "vc-b", undefined],
+      ["v3", Action.Deny, undefined, 'image tag "v3" does not match pattern "^v1$"'],
+    ];
+    for (let i = 0; i < 50; i++) {
+      for (const [tag, want, service, msg] of cases) {
+        const r = router.route("POST", `/images/create?fromImage=example%2Fvc&tag=${tag}`);
+        assert.equal(r.action, want, `iteration ${i}: pull tag ${tag}: ${r.denyMsg}`);
+        assert.equal(r.service, service, `iteration ${i}: pull tag ${tag}`);
+        assert.equal(r.denyMsg, msg, `iteration ${i}: pull tag ${tag}`);
+      }
+    }
   });
 });

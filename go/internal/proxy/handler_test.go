@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -597,5 +598,196 @@ func TestHandler_PullRoutesOnQuery(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "image busybox not allowed by any policy") {
 		t.Errorf("deny body = %q", w.Body.String())
+	}
+}
+
+// daemonTransport answers GET /containers/{id}/json from a table of
+// id -> container name, as the daemon does, and records every request.
+type daemonTransport struct {
+	names    map[string]string
+	status   int // when non-zero, every inspect answers this status
+	requests []string
+}
+
+func (t *daemonTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	t.requests = append(t.requests, r.Method+" "+r.URL.EscapedPath())
+	if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json") {
+		if t.status != 0 {
+			http.Error(w, "boom", t.status)
+			return
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/containers/"), "/json")
+		name, ok := t.names[id]
+		if !ok {
+			http.Error(w, `{"message":"No such container: `+id+`"}`, http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"Id": "4f6e1d2c9a7b", "Name": "/" + name})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+const (
+	beaconID     = "4f6e1d2c9a7b8c3d4e5f60718293a4b5c6d7e8f9012345678901234567890abc"
+	monitoringID = "9d8c7b6a5f4e3d2c1b0a99887766554433221100ffeeddccbbaa998877665544"
+)
+
+func newDaemonTransport() *daemonTransport {
+	return &daemonTransport{names: map[string]string{
+		"beacon":          "beacon",
+		beaconID:          "beacon",
+		beaconID[:12]:     "beacon",
+		"dsp-monitoring":  "dsp-monitoring",
+		monitoringID:      "dsp-monitoring",
+		monitoringID[:12]: "dsp-monitoring",
+	}}
+}
+
+func newCoverageHandler(t *testing.T, transport Transport) (*Handler, string) {
+	t.Helper()
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "beacon.yaml"), []byte("service_name: beacon\nallowed_image_prefixes:\n  - chainsafe/lodestar\n"), 0644)
+	m, err := policy.NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "audit.log")
+	auditLog, err := audit.NewLogger(logPath)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+	t.Cleanup(func() { auditLog.Close() })
+	return NewHandler(NewRouter(m), middleware.NewChain(), auditLog, transport), logPath
+}
+
+// TestHandlerLifecycleCoverage is the handler half of #86: a lifecycle action
+// or DELETE is forwarded only if its target is a container a policy covers.
+// A name, full ID or short ID is resolved with GET /containers/{id}/json.
+// Before #86 every row was forwarded.
+func TestHandlerLifecycleCoverage(t *testing.T) {
+	notManaged := func(id string) string { return "container " + id + " is not managed by any policy" }
+	tests := []struct {
+		name     string
+		method   string
+		target   string
+		status   int
+		body     string
+		inspects []string // inspect requests the proxy sends before deciding
+	}{
+		{"covered name", "POST", "/v1.45/containers/beacon/stop?t=1", http.StatusNoContent, "", nil},
+		{"covered full ID", "POST", "/containers/" + beaconID + "/kill", http.StatusNoContent, "", []string{"GET /containers/" + beaconID + "/json"}},
+		{"covered short ID", "DELETE", "/containers/" + beaconID[:12] + "?force=1", http.StatusNoContent, "", []string{"GET /containers/" + beaconID[:12] + "/json"}},
+		// uncoveredNameStopDeniedTest: an operator container.
+		{"uncovered name", "POST", "/containers/dsp-monitoring/stop", http.StatusForbidden, notManaged("dsp-monitoring"), []string{"GET /containers/dsp-monitoring/json"}},
+		{"uncovered full ID", "POST", "/containers/" + monitoringID + "/kill", http.StatusForbidden, notManaged(monitoringID), []string{"GET /containers/" + monitoringID + "/json"}},
+		{"uncovered short ID", "DELETE", "/containers/" + monitoringID[:12], http.StatusForbidden, notManaged(monitoringID[:12]), []string{"GET /containers/" + monitoringID[:12] + "/json"}},
+		// realNameDeleteDeniedTest: the daemon answers 404.
+		{"unknown name", "DELETE", "/containers/mycontainer", http.StatusForbidden, notManaged("mycontainer"), []string{"GET /containers/mycontainer/json"}},
+		// execPrefixNameStartDeniedTest
+		{"unknown exec-prefixed name", "POST", "/containers/exec-runner/start", http.StatusForbidden, notManaged("exec-runner"), []string{"GET /containers/exec-runner/json"}},
+		// A read is not resolved.
+		{"inspect read", "GET", "/containers/dsp-monitoring/json", http.StatusOK, "", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newDaemonTransport()
+			h, _ := newCoverageHandler(t, d)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(tt.method, tt.target, nil))
+			if rec.Code != tt.status {
+				t.Fatalf("%s %s: status %d, want %d (%s)", tt.method, tt.target, rec.Code, tt.status, rec.Body.String())
+			}
+			if tt.body != "" && strings.TrimSpace(rec.Body.String()) != tt.body {
+				t.Fatalf("%s %s: body %q, want %q", tt.method, tt.target, rec.Body.String(), tt.body)
+			}
+			want := append([]string{}, tt.inspects...)
+			if tt.status != http.StatusForbidden {
+				u, _ := url.Parse(tt.target)
+				want = append(want, tt.method+" "+u.EscapedPath())
+			}
+			if strings.Join(d.requests, "\n") != strings.Join(want, "\n") {
+				t.Fatalf("%s %s: daemon saw %q, want %q", tt.method, tt.target, d.requests, want)
+			}
+		})
+	}
+}
+
+// A daemon error other than 404 fails closed with its own message (#86).
+func TestHandlerLifecycleResolveFailsClosed(t *testing.T) {
+	d := newDaemonTransport()
+	d.status = http.StatusInternalServerError
+	h, _ := newCoverageHandler(t, d)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/containers/"+beaconID[:12]+"/stop", nil))
+	want := "cannot resolve container " + beaconID[:12] + ": daemon returned 500"
+	if rec.Code != http.StatusForbidden || strings.TrimSpace(rec.Body.String()) != want {
+		t.Fatalf("status %d body %q, want 403 %q", rec.Code, rec.Body.String(), want)
+	}
+	if len(d.requests) != 1 {
+		t.Fatalf("daemon saw %q, want only the inspect", d.requests)
+	}
+}
+
+// The resolved name is audited with the request (#86).
+func TestHandlerLifecycleAuditsResolvedName(t *testing.T) {
+	d := newDaemonTransport()
+	h, logPath := newCoverageHandler(t, d)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/containers/"+beaconID[:12]+"/start", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/containers/"+monitoringID[:12]+"/start", nil))
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading audit log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("audit log has %d lines, want 2:\n%s", len(lines), data)
+	}
+	for i, want := range []struct{ decision, name, service string }{{"ALLOW", "beacon", "beacon"}, {"DENY", "dsp-monitoring", ""}} {
+		var entry struct {
+			Decision string            `json:"decision"`
+			Extra    map[string]string `json:"extra"`
+		}
+		if err := json.Unmarshal([]byte(lines[i]), &entry); err != nil {
+			t.Fatalf("line %d: %v", i, err)
+		}
+		if entry.Decision != want.decision || entry.Extra["resolved_name"] != want.name || entry.Extra["service"] != want.service {
+			t.Fatalf("line %d = %s, want %s with resolved_name %q service %q", i, lines[i], want.decision, want.name, want.service)
+		}
+	}
+}
+
+// TestHandlerCreateSelectsByName is the #85 reproduction through the handler:
+// two policies for one image force different users, and each create named
+// for one of them gets that policy's user, every time.
+func TestHandlerCreateSelectsByName(t *testing.T) {
+	rec := &recorderTransport{}
+	h := newTestHandler(t, map[string]string{
+		"a.yaml": "service_name: svc-a\ncontainer_names: [svc-a]\nallowed_image_prefixes: [alpine]\ncontainer_config: { user: \"1111:1111\" }\n",
+		"b.yaml": "service_name: svc-b\ncontainer_names: [svc-b]\nallowed_image_prefixes: [alpine]\ncontainer_config: { user: \"2222:2222\" }\n",
+	}, rec)
+	for i := 0; i < 50; i++ {
+		for _, tc := range []struct{ name, user string }{{"svc-a", "1111:1111"}, {"svc-b", "2222:2222"}} {
+			rec.lastRequest = nil
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest("POST", "/v1.45/containers/create?name="+tc.name, strings.NewReader(`{"Image":"alpine:3.20","Cmd":["true"]}`)))
+			if w.Code != http.StatusOK || rec.lastRequest == nil {
+				t.Fatalf("iteration %d %s: status %d (%s)", i, tc.name, w.Code, w.Body.String())
+			}
+			var fwd map[string]interface{}
+			b, _ := io.ReadAll(rec.lastRequest.Body)
+			if err := json.Unmarshal(b, &fwd); err != nil {
+				t.Fatalf("forwarded body: %v", err)
+			}
+			if fwd["User"] != tc.user {
+				t.Fatalf("iteration %d: create ?name=%s forwarded User %v, want %s", i, tc.name, fwd["User"], tc.user)
+			}
+		}
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/containers/create", strings.NewReader(`{"Image":"alpine:3.20"}`)))
+	if w.Code != http.StatusForbidden || strings.TrimSpace(w.Body.String()) != "image alpine:3.20 requires a container name" {
+		t.Fatalf("nameless create: status %d body %q", w.Code, w.Body.String())
 	}
 }

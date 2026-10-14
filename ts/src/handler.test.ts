@@ -11,7 +11,7 @@ import { Chain } from "./middleware.js";
 import { Router } from "./proxy.js";
 import { Manager } from "./policy.js";
 import { AuditLogger } from "./audit.js";
-import { Transport } from "./transport.js";
+import { Transport, type DaemonResponse } from "./transport.js";
 
 class FakeTransport extends Transport {
   lastBody?: Buffer;
@@ -445,5 +445,172 @@ describe("Handler image pull (#83)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+const BEACON_ID = "4f6e1d2c9a7b8c3d4e5f60718293a4b5c6d7e8f9012345678901234567890abc";
+const MONITORING_ID = "9d8c7b6a5f4e3d2c1b0a99887766554433221100ffeeddccbbaa998877665544";
+
+// Answers GET /containers/{id}/json from a table of id -> container name, as
+// the daemon does, and records every request.
+class DaemonTransport extends Transport {
+  requests: string[] = [];
+  lastBody?: Buffer;
+  status?: number;
+  names = new Map<string, string>([
+    ["beacon", "beacon"],
+    [BEACON_ID, "beacon"],
+    [BEACON_ID.slice(0, 12), "beacon"],
+    ["dsp-monitoring", "dsp-monitoring"],
+    [MONITORING_ID, "dsp-monitoring"],
+    [MONITORING_ID.slice(0, 12), "dsp-monitoring"],
+  ]);
+
+  override async get(path: string): Promise<DaemonResponse> {
+    this.requests.push(`GET ${path}`);
+    if (this.status !== undefined) return { statusCode: this.status, body: Buffer.from("boom") };
+    const id = path.slice("/containers/".length, -"/json".length);
+    const name = this.names.get(id);
+    if (name === undefined) return { statusCode: 404, body: Buffer.from("no such container") };
+    return { statusCode: 200, body: Buffer.from(JSON.stringify({ Id: "4f6e1d2c9a7b", Name: `/${name}` })) };
+  }
+
+  override async forward(req: IncomingMessage, res: ServerResponse, body?: Buffer): Promise<void> {
+    this.requests.push(`${req.method} ${(req.url ?? "").split("?")[0]}`);
+    this.lastBody = body;
+    res.writeHead(204);
+    res.end();
+  }
+}
+
+function newDaemonHandler(files: Record<string, string>) {
+  const dir = makeEnv(files);
+  const transport = new DaemonTransport();
+  const handler = new Handler(
+    new Router(new Manager(dir)),
+    new Chain(),
+    new AuditLogger(join(dir, "audit.log")),
+    transport,
+  );
+  return { handler, transport, dir };
+}
+
+describe("Handler container coverage", () => {
+  const notManaged = (id: string) => `container ${id} is not managed by any policy`;
+  const inspect = (id: string) => [`GET /containers/${id}/json`];
+  const beaconShort = BEACON_ID.slice(0, 12);
+  const monShort = MONITORING_ID.slice(0, 12);
+
+  // The handler half of #86: a lifecycle action or DELETE is forwarded only
+  // if its target is a container a policy covers. A name, full ID or short ID
+  // is resolved with GET /containers/{id}/json. Before #86 every row was
+  // forwarded.
+  it("forwards lifecycle actions only for covered containers", async () => {
+    const cases: [string, string, string, number, string, string[]][] = [
+      ["covered name", "POST", "/v1.45/containers/beacon/stop?t=1", 204, "", []],
+      ["covered full ID", "POST", `/containers/${BEACON_ID}/kill`, 204, "", inspect(BEACON_ID)],
+      ["covered short ID", "DELETE", `/containers/${beaconShort}?force=1`, 204, "", inspect(beaconShort)],
+      // uncoveredNameStopDeniedTest: an operator container.
+      [
+        "uncovered name",
+        "POST",
+        "/containers/dsp-monitoring/stop",
+        403,
+        notManaged("dsp-monitoring"),
+        inspect("dsp-monitoring"),
+      ],
+      [
+        "uncovered full ID",
+        "POST",
+        `/containers/${MONITORING_ID}/kill`,
+        403,
+        notManaged(MONITORING_ID),
+        inspect(MONITORING_ID),
+      ],
+      ["uncovered short ID", "DELETE", `/containers/${monShort}`, 403, notManaged(monShort), inspect(monShort)],
+      // realNameDeleteDeniedTest: the daemon answers 404.
+      ["unknown name", "DELETE", "/containers/mycontainer", 403, notManaged("mycontainer"), inspect("mycontainer")],
+      // execPrefixNameStartDeniedTest
+      [
+        "unknown exec-prefixed name",
+        "POST",
+        "/containers/exec-runner/start",
+        403,
+        notManaged("exec-runner"),
+        inspect("exec-runner"),
+      ],
+    ];
+    const mismatches: string[] = [];
+    for (const [name, method, target, status, body, inspects] of cases) {
+      const { handler, transport } = newDaemonHandler(beaconConfig);
+      const { res, recorder } = makeResponse();
+      await handler.handle(makeRequest(method, target), res);
+      if (recorder.statusCode !== status || (body !== "" && recorder.body !== body)) {
+        mismatches.push(`${name}: got ${recorder.statusCode} ${recorder.body}, want ${status} ${body}`);
+      }
+      const want = [...inspects];
+      if (status !== 403) want.push(`${method} ${target.split("?")[0]}`);
+      if (JSON.stringify(transport.requests) !== JSON.stringify(want)) {
+        mismatches.push(`${name}: daemon saw ${JSON.stringify(transport.requests)}, want ${JSON.stringify(want)}`);
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
+
+  // A daemon error other than 404 fails closed with its own message (#86).
+  it("fails closed when the daemon cannot resolve a container", async () => {
+    const { handler, transport } = newDaemonHandler(beaconConfig);
+    transport.status = 500;
+    const { res, recorder } = makeResponse();
+    await handler.handle(makeRequest("POST", `/containers/${beaconShort}/stop`), res);
+    assert.equal(recorder.statusCode, 403);
+    assert.equal(recorder.body, `cannot resolve container ${beaconShort}: daemon returned 500`);
+    assert.deepEqual(transport.requests, inspect(beaconShort));
+  });
+
+  // The resolved name is audited with the request (#86).
+  it("audits the resolved name", async () => {
+    const { handler, dir } = newDaemonHandler(beaconConfig);
+    await handler.handle(makeRequest("POST", `/containers/${beaconShort}/start`), makeResponse().res);
+    await handler.handle(makeRequest("POST", `/containers/${monShort}/start`), makeResponse().res);
+    const lines = readFileSync(join(dir, "audit.log"), "utf-8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as { decision: string; reason: string });
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0]!.decision, "ALLOW");
+    assert.equal(lines[0]!.reason, `container ${beaconShort} resolved to beacon`);
+    assert.equal(lines[1]!.decision, "DENY");
+    assert.equal(lines[1]!.reason, `container ${monShort} is not managed by any policy (resolved to dsp-monitoring)`);
+  });
+
+  // The #85 reproduction through the handler: two policies for one image
+  // force different users, and each create named for one of them gets that
+  // policy's user, every time.
+  it("applies the policy selected by the create name", async () => {
+    const { handler, transport } = newDaemonHandler({
+      "a.yaml":
+        'service_name: svc-a\ncontainer_names: [svc-a]\nallowed_image_prefixes: [alpine]\ncontainer_config: { user: "1111:1111" }\n',
+      "b.yaml":
+        'service_name: svc-b\ncontainer_names: [svc-b]\nallowed_image_prefixes: [alpine]\ncontainer_config: { user: "2222:2222" }\n',
+    });
+    const body = JSON.stringify({ Image: "alpine:3.20", Cmd: ["true"] });
+    for (let i = 0; i < 50; i++) {
+      for (const [name, user] of [
+        ["svc-a", "1111:1111"],
+        ["svc-b", "2222:2222"],
+      ] as const) {
+        transport.lastBody = undefined;
+        const { res, recorder } = makeResponse();
+        await handler.handle(makeRequest("POST", `/v1.45/containers/create?name=${name}`, body), res);
+        assert.equal(recorder.statusCode, 204, `iteration ${i} ${name}: ${recorder.body}`);
+        const fwd = JSON.parse(transport.lastBody!.toString("utf-8")) as { User?: string };
+        assert.equal(fwd.User, user, `iteration ${i}: create ?name=${name}`);
+      }
+    }
+    const { res, recorder } = makeResponse();
+    await handler.handle(makeRequest("POST", "/containers/create", JSON.stringify({ Image: "alpine:3.20" })), res);
+    assert.equal(recorder.statusCode, 403);
+    assert.equal(recorder.body, "image alpine:3.20 requires a container name");
   });
 });

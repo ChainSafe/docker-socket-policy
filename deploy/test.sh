@@ -7,7 +7,9 @@
 # the last two by starting real containers (#87); exec and attach are denied by the
 # router, protocol upgrades by the handler (#76), non-read methods on the read
 # endpoints by the router and CONNECT by the handler (#78), and every write on a
-# second proxy run with --readonly (#75).
+# second proxy run with --readonly (#75). Creates select their policy by
+# container name (#85), and lifecycle actions reach only covered containers
+# (#86).
 
 set -e
 
@@ -487,11 +489,13 @@ check_denied "POST /containers//start -> 403 (empty name, not a container)" "$S"
 
 # Dotted API-version prefix (#52). The Docker CLI versions every request
 # (/v1.45/containers/...). The proxy must strip the prefix and route the rest
-# like the unversioned path: a lifecycle call reaches the daemon (404, no such
-# container — not a proxy 403), and a reserved segment is still denied.
+# like the unversioned path: a lifecycle call reaches the lifecycle branch, and
+# a reserved segment is still denied. No policy covers no-such-container, so
+# the proxy asks the daemon (404) and denies it as unmanaged (#86); the
+# default deny would name the endpoint instead.
 # TypeScript only stripped undotted prefixes, so these fell to the default deny.
 S=$(post_empty "$PROXY/v1.45/containers/no-such-container/start")
-check "POST /v1.45/containers/*/start -> 404 (daemon answered, not proxy 403)" "404" "$S"
+check_denied "POST /v1.45/containers/*/start -> 403 (lifecycle branch, unmanaged)" "$S" "$BODY" 'container no-such-container is not managed by any policy'
 
 S=$(delete_status "$PROXY/v1.45/containers/json")
 check_denied "DELETE /v1.45/containers/json -> 403 (reserved survives version strip)" "$S" "$BODY" 'endpoint DELETE /containers/json is not allowed'
@@ -541,7 +545,7 @@ S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/c
 check_denied "POST /containers/create/extra -> 403 (not the create endpoint)" "$S" "$BODY" 'endpoint POST /containers/create/extra is not allowed'
 
 S=$(post_empty "$PROXY/containers/exec-nosuch/start")
-check "POST /containers/exec-nosuch/start -> 404 (daemon answered, not proxy 403)" "404" "$S"
+check_denied "POST /containers/exec-nosuch/start -> 403 (a name, not exec; unmanaged, #86)" "$S" "$BODY" 'container exec-nosuch is not managed by any policy'
 
 S=$(get_status "$PROXY/exec/0000000000000000000000000000000000000000000000000000000000000000/json")
 check_denied "GET /exec/*/json -> 403 (exec inspect denied)" "$S" "$BODY" 'exec is not allowed'
@@ -696,6 +700,106 @@ check_denied "create with an extra endpoint under network_mode host -> 403" "$S"
   'network "bridge" is not allowed for service net-host; policy forces network_mode host'
 # Without the deny the create succeeds; do not leave the container behind.
 delete_status "$PROXY/containers/net-host?force=true" >/dev/null
+
+# ─── Container names (#85) and lifecycle coverage (#86) ──────
+
+# deploy/config/dsp-it-a.yaml and dsp-it-b.yaml allow this test runner's own
+# image, which every run has locally, under container_names dsp-it-a and
+# dsp-it-b, and force different users. This runner's container is covered by
+# no policy: it stands for an operator container. Its hostname is its short ID.
+echo ""
+echo "--- Container names (#85) and lifecycle coverage (#86) ---"
+
+SELF=$(hostname)
+: >"$BODY"
+curl -s -o "$BODY" $TIMEOUT --unix-socket "$PROXY_SOCK" "$PROXY/containers/$SELF/json" 2>/dev/null || true
+SELF_ID=$(sed -n 's/.*"Id":"\([0-9a-f]\{64\}\)".*/\1/p' "$BODY")
+SELF_NAME=$(sed -n 's/.*"Name":"\/\([^"]*\)".*/\1/p' "$BODY")
+IT_IMAGE=$(sed -n 's/.*"Image":"\(docker-socket-policy-test-[a-z]*-test[^"]*\)".*/\1/p' "$BODY")
+if [ -z "$SELF_ID" ] || [ -z "$SELF_NAME" ] || [ -z "$IT_IMAGE" ]; then
+  echo "  FAIL: could not inspect the test container (id=$SELF_ID name=$SELF_NAME image=$IT_IMAGE)"
+  FAIL=$((FAIL+1))
+fi
+IT_BODY="{\"Image\":\"$IT_IMAGE\",\"Cmd\":[\"sleep\",\"300\"]}"
+
+# Leftovers from an interrupted run. Both names are covered, so this is allowed.
+delete_status "$PROXY/containers/dsp-it-a?force=1" >/dev/null
+delete_status "$PROXY/containers/dsp-it-b?force=1" >/dev/null
+
+# #85: both policies allow the image. Before #85 the one applied was whichever
+# came first in map order (Go, Rust) or load order (TypeScript), so one of the
+# two names got the other's user. Five rounds, each create inspected.
+OK_A=0
+OK_B=0
+i=0
+while [ $i -lt 5 ]; do
+  for n in a b; do
+    case "$n" in a) want='1111:1111' ;; b) want='2222:2222' ;; esac
+    S=$(post_json "$IT_BODY" "$PROXY/containers/create?name=dsp-it-$n")
+    : >"$BODY"
+    curl -s -o "$BODY" $TIMEOUT --unix-socket "$PROXY_SOCK" "$PROXY/containers/dsp-it-$n/json" 2>/dev/null || true
+    if [ "$S" = "201" ] && grep -qF "\"User\":\"$want\"" "$BODY"; then
+      case "$n" in a) OK_A=$((OK_A+1)) ;; b) OK_B=$((OK_B+1)) ;; esac
+    fi
+    delete_status "$PROXY/containers/dsp-it-$n?force=1" >/dev/null
+  done
+  i=$((i + 1))
+done
+check "create ?name=dsp-it-a x5 -> 201 with policy dsp-it-a's user every time (#85)" "5" "$OK_A"
+check "create ?name=dsp-it-b x5 -> 201 with policy dsp-it-b's user every time (#85)" "5" "$OK_B"
+
+# remove_if_created STATUS: a proxy without the fix creates these; remove the
+# container so it does not outlive the run (or block the next one).
+remove_if_created() {
+  if [ "$1" = "201" ]; then
+    id=$(sed -n 's/.*"Id":"\([0-9a-f]\{64\}\)".*/\1/p' "$BODY")
+    cp "$BODY" "$BODY.keep"
+    [ -n "$id" ] && delete_status "$PROXY/containers/$id?force=1" >/dev/null
+    mv "$BODY.keep" "$BODY"
+  fi
+}
+
+S=$(post_json "$IT_BODY" "$PROXY/containers/create?name=dsp-it-c")
+remove_if_created "$S"
+check_denied "create ?name=dsp-it-c -> 403 (no policy accepts the name, #85)" "$S" "$BODY" "container name dsp-it-c not allowed for image $IT_IMAGE by any policy"
+
+S=$(post_json "$IT_BODY" "$PROXY/containers/create")
+remove_if_created "$S"
+check_denied "create without ?name= -> 403 (both policies set container_names, #85)" "$S" "$BODY" "image $IT_IMAGE requires a container name"
+
+# #86: lifecycle actions and DELETE on a covered container, by name, full ID
+# and short ID, reach the daemon.
+S=$(post_json "$IT_BODY" "$PROXY/containers/create?name=dsp-it-a")
+IT_ID=$(sed -n 's/.*"Id":"\([0-9a-f]\{64\}\)".*/\1/p' "$BODY")
+check "create ?name=dsp-it-a -> 201" "201" "$S"
+IT_SHORT=$(echo "$IT_ID" | cut -c1-12)
+
+S=$(post_empty "$PROXY/containers/dsp-it-a/start")
+check "POST /containers/dsp-it-a/start -> 204 (covered name)" "204" "$S"
+
+S=$(post_empty "$PROXY/containers/$IT_ID/kill")
+check "POST /containers/<full ID of dsp-it-a>/kill -> 204 (resolved, covered)" "204" "$S"
+
+S=$(post_empty "$PROXY/v1.45/containers/$IT_SHORT/start")
+check "POST /v1.45/containers/<short ID of dsp-it-a>/start -> 204 (resolved, covered)" "204" "$S"
+
+S=$(delete_status "$PROXY/containers/$IT_SHORT?force=1")
+check "DELETE /containers/<short ID of dsp-it-a>?force=1 -> 204 (resolved, covered)" "204" "$S"
+
+# #86: this runner's container is covered by no policy. Before #86 each of
+# these reached the daemon: start answered 304 (already running) and DELETE
+# without force 409 (running). Nothing here can stop the runner.
+S=$(post_empty "$PROXY/containers/$SELF_NAME/start")
+check_denied "POST /containers/<runner name>/start -> 403 (uncovered, #86)" "$S" "$BODY" "container $SELF_NAME is not managed by any policy"
+
+S=$(post_empty "$PROXY/containers/$SELF_ID/start")
+check_denied "POST /containers/<runner full ID>/start -> 403 (uncovered, #86)" "$S" "$BODY" "container $SELF_ID is not managed by any policy"
+
+S=$(delete_status "$PROXY/v1.45/containers/$SELF")
+check_denied "DELETE /v1.45/containers/<runner short ID> -> 403 (uncovered, #86)" "$S" "$BODY" "container $SELF is not managed by any policy"
+
+S=$(delete_status "$PROXY/containers/no-such-container")
+check_denied "DELETE /containers/no-such-container -> 403 (daemon 404, #86)" "$S" "$BODY" 'container no-such-container is not managed by any policy'
 
 # ─── Read-only mode (#75) ────────────────────────────────
 
