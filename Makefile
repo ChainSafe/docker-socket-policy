@@ -114,6 +114,8 @@ test-spec:
 	$(QUINT) test $(ROUTER_SPEC) --main=pull_pre84
 	$(QUINT) test $(SPEC) --main=create
 	$(QUINT) test $(SPEC) --main=create_pre88
+	$(QUINT) test $(ROUTER_SPEC) --main=router_pre86
+	$(QUINT) test $(SPEC) --main=docker_socket_policy --max-samples=100
 
 verify-ts:
 	$(QUINT) run $(SPEC) --max-steps=50 --invariants allInvariants --backend typescript

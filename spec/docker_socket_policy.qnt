@@ -10,8 +10,12 @@ module policy {
     user: str
   }
 
+  // containerNames is the policy's container_names (#85). The empty set
+  // stands for "unset": an empty container_names list is a load error, so
+  // the two cannot be confused.
   type Policy = {
     serviceName: str,
+    containerNames: Set[str],
     allowedImagePrefixes: Set[str],
     imageTagPattern: str,
     imageDigestAllowed: bool,
@@ -28,6 +32,19 @@ module policy {
 
   pure def imageNameAllowed(name: str, policy: Policy): bool = {
     policy.allowedImagePrefixes.contains(name)
+  }
+
+  // A create named `name` may use the policy: a policy without
+  // container_names accepts any name, including none (#85).
+  pure def acceptsName(name: str, policy: Policy): bool = {
+    policy.containerNames.size() == 0 or policy.containerNames.contains(name)
+  }
+
+  // The policies a create of `image` named `name` could use. The proxy
+  // forwards a create only when this is exactly one policy, and applies that
+  // one (#85). Before #85 any policy that matched the image could be applied.
+  pure def selectPolicies(ps: Set[Policy], image: str, name: str): Set[Policy] = {
+    ps.filter(p => imageNameAllowed(image, p) and acceptsName(name, p))
   }
 
   pure def flagAllowed(flag: str, policy: Policy): bool = {
@@ -362,6 +379,7 @@ module create_model {
 
   pure val BEACON: Policy = {
     serviceName: "beacon",
+    containerNames: Set(),
     allowedImagePrefixes: Set("chainsafe/lodestar"),
     imageTagPattern: "",
     imageDigestAllowed: false,
@@ -383,6 +401,7 @@ module create_model {
   // No volumes and no container_config.
   pure val TOOLS: Policy = {
     serviceName: "tools",
+    containerNames: Set(),
     allowedImagePrefixes: Set("example/tools"),
     imageTagPattern: "",
     imageDigestAllowed: false,
@@ -649,6 +668,10 @@ module docker_socket_policy {
   val policies: Set[Policy] = Set(
     {
       serviceName: "beacon",
+      // The #88 create scenarios below are named for beacon too, so they
+      // reach the HostConfig checks rather than stopping at selection (#85).
+      containerNames: Set("beacon-0", "beacon-1", "beacon-2", "beacon-privileged", "beacon-jwt-ro",
+                          "mount-root", "jwt-rw", "cap-add", "pid-host", "lower-privileged"),
       allowedImagePrefixes: Set(
         "chainsafe/lodestar",
         "ethpandaops/lodestar"
@@ -676,6 +699,7 @@ module docker_socket_policy {
     },
     {
       serviceName: "validator",
+      containerNames: Set("validator-0", "validator-1", "validator-2"),
       allowedImagePrefixes: Set(
         "chainsafe/lodestar"
       ),
@@ -765,8 +789,12 @@ module docker_socket_policy {
     hc: CreateReq
   ): bool = {
     if (imageRef.kind == "valid") {
-      nondet matched = oneOf(policies.filter(p => imageNameAllowed(imageRef.imageName, p)))
+      // The one policy that matches the image and accepts the name (#85):
+      // zero or several candidates deny the create.
+      val candidates = selectPolicies(policies, imageRef.imageName, name)
+      nondet matched = oneOf(candidates)
       all {
+        candidates.size() == 1,
         flags.forall(f => flagAllowed(f, matched)),
         volumes.forall(v => volumeAllowed(v, matched)),
         envAllowed(envVars, matched),
@@ -1023,6 +1051,12 @@ module docker_socket_policy {
 
   val proxyLives = proxyRunning
 
+  // Every container was created under the one policy that matches its image
+  // and accepts its name (#85): selection is unique, never a choice.
+  val policySelectionUnique = containers.forall(c =>
+    selectPolicies(policies, c.imageRef.imageName, c.name).map(p => p.serviceName) == Set(c.serviceName)
+  )
+
   val volumesInWhitelist = containers.forall(c =>
     policies.exists(p =>
       p.serviceName == c.serviceName
@@ -1080,7 +1114,8 @@ module docker_socket_policy {
     envOnlyFromFile,
     proxyLives,
     hostConfigInAllowlist,
-    hostMountsInWhitelist
+    hostMountsInWhitelist,
+    policySelectionUnique
   }
 
   val allInvariants = allP0Invariants.and(all {
@@ -1090,6 +1125,49 @@ module docker_socket_policy {
   })
 
   // Attack scenarios are documented in spec/README.md.
+
+  // ─── Policy selection (#85) ──────────────────────────────────────────
+  //
+  // Beacon and validator run one image. Without container_names (the
+  // policies before #85) both match every lodestar create, and the proxy
+  // applied whichever it found first.
+  pure val PRE85_POLICIES: Set[Policy] = policies.map(p => { ...p, containerNames: Set() })
+
+  run pre85AmbiguousTest =
+    assert(and {
+      selectPolicies(PRE85_POLICIES, "chainsafe/lodestar", "validator-0").size() == 2,
+      selectPolicies(policies, "chainsafe/lodestar", "validator-0").map(p => p.serviceName) == Set("validator"),
+      selectPolicies(policies, "chainsafe/lodestar", "beacon-0").map(p => p.serviceName) == Set("beacon"),
+    })
+
+  // A create named for a policy gets that policy.
+  run createSelectsByNameTest =
+    init
+      .then(createContainer("validator-0",
+        { kind: "valid", imageName: "chainsafe/lodestar", tag: "validator", digest: "" },
+        Set("--dataDir"), Set("/home/validator"), Set(), NO_HOST_CONFIG))
+      .then(all {
+        assert(containers.map(c => c.serviceName) == Set("validator")),
+        assert(policySelectionUnique),
+        containers' = containers,
+        proxyRunning' = proxyRunning,
+      })
+
+  // A name no policy for the image accepts is denied, as is a create without
+  // a name ("") when every matching policy sets container_names.
+  run createUnknownNameDeniedTest =
+    init
+      .then(createContainer("monitoring",
+        { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
+        Set(), Set(), Set(), NO_HOST_CONFIG))
+      .fail()
+
+  run createNamelessDeniedTest =
+    init
+      .then(createContainer("",
+        { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
+        Set(), Set(), Set(), NO_HOST_CONFIG))
+      .fail()
 
   // P0 invariants must never fail under any sequence of actions.
   // P1 invariants should never fail under normal operation.
