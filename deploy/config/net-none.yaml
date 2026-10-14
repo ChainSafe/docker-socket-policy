@@ -1,0 +1,9 @@
+# Integration test policy for #87: a forced network_mode of none. The pause
+# image is small, so deploy/test.sh can pull, create and start a real
+# container through the proxy. The container is named after the service.
+service_name: net-none
+allowed_image_prefixes:
+  - registry.k8s.io/pause
+
+container_config:
+  network_mode: none

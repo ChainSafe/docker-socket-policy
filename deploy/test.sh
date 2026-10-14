@@ -2,8 +2,9 @@
 # Integration tests for docker-socket-policy.
 # Sends HTTP requests directly to the proxy's Docker API and checks status codes,
 # and the deny message on every expected proxy 403.
-# The proxy's RegistryGate, MountSourceGate, EnvFileGate, CmdGate, and
-# ContainerConfigMutator are all exercised; exec and attach are denied by the
+# The proxy's RegistryGate, MountSourceGate, EnvFileGate, CmdGate,
+# NetworkEndpointsGate and ContainerConfigMutator are all exercised, the last
+# two by starting real containers (#87); exec and attach are denied by the
 # router, protocol upgrades by the handler (#76), non-read methods on the read
 # endpoints by the router and CONNECT by the handler (#78), and every write on a
 # second proxy run with --readonly (#75).
@@ -529,6 +530,59 @@ check_denied "GET /x/../exec/*/json -> 403 (dot segment)" "$S" "$BODY" 'dot path
 
 S=$(dot_get "$PROXY/containers/./json")
 check_denied "GET /containers/./json -> 403 (dot segment)" "$S" "$BODY" 'dot path segment not allowed'
+
+# ─── Forced network_mode and NetworkingConfig (#87) ──────
+
+# A policy that forces network_mode must also make the endpoint entries match
+# it. Without --network the Docker CLI sends EndpointsConfig {"default": {}};
+# before #87 the proxy forwarded that as sent, the create succeeded, and the
+# start failed with "network default not found". These create and START real
+# containers through the proxy, as the CLI does, under the net-host (host) and
+# net-none (none) policies in deploy/config, then remove them.
+echo ""
+echo "--- Forced network_mode (#87) ---"
+
+# pull IMAGE TAG: pull through the proxy. The router reads the body (and the
+# query string, #83); the daemon reads the query string. A pull streams until
+# it completes, so it gets a longer timeout.
+pull() {
+  : >"$BODY"
+  out=$(curl -s -o "$BODY" -w '%{http_code}' --max-time 120 --connect-timeout 2 --unix-socket "$PROXY_SOCK" \
+    -X POST -H "Content-Type: application/json" -d "{\"fromImage\":\"$1:$2\"}" \
+    "$PROXY/images/create?fromImage=$1&tag=$2" 2>/dev/null || true)
+  echo "${out:-000}"
+}
+
+# start_forced NAME IMAGE MODE: create NAME as the CLI does, start it, and
+# remove it. A leftover from an earlier run is removed first.
+start_forced() {
+  delete_status "$PROXY/containers/$1?force=true" >/dev/null
+  S=$(post_json "{\"Image\":\"$2\",\"HostConfig\":{},\"NetworkingConfig\":{\"EndpointsConfig\":{\"default\":{}}}}" \
+    "$PROXY/containers/create?name=$1")
+  check "create $1 with EndpointsConfig {\"default\":{}} -> 201 (network_mode $3)" "201" "$S"
+  S=$(post_empty "$PROXY/containers/$1/start")
+  check "start $1 -> 204 (network_mode $3)" "204" "$S"
+  [ "$S" = "204" ] || echo "        start body: $(head -c 200 "$BODY")"
+  S=$(delete_status "$PROXY/containers/$1?force=true")
+  check "remove $1 -> 204" "204" "$S"
+}
+
+S=$(pull hello-world latest)
+check "pull hello-world (net-host policy) -> 200" "200" "$S"
+start_forced net-host hello-world:latest host
+
+S=$(pull registry.k8s.io/pause 3.10)
+check "pull registry.k8s.io/pause (net-none policy) -> 200" "200" "$S"
+start_forced net-none registry.k8s.io/pause:3.10 none
+
+# An extra endpoint entry would attach the container to a network the policy
+# does not allow, so it is denied, not dropped.
+S=$(post_json '{"Image":"hello-world:latest","NetworkingConfig":{"EndpointsConfig":{"default":{},"bridge":{}}}}' \
+  "$PROXY/containers/create?name=net-host")
+check_denied "create with an extra endpoint under network_mode host -> 403" "$S" "$BODY" \
+  'network "bridge" is not allowed for service net-host; policy forces network_mode host'
+# Without the deny the create succeeds; do not leave the container behind.
+delete_status "$PROXY/containers/net-host?force=true" >/dev/null
 
 # ─── Read-only mode (#75) ────────────────────────────────
 

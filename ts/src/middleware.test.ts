@@ -263,4 +263,79 @@ describe("Chain", () => {
     assert.ok(result.allowed);
     assert.ok(result.modifiedBody);
   });
+
+  // When the policy forces network_mode, the endpoint entries in
+  // NetworkingConfig.EndpointsConfig are made consistent with it (#87). Before
+  // #87 they went through as sent, so the Docker CLI's {"default": {}} made the
+  // start fail with "network default not found", and an extra entry attached
+  // the container to a network the policy does not allow. Rows mirror the runs
+  // in the network_endpoints module of spec/docker_socket_policy.qnt; mynet
+  // stands for a named network and container:beacon for container:x.
+  it("makes NetworkingConfig endpoints consistent with a forced network_mode", () => {
+    const aliases = { Aliases: ["a"] };
+    const ec = (entries: Record<string, unknown>) => ({ EndpointsConfig: entries });
+    const extra = (mode: string) =>
+      `network "other" is not allowed for service test-svc; policy forces network_mode ${mode}`;
+    const malformed = "NetworkingConfig.EndpointsConfig must be a JSON object; policy forces network_mode host";
+    const both = ec({ default: {}, other: {} });
+    // [row, forced mode ("" = none), NetworkingConfig sent (undefined = absent),
+    //  NetworkingConfig forwarded when allowed, deny reason when denied]
+    const cases: [string, string, unknown, unknown, string | undefined][] = [
+      ["hostNoEndpoints", "host", undefined, ec({}), undefined],
+      ["hostDefaultCleared", "host", ec({ default: {} }), ec({}), undefined],
+      ["hostOwnCleared", "host", ec({ host: aliases }), ec({}), undefined],
+      ["hostExtraDenied", "host", both, undefined, extra("host")],
+      ["noneNoEndpoints", "none", undefined, ec({}), undefined],
+      ["noneDefaultCleared", "none", ec({ default: {} }), ec({}), undefined],
+      ["noneOwnCleared", "none", ec({ none: aliases }), ec({}), undefined],
+      ["noneExtraDenied", "none", both, undefined, extra("none")],
+      ["containerNoEndpoints", "container:beacon", undefined, ec({}), undefined],
+      ["containerDefaultCleared", "container:beacon", ec({ default: {} }), ec({}), undefined],
+      ["containerOwnCleared", "container:beacon", ec({ "container:beacon": aliases }), ec({}), undefined],
+      ["containerExtraDenied", "container:beacon", both, undefined, extra("container:beacon")],
+      ["bridgeNoEndpoints", "bridge", undefined, ec({ bridge: {} }), undefined],
+      ["bridgeDefaultRekeyed", "bridge", ec({ default: aliases }), ec({ bridge: aliases }), undefined],
+      ["bridgeOwnKept", "bridge", ec({ bridge: aliases }), ec({ bridge: aliases }), undefined],
+      ["bridgeExtraDenied", "bridge", both, undefined, extra("bridge")],
+      ["namedNoEndpoints", "mynet", undefined, ec({ mynet: {} }), undefined],
+      ["namedDefaultRekeyed", "mynet", ec({ default: aliases }), ec({ mynet: aliases }), undefined],
+      ["namedOwnKept", "mynet", ec({ mynet: aliases }), ec({ mynet: aliases }), undefined],
+      ["namedExtraDenied", "mynet", both, undefined, extra("mynet")],
+      ["namedOwnOverDefault", "mynet", ec({ default: aliases, mynet: {} }), ec({ mynet: {} }), undefined],
+      // #87: a null NetworkingConfig or EndpointsConfig counts as absent.
+      ["#87 null NetworkingConfig", "host", null, ec({}), undefined],
+      ["#87 null EndpointsConfig", "bridge", { EndpointsConfig: null }, ec({ bridge: {} }), undefined],
+      // #87: a NetworkingConfig or EndpointsConfig that is not an object is denied.
+      ["#87 EndpointsConfig array", "host", { EndpointsConfig: [] }, undefined, malformed],
+      ["#87 NetworkingConfig string", "host", "default", undefined, malformed],
+      // #87 control: without a forced network_mode, NetworkingConfig is untouched.
+      ["#87 no forced mode", "", both, both, undefined],
+    ];
+    const mismatches: string[] = [];
+    for (const [row, mode, req, want, deny] of cases) {
+      const policy = makePolicy({
+        container_config: { network_mode: mode || undefined, restart_policy: "unless-stopped" },
+      });
+      const body: Record<string, unknown> = { Image: "nginx:latest" };
+      if (req !== undefined) body["NetworkingConfig"] = JSON.parse(JSON.stringify(req));
+      const result = new Chain().execute("POST", "/containers/create", policy, body);
+      if (deny !== undefined) {
+        if (result.allowed || !result.reason.includes(deny)) {
+          mismatches.push(`${row}: got allowed=${result.allowed} ${result.reason}, want deny ${deny}`);
+        }
+        continue;
+      }
+      if (!result.allowed) {
+        mismatches.push(`${row}: got deny ${result.reason}, want ${JSON.stringify(want)}`);
+        continue;
+      }
+      const out = JSON.parse(result.modifiedBody!.toString()) as Record<string, unknown>;
+      try {
+        assert.deepStrictEqual(out["NetworkingConfig"], want);
+      } catch {
+        mismatches.push(`${row}: got ${JSON.stringify(out["NetworkingConfig"])}, want ${JSON.stringify(want)}`);
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
 });

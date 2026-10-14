@@ -1,0 +1,9 @@
+# Integration test policy for #87: a forced network_mode of host. hello-world
+# is small and exits at once, so deploy/test.sh can pull, create and start a
+# real container through the proxy. The container is named after the service.
+service_name: net-host
+allowed_image_prefixes:
+  - hello-world
+
+container_config:
+  network_mode: host
