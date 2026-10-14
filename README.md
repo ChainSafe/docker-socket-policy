@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 114 unit + 72 integration + 15 socket | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 146 unit + 72 integration + 15 socket | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 165 unit (1 skipped) + 72 integration + 15 socket | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 118 unit + 77 integration + 15 socket | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 145 unit + 77 integration + 15 socket | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 169 unit (1 skipped) + 77 integration + 15 socket | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -193,7 +193,7 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 | Middleware | Type | What it checks |
 |------------|------|----------------|
 | ContainerConfigMutator | Mutator | Forces `network_mode`, `user`, `security_options`, `restart_policy` from policy, and makes `NetworkingConfig.EndpointsConfig` match a forced `network_mode` |
-| RegistryGate | Gate | Validates image ref against `allowed_image_prefixes` |
+| RegistryGate | Gate | Validates the normalised image ref against `allowed_image_prefixes`, then `image_tag_pattern` and `image_digest_allowed` |
 | MountSourceGate | Gate | Validates volume binds against whitelist |
 | EnvFileGate | Gate | Strips `Env` field from create body; env must come from locked `env_file` |
 | CmdGate | Gate | Validates each CLI flag in `Cmd` array against allowlist + denylist |
@@ -220,7 +220,7 @@ The chain runs only on container create. `--readonly` is not a gate: the router 
 | Any | `/exec/*` | **DENIED** |
 | Any | `/containers/{name}/attach…` (an `attach` segment anywhere under `/containers`) | **DENIED** |
 | POST | `/containers/{name}/rename\|update` | **DENIED** |
-| POST | `/images/create` | Validated by registry gate |
+| POST | `/images/create` | Pull: `fromImage` and `tag` from the query string get the image checks (see below); a request body or `fromSrc` (import) **DENIED** |
 | POST | `/auth` | **DENIED** |
 | POST | `/build` | **DENIED** |
 | POST | `/commit` | **DENIED** |
@@ -234,6 +234,10 @@ Exec is matched on whole path segments, so containers named like `exec-runner` w
 Attach is matched the same way: an `attach` segment under `/containers` is denied for every method, so `attach-runner` is an ordinary name, while a container literally named `attach` cannot be reached by name. Protocol upgrades are refused outright: any request with an `Upgrade` header, or a `Connection` header that lists `upgrade`, gets 403 `protocol upgrade not allowed` before it is routed, whatever its path ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)). Forwarding one would hand the caller a raw stream to the daemon. Every Docker endpoint that upgrades (attach, exec start, the build session) is denied anyway; the refusal keeps any path the router allows from becoming one.
 
 `/_ping`, `/version`, `/info` and `/events` are ordinary reads: `GET` and `HEAD` pass, and every other method is denied with `endpoint <METHOD> <path> is not allowed`, `OPTIONS` (a CORS preflight) included ([#78](https://github.com/ChainSafe/docker-socket-policy/issues/78)). `CONNECT` is refused with 403 `CONNECT is not allowed` before anything else, whatever its target or headers; the TypeScript proxy answers it on the raw socket, since Node never hands `CONNECT` to the request handler.
+
+An image pull is routed on its query string, as the Docker Engine API defines it and the Docker CLI sends it: `POST /images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.19` and no body ([#83](https://github.com/ChainSafe/docker-socket-policy/issues/83)). A pull with any body is denied (`image pull must not have a request body`), whatever its `Content-Type` or framing: the daemon reads a form body's `fromImage` over the query's, so a body could name an image the router never checked. The image gets the same checks as `Image` on create: its normalised repository must match a policy's prefix, then the tag must match that policy's `image_tag_pattern` and a digest needs `image_digest_allowed` (the CLI sends a digest in `tag`). The proxy denies a pull with no `fromImage` (`fromImage query parameter is required for image pull`), an import (`image import (fromSrc) is not allowed`: it would store any tarball under an allowed name), a tag in both `fromImage` and `tag`, a repeated `fromImage`, `tag` or `fromSrc`, a query the daemon would reject, and a pull with neither tag nor digest, which makes the daemon pull every tag of the repository (`image pull without a tag or digest pulls every tag and is not allowed`; `docker pull alpine` sends `tag=latest`, `docker pull --all-tags` is denied).
+
+Image references are normalised before policy matching, in all three implementations and for both the request and the policy's `allowed_image_prefixes` (at load time) ([#84](https://github.com/ChainSafe/docker-socket-policy/issues/84)). The reference is split the way Docker does: the digest follows `@`, the tag follows the last `:` after the last `/` (so `localhost:5000/team/app:1.2` has tag `1.2`), and the first component is a registry host when it contains `.` or `:` or is `localhost`. Docker Hub's `docker.io/`, `index.docker.io/` and `registry-1.docker.io/` are dropped, and so is `library/` before a single-component name, so `alpine`, `library/alpine` and `docker.io/library/alpine` are the same image, as are `chainsafe/lodestar` and `docker.io/chainsafe/lodestar`. The registry host is compared lower-cased; upper case in the repository path is invalid, as it is for Docker (`invalid image reference "…"`). The prefix match stays on whole path components: `alpine` does not match `alpine-evil`, and `alpine` (Docker Hub) does not match `localhost:5000/alpine`. A prefix that is not a valid repository name, or that carries a tag or digest, fails the policy load.
 
 ## Configuration
 
