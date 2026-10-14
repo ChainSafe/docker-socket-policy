@@ -112,6 +112,8 @@ test-spec:
 	$(QUINT) test $(ROUTER_SPEC) --main=pull_pre83
 	$(QUINT) test $(ROUTER_SPEC) --main=pull_body_ignored
 	$(QUINT) test $(ROUTER_SPEC) --main=pull_pre84
+	$(QUINT) test $(SPEC) --main=create
+	$(QUINT) test $(SPEC) --main=create_pre88
 
 verify-ts:
 	$(QUINT) run $(SPEC) --max-steps=50 --invariants allInvariants --backend typescript

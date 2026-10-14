@@ -17,6 +17,8 @@ module policy {
     imageDigestAllowed: bool,
     containerConfig: ContainerConfig,
     volumes: Set[str],
+    // The volumes with read_write: false (#88).
+    readOnlyVolumes: Set[str],
     envFile: str,
     privileged: bool,
     allowedCliFlags: Set[str],
@@ -181,10 +183,427 @@ module network_endpoints_pre87 {
     })
 }
 
+// ─── Module: create_model ───────────────────────────────────────────────
+//
+// The HostConfig check on POST /containers/create (#88): what of a create
+// request's HostConfig reaches the daemon. Mirrors ContainerConfigMutator,
+// MountSourceGate and HostConfigGate in go/internal/middleware,
+// rs/src/middleware.rs and ts/src/middleware.ts.
+//
+// A HostConfig field is a key, spelled as the caller spelled it, and an atom
+// standing for its value. "null" is an absent or null field, "zero" any other
+// zero value (false, 0, "", {}), and "[]" an empty list; every other atom is
+// a non-zero value. A list field holds one entry, the atom. The model's field
+// names stand for the classes in the README table: CapAdd, Devices and
+// GroupAdd for the fields that must be zero, FutureField for a field the
+// proxy does not know, CapDrop and MemorySwappiness for the fields that may
+// hold any value, PidMode and IpcMode for the namespace modes.
+//
+// The daemon matches field names without regard to case, and the last match
+// in the body wins. CASE_FOLD lists the variants in the model; the daemon
+// reads a variant under its canonical name, and when a name appears twice,
+// either value may be the one it keeps. The same holds inside
+// NetworkingConfig, whose only field is EndpointsConfig: a request's
+// `networking` entries are its NetworkingConfig keys, each with one network
+// name as value, and NetworkEndpointsGate (#87) reads the exact key only.
+//
+// LEGACY_CREATE = true models all three before #88: the only check was that
+// each Binds host path is a policy volume, skipped when the policy has no
+// volumes; Mounts, bind options and every other field went through; and the
+// mutator did not force Privileged when the policy has no container_config.
+// NetworkEndpointsGate (#87) is in both instances, as it is on main before
+// #88. false models all three after the fix.
+
+module create_model {
+  import policy.*
+
+  const LEGACY_CREATE: bool
+
+  type Field = { key: str, value: str }
+  // A HostConfig.Binds entry: host path and bind options.
+  type Bind = { source: str, opts: Set[str] }
+  // A HostConfig.Mounts entry. kind is its Type; propagation is
+  // BindOptions.Propagation.
+  type MountEntry = { kind: str, source: str, readOnly: bool, propagation: str }
+  type CreateReq = { entries: Set[Field], binds: Set[Bind], mounts: Set[MountEntry], networking: Set[Field] }
+  // A host path the daemon mounts into the container.
+  type HostMount = { source: str, writable: bool, privatePropagation: bool }
+
+  pure val ZERO_VALUES = Set("null", "zero", "[]")
+  pure def isZero(v: str): bool = ZERO_VALUES.contains(v)
+
+  pure val CASE_FOLD: str -> str = Map(
+    "privileged" -> "Privileged",
+    "securityopt" -> "SecurityOpt",
+    "networkmode" -> "NetworkMode",
+    "endpointsconfig" -> "EndpointsConfig",
+  )
+  pure def canon(k: str): str = if (CASE_FOLD.keys().contains(k)) CASE_FOLD.get(k) else k
+  pure def isVariant(k: str): bool = canon(k) != k
+
+  pure val ANY_VALUE = Set("NetworkMode", "CapDrop", "MemorySwappiness")
+  pure val MODES: str -> Set[str] = Map(
+    "PidMode" -> Set(),
+    "IpcMode" -> Set("private", "shareable", "none"),
+  )
+  pure val NULL_ONLY = Set("MaskedPaths")
+  pure val NO_NEW_PRIVILEGES = Set("no-new-privileges", "no-new-privileges:true")
+  // The value the mutator writes for SecurityOpt: the policy's list.
+  pure val POLICY_SECURITY_OPT = "policySecurityOptions"
+
+  pure val BIND_OPTS = Set("ro", "rw", "Z", "rprivate")
+  pure val PRIVATE_PROPAGATION = Set("", "private", "rprivate")
+  pure val SHARED_PROPAGATION = Set("shared", "rshared", "slave", "rslave")
+
+  // The value a field may hold when it reaches the daemon, under its
+  // canonical name.
+  pure def valueAllowed(p: Policy, k: str, v: str): bool =
+    if (NULL_ONLY.contains(k)) v == "null"
+    else if (isZero(v)) true
+    else if (ANY_VALUE.contains(k)) true
+    else if (MODES.keys().contains(k)) MODES.get(k).contains(v)
+    else if (k == "OomScoreAdj") v != "-1000"
+    else if (k == "SecurityOpt")
+      NO_NEW_PRIVILEGES.contains(v) or p.containerConfig.securityOptions.contains(v) or v == POLICY_SECURITY_OPT
+    else false
+
+  pure def hasContainerConfig(p: Policy): bool = or {
+    p.containerConfig.networkMode != "",
+    p.containerConfig.restartPolicy != "",
+    p.containerConfig.securityOptions.size() > 0,
+    p.containerConfig.user != "",
+  }
+
+  pure def forcesPrivileged(p: Policy): bool = not(LEGACY_CREATE) or hasContainerConfig(p)
+
+  // ContainerConfigMutator. It writes canonical names only.
+  pure def mutate(p: Policy, fs: Set[Field]): Set[Field] = {
+    val nm = p.containerConfig.networkMode
+    val forcesSecOpt = p.containerConfig.securityOptions.size() > 0
+    val kept = fs.filter(f => not(or {
+      f.key == "Privileged" and forcesPrivileged(p),
+      f.key == "NetworkMode" and nm != "",
+      f.key == "SecurityOpt" and forcesSecOpt,
+    }))
+    kept
+      .union(if (forcesPrivileged(p)) Set({ key: "Privileged", value: "zero" }) else Set())
+      .union(if (nm != "") Set({ key: "NetworkMode", value: nm }) else Set())
+      .union(if (forcesSecOpt) Set({ key: "SecurityOpt", value: POLICY_SECURITY_OPT }) else Set())
+  }
+
+  // HostConfigGate, on the mutated fields.
+  pure def fieldOk(p: Policy, f: Field): bool =
+    not(isVariant(f.key)) and valueAllowed(p, f.key, f.value)
+
+  // MountSourceGate on a Binds entry.
+  pure def bindOk(p: Policy, b: Bind): bool = and {
+    p.volumes.contains(b.source),
+    b.opts.subseteq(BIND_OPTS),
+    p.readOnlyVolumes.contains(b.source) implies (b.opts.contains("ro") and not(b.opts.contains("rw"))),
+  }
+
+  // MountSourceGate on a Mounts entry.
+  pure def mountOk(p: Policy, m: MountEntry): bool = or {
+    m.kind == "tmpfs" and m.source == "",
+    and {
+      m.kind == "bind",
+      p.volumes.contains(m.source),
+      p.readOnlyVolumes.contains(m.source) implies m.readOnly,
+      PRIVATE_PROPAGATION.contains(m.propagation),
+    },
+  }
+
+  // NetworkEndpointsGate (#87): when the policy forces network_mode, every
+  // network under the exact key EndpointsConfig is "default" or the mode.
+  pure def endpointsOk(p: Policy, r: CreateReq): bool = {
+    val nm = p.containerConfig.networkMode
+    nm == "" or r.networking.forall(f => f.key == "EndpointsConfig" implies Set("default", nm).contains(f.value))
+  }
+
+  pure def createAllowed(p: Policy, r: CreateReq): bool = and {
+    endpointsOk(p, r),
+    if (LEGACY_CREATE)
+      p.volumes.size() == 0 or r.binds.forall(b => p.volumes.contains(b.source))
+    else and {
+      mutate(p, r.entries).forall(f => fieldOk(p, f)),
+      r.networking.forall(f => not(isVariant(f.key))),
+      r.binds.forall(b => bindOk(p, b)),
+      r.mounts.forall(m => mountOk(p, m)),
+    },
+  }
+
+  // ─── What the daemon reads ──────────────────────────────────────────
+
+  pure def daemonFields(p: Policy, r: CreateReq): Set[Field] =
+    mutate(p, r.entries).map(f => { key: canon(f.key), value: f.value })
+
+  // The networks the daemon attaches: every EndpointsConfig entry, under any
+  // spelling of the key.
+  pure def daemonNetworks(r: CreateReq): Set[str] =
+    r.networking.filter(f => canon(f.key) == "EndpointsConfig").map(f => f.value)
+
+  pure def daemonPrivileged(p: Policy, r: CreateReq): bool =
+    daemonFields(p, r).exists(f => f.key == "Privileged" and not(isZero(f.value)))
+
+  // Every host path the daemon mounts. A volume mount stands for host
+  // storage named by its source; tmpfs mounts nothing from the host.
+  pure def daemonMounts(r: CreateReq): Set[HostMount] =
+    r.binds.map(b => {
+      source: b.source,
+      writable: not(b.opts.contains("ro")),
+      privatePropagation: b.opts.intersect(SHARED_PROPAGATION).size() == 0,
+    }).union(r.mounts.filter(m => m.kind != "tmpfs").map(m => {
+      source: m.source,
+      writable: not(m.readOnly),
+      privatePropagation: PRIVATE_PROPAGATION.contains(m.propagation),
+    }))
+
+  // ─── Universe ───────────────────────────────────────────────────────
+
+  pure val BEACON: Policy = {
+    serviceName: "beacon",
+    allowedImagePrefixes: Set("chainsafe/lodestar"),
+    imageTagPattern: "",
+    imageDigestAllowed: false,
+    containerConfig: {
+      networkMode: "host",
+      restartPolicy: "unless-stopped",
+      securityOptions: Set("no-new-privileges:true"),
+      user: "2001:2001",
+    },
+    volumes: Set("/home/beacon", "/etc/jwt_dir"),
+    readOnlyVolumes: Set("/etc/jwt_dir"),
+    envFile: "",
+    privileged: false,
+    allowedCliFlags: Set(),
+    flagRules: List(),
+    deniedFlags: Set(),
+  }
+
+  // No volumes and no container_config.
+  pure val TOOLS: Policy = {
+    serviceName: "tools",
+    allowedImagePrefixes: Set("example/tools"),
+    imageTagPattern: "",
+    imageDigestAllowed: false,
+    containerConfig: { networkMode: "", restartPolicy: "", securityOptions: Set(), user: "" },
+    volumes: Set(),
+    readOnlyVolumes: Set(),
+    envFile: "",
+    privileged: false,
+    allowedCliFlags: Set(),
+    flagRules: List(),
+    deniedFlags: Set(),
+  }
+
+  pure val MODEL_POLICIES = Set(BEACON, TOOLS)
+
+  pure val KEYS = Set(
+    "Privileged", "privileged", "SecurityOpt", "securityopt", "NetworkMode", "networkmode",
+    "CapAdd", "Devices", "GroupAdd", "FutureField", "MaskedPaths", "CapDrop",
+    "MemorySwappiness", "PidMode", "IpcMode", "OomScoreAdj",
+  )
+  pure val VALUES = Set(
+    "null", "zero", "[]", "true", "host", "private", "container:x", "SYS_ADMIN",
+    "-1000", "500", "no-new-privileges", "seccomp=unconfined", "bridge",
+  )
+  pure val SOURCES = Set("/home/beacon", "/etc/jwt_dir", "/")
+
+  pure def fieldsReq(fs: Set[Field]): CreateReq = { entries: fs, binds: Set(), mounts: Set(), networking: Set() }
+  pure def bindReq(source: str, opts: Set[str]): CreateReq =
+    { entries: Set(), binds: Set({ source: source, opts: opts }), mounts: Set(), networking: Set() }
+  pure def mountReq(kind: str, source: str, readOnly: bool, propagation: str): CreateReq =
+    { entries: Set(), binds: Set(), mounts: Set({ kind: kind, source: source, readOnly: readOnly, propagation: propagation }), networking: Set() }
+  pure def netReq(fs: Set[Field]): CreateReq = { entries: Set(), binds: Set(), mounts: Set(), networking: fs }
+
+  // Every single-field request, every single-bind request, every
+  // single-mount request, and every NetworkingConfig with the CLI's
+  // {"default"} plus one more entry, over the model's atoms.
+  pure val REQS: Set[CreateReq] =
+    tuples(KEYS, VALUES).map(((k, v)) => fieldsReq(Set({ key: k, value: v })))
+      .union(tuples(SOURCES, Set("ro", "rw", "rshared", "Z").powerset()).map(((s, o)) => bindReq(s, o)))
+      .union(tuples(Set("bind", "tmpfs", "volume"), SOURCES.union(Set("")), Set(true, false), Set("", "rprivate", "rshared"))
+        .map(((k, s, ro, prop)) => mountReq(k, s, ro, prop)))
+      .union(tuples(Set("EndpointsConfig", "endpointsconfig"), Set("default", "host", "evil-net"))
+        .map(((k, n)) => netReq(Set({ key: "EndpointsConfig", value: "default" }, { key: k, value: n })))
+      )
+
+  // ─── Properties ─────────────────────────────────────────────────────
+
+  // The rule: an allowed create has only fields spelled as the daemon names
+  // them, each with a value its rule allows, and only binds and mounts the
+  // policy allows. Close to a tautology on `create`, since createAllowed
+  // tests exactly this.
+  pure val createChecksEveryField: bool =
+    MODEL_POLICIES.forall(p => REQS.forall(r =>
+      createAllowed(p, r) implies and {
+        r.entries.forall(f => not(isVariant(f.key))),
+        r.networking.forall(f => not(isVariant(f.key))),
+        mutate(p, r.entries).forall(f => valueAllowed(p, f.key, f.value)),
+        r.binds.forall(b => bindOk(p, b)),
+        r.mounts.forall(m => mountOk(p, m)),
+      }
+    ))
+
+  // The security claim, on what the daemon reads: only allowlisted fields
+  // with allowed values, Privileged false, and every value the policy forces
+  // kept. It does not mention createAllowed's rules or LEGACY_CREATE, so
+  // that create_pre88 fails it.
+  pure val daemonSeesOnlyAllowlistedHostConfig: bool =
+    MODEL_POLICIES.forall(p => REQS.forall(r =>
+      createAllowed(p, r) implies daemonFields(p, r).forall(f => and {
+        valueAllowed(p, f.key, f.value),
+        f.key == "Privileged" implies isZero(f.value),
+        (f.key == "NetworkMode" and p.containerConfig.networkMode != "")
+          implies f.value == p.containerConfig.networkMode,
+        (f.key == "SecurityOpt" and p.containerConfig.securityOptions.size() > 0)
+          implies f.value == POLICY_SECURITY_OPT,
+      })
+    ))
+
+  // The security claim on mounts: every host path the daemon mounts is a
+  // policy volume, a read-only volume is never writable, and no mount
+  // propagates. With no volumes, nothing is mounted.
+  pure val daemonMountsOnlyWhitelisted: bool =
+    MODEL_POLICIES.forall(p => REQS.forall(r =>
+      createAllowed(p, r) implies daemonMounts(r).forall(m => and {
+        p.volumes.contains(m.source),
+        m.writable implies not(p.readOnlyVolumes.contains(m.source)),
+        m.privatePropagation,
+      })
+    ))
+
+  // The security claim on networks: when the policy forces network_mode,
+  // the daemon attaches no network but the mode (or the CLI's "default",
+  // which the mutator rewrites). #87 checked the exact key only.
+  pure val daemonAttachesOnlyForcedNetwork: bool =
+    MODEL_POLICIES.forall(p => REQS.forall(r =>
+      (createAllowed(p, r) and p.containerConfig.networkMode != "")
+        implies daemonNetworks(r).subseteq(Set("default", p.containerConfig.networkMode))
+    ))
+
+  pure def one(k: str, v: str): CreateReq = fieldsReq(Set({ key: k, value: v }))
+  pure def withVariantEndpoints(n: str): CreateReq =
+    netReq(Set({ key: "EndpointsConfig", value: "default" }, { key: "endpointsconfig", value: n }))
+  pure val NO_HOST_CONFIG: CreateReq = fieldsReq(Set())
+}
+
+// After #88, all three.
+module create {
+  import create_model(LEGACY_CREATE = false).*
+
+  // ─── Tests: one run per table row ───────────────────────────────────
+  //
+  // Rows shared with the language tables (same names), on `create` only:
+  // most deny rows are allowed on create_pre88.
+
+  run capAddDeniedTest = assert(not(createAllowed(BEACON, one("CapAdd", "SYS_ADMIN"))))
+  run devicesDeniedTest = assert(not(createAllowed(BEACON, one("Devices", "/dev/sda"))))
+  run groupAddDeniedTest = assert(not(createAllowed(BEACON, one("GroupAdd", "true"))))
+  run unknownFieldDeniedTest = assert(not(createAllowed(BEACON, one("FutureField", "true"))))
+  run maskedPathsEmptyDeniedTest = assert(not(createAllowed(BEACON, one("MaskedPaths", "[]"))))
+  run pidModeHostDeniedTest = assert(not(createAllowed(BEACON, one("PidMode", "host"))))
+  run pidModeContainerDeniedTest = assert(not(createAllowed(BEACON, one("PidMode", "container:x"))))
+  run ipcModeHostDeniedTest = assert(not(createAllowed(BEACON, one("IpcMode", "host"))))
+  run ipcModePrivateAllowedTest = assert(createAllowed(BEACON, one("IpcMode", "private")))
+  run oomScoreAdjNegativeDeniedTest = assert(not(createAllowed(BEACON, one("OomScoreAdj", "-1000"))))
+  run oomScoreAdjPositiveAllowedTest = assert(createAllowed(BEACON, one("OomScoreAdj", "500")))
+  run capDropAllowedTest = assert(createAllowed(BEACON, one("CapDrop", "SYS_ADMIN")))
+  run memorySwappinessAllowedTest = assert(createAllowed(BEACON, one("MemorySwappiness", "-1000")))
+  run networkModeAllowedTest = assert(createAllowed(TOOLS, one("NetworkMode", "bridge")))
+  run zeroValuesAllowedTest =
+    assert(createAllowed(BEACON, fieldsReq(Set(
+      { key: "CapAdd", value: "null" }, { key: "Devices", value: "[]" },
+      { key: "FutureField", value: "zero" }, { key: "MaskedPaths", value: "null" },
+      { key: "PidMode", value: "zero" }, { key: "Privileged", value: "zero" },
+    ))))
+  run securityOptSeccompUnconfinedDeniedTest =
+    assert(not(createAllowed(TOOLS, one("SecurityOpt", "seccomp=unconfined"))))
+  run securityOptNoNewPrivilegesAllowedTest =
+    assert(createAllowed(TOOLS, one("SecurityOpt", "no-new-privileges")))
+  run securityOptOverwrittenByPolicyTest =
+    assert(and {
+      createAllowed(BEACON, one("SecurityOpt", "seccomp=unconfined")),
+      daemonFields(BEACON, one("SecurityOpt", "seccomp=unconfined"))
+        == Set({ key: "SecurityOpt", value: POLICY_SECURITY_OPT }, { key: "Privileged", value: "zero" },
+               { key: "NetworkMode", value: "host" }),
+    })
+  run caseVariantPrivilegedDeniedTest = assert(not(createAllowed(BEACON, one("privileged", "true"))))
+  run caseVariantZeroSecurityOptDeniedTest = assert(not(createAllowed(BEACON, one("securityopt", "null"))))
+  run networkingConfigVariantDeniedTest = assert(not(createAllowed(BEACON, withVariantEndpoints("evil-net"))))
+  run networkingConfigVariantBareDeniedTest = assert(not(createAllowed(TOOLS, withVariantEndpoints("evil-net"))))
+  run privilegedNeutralisedTest =
+    assert(createAllowed(BEACON, one("Privileged", "true")) and not(daemonPrivileged(BEACON, one("Privileged", "true"))))
+  run privilegedNeutralisedEmptyContainerConfigTest =
+    assert(createAllowed(TOOLS, one("Privileged", "true")) and not(daemonPrivileged(TOOLS, one("Privileged", "true"))))
+  run mountBindRootDeniedTest = assert(not(createAllowed(BEACON, mountReq("bind", "/", false, ""))))
+  run mountBindAllowedTest = assert(createAllowed(BEACON, mountReq("bind", "/home/beacon", false, "")))
+  run mountBindReadOnlyVolumeWritableDeniedTest =
+    assert(not(createAllowed(BEACON, mountReq("bind", "/etc/jwt_dir", false, ""))))
+  run mountBindReadOnlyVolumeReadOnlyAllowedTest =
+    assert(createAllowed(BEACON, mountReq("bind", "/etc/jwt_dir", true, "")))
+  run mountVolumeTypeDeniedTest = assert(not(createAllowed(BEACON, mountReq("volume", "/home/beacon", false, ""))))
+  run mountTmpfsAllowedTest = assert(createAllowed(BEACON, mountReq("tmpfs", "", false, "")))
+  run mountTmpfsWithSourceDeniedTest = assert(not(createAllowed(BEACON, mountReq("tmpfs", "/", false, ""))))
+  run mountPropagationRsharedDeniedTest =
+    assert(not(createAllowed(BEACON, mountReq("bind", "/home/beacon", false, "rshared"))))
+  run mountPropagationRprivateAllowedTest =
+    assert(createAllowed(BEACON, mountReq("bind", "/home/beacon", false, "rprivate")))
+  run mountNoVolumesDeniedTest = assert(not(createAllowed(TOOLS, mountReq("bind", "/home/beacon", false, ""))))
+  run bindAllowedTest = assert(createAllowed(BEACON, bindReq("/home/beacon", Set())))
+  run bindReadOnlyVolumeRwDeniedTest = assert(not(createAllowed(BEACON, bindReq("/etc/jwt_dir", Set("rw")))))
+  run bindReadOnlyVolumeNoModeDeniedTest = assert(not(createAllowed(BEACON, bindReq("/etc/jwt_dir", Set()))))
+  run bindReadOnlyVolumeRoAllowedTest = assert(createAllowed(BEACON, bindReq("/etc/jwt_dir", Set("ro"))))
+  run bindReadOnlyVolumeRoZAllowedTest = assert(createAllowed(BEACON, bindReq("/etc/jwt_dir", Set("ro", "Z"))))
+  run bindReadOnlyVolumeRoRwDeniedTest = assert(not(createAllowed(BEACON, bindReq("/etc/jwt_dir", Set("ro", "rw")))))
+  run bindRsharedDeniedTest = assert(not(createAllowed(BEACON, bindReq("/home/beacon", Set("rshared")))))
+  run bindUnlistedDeniedTest = assert(not(createAllowed(BEACON, bindReq("/", Set("ro")))))
+  run bindNoVolumesDeniedTest = assert(not(createAllowed(TOOLS, bindReq("/home/beacon", Set()))))
+
+  run createSoundTest =
+    assert(and {
+      createChecksEveryField,
+      daemonSeesOnlyAllowlistedHostConfig,
+      daemonMountsOnlyWhitelisted,
+      daemonAttachesOnlyForcedNetwork,
+    })
+}
+
+// All three before #88: only the Binds host paths were checked, and not at
+// all for a policy with no volumes; the mutator did not force Privileged
+// without a container_config.
+module create_pre88 {
+  import create_model(LEGACY_CREATE = true).*
+
+  run pre88UnsoundTest =
+    assert(and {
+      not(daemonSeesOnlyAllowlistedHostConfig),
+      not(daemonMountsOnlyWhitelisted),
+      // The reproductions in #88.
+      createAllowed(BEACON, mountReq("bind", "/", false, "")),
+      createAllowed(BEACON, bindReq("/etc/jwt_dir", Set("rw"))),
+      createAllowed(BEACON, bindReq("/etc/jwt_dir", Set())),
+      createAllowed(BEACON, one("CapAdd", "SYS_ADMIN")),
+      createAllowed(BEACON, one("PidMode", "host")),
+      // A policy with no volumes let any bind through.
+      createAllowed(TOOLS, bindReq("/", Set())),
+      // Without a container_config, Privileged reached the daemon.
+      createAllowed(TOOLS, one("Privileged", "true")) and daemonPrivileged(TOOLS, one("Privileged", "true")),
+      // A zero-valued case variant cleared a forced field.
+      createAllowed(BEACON, one("securityopt", "null")),
+      // NetworkEndpointsGate (#87) read only the exact key, so a variant
+      // attached another network.
+      not(daemonAttachesOnlyForcedNetwork),
+      createAllowed(BEACON, withVariantEndpoints("evil-net")),
+    })
+}
+
 // ─── Module: docker_socket_policy ───────────────────────────────────────
 
 module docker_socket_policy {
   import policy.*
+  // The create check after #88: createAllowed, daemonFields, daemonMounts.
+  import create_model(LEGACY_CREATE = false).*
 
   // ─── Image Reference Types ──────────────────────────────────────────
   //
@@ -215,21 +634,14 @@ module docker_socket_policy {
     volumes: Set[str],
     envVars: Set[str],
     flags: Set[str],
-    networkMode: str
+    networkMode: str,
+    // The HostConfig fields and host mounts the daemon read (#88).
+    hostConfig: Set[Field],
+    hostMounts: Set[HostMount]
   }
 
   pure def setState(c: Container, s: ContainerState): Container = {
-    {
-      name: c.name,
-      serviceName: c.serviceName,
-      imageRef: c.imageRef,
-      state: s,
-      privileged: c.privileged,
-      volumes: c.volumes,
-      envVars: c.envVars,
-      flags: c.flags,
-      networkMode: c.networkMode
-    }
+    { ...c, state: s }
   }
 
   // ─── Policy Constants ─────────────────────────────────────────────────
@@ -250,6 +662,7 @@ module docker_socket_policy {
         user: "2001:2001"
       },
       volumes: Set("/home/beacon", "/etc/jwt_dir"),
+      readOnlyVolumes: Set("/etc/jwt_dir"),
       envFile: "/etc/docker/env/beacon.env",
       privileged: false,
       allowedCliFlags: Set("--rcConfig", "--logLevel", "--dataDir", "--network"),
@@ -275,6 +688,7 @@ module docker_socket_policy {
         user: "2002:2002"
       },
       volumes: Set("/home/validator"),
+      readOnlyVolumes: Set(),
       envFile: "/etc/docker/env/validator.env",
       privileged: false,
       allowedCliFlags: Set("--rcConfig", "--logLevel", "--dataDir", "--network"),
@@ -284,7 +698,9 @@ module docker_socket_policy {
       deniedFlags: Set("--privileged", "--volume", "--mount",
                        "--cap-add", "--cap-drop", "--device",
                        "--security-opt", "--user", "--network")
-    }
+    },
+    // No volumes and no container_config (#88).
+    TOOLS
   )
 
   // ─── State Variables ──────────────────────────────────────────────────
@@ -346,7 +762,7 @@ module docker_socket_policy {
   action createContainer(
     name: str, imageRef: ImageRef, flags: Set[str],
     volumes: Set[str], envVars: Set[str],
-    privileged: bool
+    hc: CreateReq
   ): bool = {
     if (imageRef.kind == "valid") {
       nondet matched = oneOf(policies.filter(p => imageNameAllowed(imageRef.imageName, p)))
@@ -354,7 +770,8 @@ module docker_socket_policy {
         flags.forall(f => flagAllowed(f, matched)),
         volumes.forall(v => volumeAllowed(v, matched)),
         envAllowed(envVars, matched),
-        not(privileged) and not(matched.privileged),
+        not(matched.privileged),
+        createAllowed(matched, hc),
 
         containers' = containers.union(
           Set({
@@ -362,11 +779,13 @@ module docker_socket_policy {
             serviceName: matched.serviceName,
             imageRef: imageRef,
             state: Running,
-            privileged: false,
+            privileged: daemonPrivileged(matched, hc),
             volumes: volumes.intersect(matched.volumes),
             envVars: if (matched.envFile != "") Set() else envVars,
             flags: flags.intersect(matched.allowedCliFlags),
-            networkMode: matched.containerConfig.networkMode
+            networkMode: matched.containerConfig.networkMode,
+            hostConfig: daemonFields(matched, hc),
+            hostMounts: daemonMounts(hc)
           })
         ),
         proxyRunning' = proxyRunning
@@ -471,34 +890,63 @@ module docker_socket_policy {
     createContainer("beacon-0",
       { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
       Set("--rcConfig", "--dataDir"),
-      Set("/home/beacon"), Set(), false),
+      Set("/home/beacon"), Set(), NO_HOST_CONFIG),
     createContainer("beacon-1",
       { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
       Set("--rcConfig", "--logLevel"),
-      Set("/home/beacon"), Set(), false),
+      Set("/home/beacon"), Set(), NO_HOST_CONFIG),
     createContainer("beacon-2",
       { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
       Set("--network", "--rcConfig"),
-      Set("/home/beacon"), Set(), false),
+      Set("/home/beacon"), Set(), NO_HOST_CONFIG),
     createContainer("validator-0",
       { kind: "valid", imageName: "chainsafe/lodestar", tag: "validator", digest: "" },
       Set("--dataDir", "/data/validator"),
-      Set("/home/validator"), Set(), false),
+      Set("/home/validator"), Set(), NO_HOST_CONFIG),
     createContainer("validator-1",
       { kind: "valid", imageName: "chainsafe/lodestar", tag: "validator", digest: "" },
       Set("--dataDir", "/data/validator"),
-      Set("/home/validator"), Set(), false),
+      Set("/home/validator"), Set(), NO_HOST_CONFIG),
     createContainer("validator-2",
       { kind: "valid", imageName: "chainsafe/lodestar", tag: "validator", digest: "" },
       Set("--dataDir", "/data/validator"),
-      Set("/home/validator"), Set(), false),
+      Set("/home/validator"), Set(), NO_HOST_CONFIG),
     // --- Rejected create attempts (always fail, test coverage) ---
     createContainer("evil",
       { kind: "invalidTag", imageName: "attacker/malware", tag: "latest", digest: "" },
-      Set("--privileged"), Set(), Set(), true),
+      Set("--privileged"), Set(), Set(), one("Privileged", "true")),
     createContainer("bad-digest",
       { kind: "invalidDigest", imageName: "", tag: "", digest: "sha256:badbadbad" },
-      Set(), Set(), Set(), false),
+      Set(), Set(), Set(), NO_HOST_CONFIG),
+    // --- HostConfig (#88): allowed, with Privileged neutralised ---
+    createContainer("beacon-privileged",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
+      Set("--rcConfig"), Set("/home/beacon"), Set(), one("Privileged", "true")),
+    createContainer("tools-privileged",
+      { kind: "valid", imageName: "example/tools", tag: "latest", digest: "" },
+      Set(), Set(), Set(), one("Privileged", "true")),
+    createContainer("beacon-jwt-ro",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
+      Set("--rcConfig"), Set("/home/beacon"), Set(), bindReq("/etc/jwt_dir", Set("ro"))),
+    // --- HostConfig (#88): rejected ---
+    createContainer("mount-root",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
+      Set("--rcConfig"), Set("/home/beacon"), Set(), mountReq("bind", "/", false, "")),
+    createContainer("jwt-rw",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
+      Set("--rcConfig"), Set("/home/beacon"), Set(), bindReq("/etc/jwt_dir", Set("rw"))),
+    createContainer("cap-add",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
+      Set("--rcConfig"), Set("/home/beacon"), Set(), one("CapAdd", "SYS_ADMIN")),
+    createContainer("pid-host",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
+      Set("--rcConfig"), Set("/home/beacon"), Set(), one("PidMode", "host")),
+    createContainer("lower-privileged",
+      { kind: "valid", imageName: "chainsafe/lodestar", tag: "beacon", digest: "" },
+      Set("--rcConfig"), Set("/home/beacon"), Set(), one("privileged", "true")),
+    createContainer("tools-bind",
+      { kind: "valid", imageName: "example/tools", tag: "latest", digest: "" },
+      Set(), Set(), Set(), bindReq("/home/beacon", Set())),
     // --- Lifecycle actions (conditional on container existence) ---
     startContainer("beacon-0"),
     stopContainer("beacon-0"),
@@ -521,6 +969,28 @@ module docker_socket_policy {
   // P1 — should never fail under normal operation.
 
   val noPrivilegedAccess = containers.forall(c => not(c.privileged))
+
+  // Every HostConfig field the daemon read is one the policy allows, with an
+  // allowed value (#88).
+  val hostConfigInAllowlist = containers.forall(c =>
+    policies.exists(p =>
+      p.serviceName == c.serviceName
+        and c.hostConfig.forall(f => valueAllowed(p, f.key, f.value))
+    )
+  )
+
+  // Every host path the daemon mounted is a policy volume, never writable
+  // when the volume is read-only, and never propagating (#88).
+  val hostMountsInWhitelist = containers.forall(c =>
+    policies.exists(p =>
+      p.serviceName == c.serviceName
+        and c.hostMounts.forall(m => and {
+          p.volumes.contains(m.source),
+          m.writable implies not(p.readOnlyVolumes.contains(m.source)),
+          m.privatePropagation,
+        })
+    )
+  )
 
   // Every container's network mode is exactly what its matched policy
   // configures — the caller cannot override it via the create request.
@@ -608,7 +1078,9 @@ module docker_socket_policy {
     imagesAlwaysAllowed,
     validImagesOnly,
     envOnlyFromFile,
-    proxyLives
+    proxyLives,
+    hostConfigInAllowlist,
+    hostMountsInWhitelist
   }
 
   val allInvariants = allP0Invariants.and(all {

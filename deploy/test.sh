@@ -2,9 +2,9 @@
 # Integration tests for docker-socket-policy.
 # Sends HTTP requests directly to the proxy's Docker API and checks status codes,
 # and the deny message on every expected proxy 403.
-# The proxy's RegistryGate, MountSourceGate, EnvFileGate, CmdGate,
-# NetworkEndpointsGate and ContainerConfigMutator are all exercised, the last
-# two by starting real containers (#87); exec and attach are denied by the
+# The proxy's RegistryGate, MountSourceGate, EnvFileGate, HostConfigGate (#88),
+# CmdGate, NetworkEndpointsGate and ContainerConfigMutator are all exercised,
+# the last two by starting real containers (#87); exec and attach are denied by the
 # router, protocol upgrades by the handler (#76), non-read methods on the read
 # endpoints by the router and CONNECT by the handler (#78), and every write on a
 # second proxy run with --readonly (#75).
@@ -271,6 +271,93 @@ fi
 
 S=$(post_json '{"Image":"chainsafe/lodestar:beacon","HostConfig":{"Binds":["/tmp:/tmp"]},"Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/containers/create")
 check_denied "create with unlisted volume -> 403" "$S" "$BODY" 'volume mount "/tmp" is not in the whitelist'
+
+# ─── HostConfig default-deny (#88) ───────────────────────
+
+# Before #88 only the host path of HostConfig.Binds was checked, so each of
+# these reached the daemon unchanged. /etc/jwt_dir is read_write: false in
+# deploy/config/beacon.yaml. The allowed creates reach the daemon, which
+# answers 404 (image not present) or 201: anything but a proxy 403.
+echo ""
+echo "--- HostConfig default-deny ---"
+
+# check_not_denied DESC ACTUAL_STATUS [ALSO_OK]
+# ALSO_OK is one more daemon status to accept: a Mounts bind whose source is
+# missing on the daemon's host gets 400 from the daemon, not from the proxy.
+check_not_denied() {
+  if [ "$2" = "201" ] || [ "$2" = "404" ] || { [ -n "${3:-}" ] && [ "$2" = "$3" ]; }; then
+    echo "  PASS: $1 -> $2 (not 403)"
+    PASS=$((PASS+1))
+  else
+    echo "  FAIL: $1 (expected 201|404, got $2: $(head -c 200 "$BODY"))"
+    FAIL=$((FAIL+1))
+  fi
+}
+
+# create_hc HOSTCONFIG_JSON: a create for the beacon policy with this HostConfig.
+create_hc() {
+  post_json "{\"Image\":\"chainsafe/lodestar:beacon\",\"Cmd\":[\"--rcConfig\",\"/data/config.yml\"],\"HostConfig\":$1}" "$PROXY/containers/create"
+}
+
+S=$(create_hc '{"Mounts":[{"Type":"bind","Source":"/","Target":"/host"}]}')
+check_denied "create with Mounts bind of / -> 403" "$S" "$BODY" 'mount source "/" is not in the whitelist'
+
+S=$(create_hc '{"Mounts":[{"Type":"volume","Source":"dsp-test","Target":"/v"}]}')
+check_denied "create with a volume-type mount -> 403" "$S" "$BODY" 'mount type "volume" is not allowed'
+
+S=$(create_hc '{"Mounts":[{"Type":"bind","Source":"/etc/jwt_dir","Target":"/jwtdir"}]}')
+check_denied "create with read-only volume in Mounts without ReadOnly -> 403" "$S" "$BODY" 'mount of "/etc/jwt_dir" must be read-only'
+
+S=$(create_hc '{"Mounts":[{"Type":"bind","Source":"/etc/jwt_dir","Target":"/jwtdir","ReadOnly":true}]}')
+check_not_denied "create with read-only volume in Mounts, ReadOnly: true" "$S" 400
+
+S=$(create_hc '{"Binds":["/etc/jwt_dir:/jwtdir:rw"]}')
+check_denied "create with read-only volume bound :rw -> 403" "$S" "$BODY" 'volume mount "/etc/jwt_dir" must be read-only (:ro)'
+
+S=$(create_hc '{"Binds":["/etc/jwt_dir:/jwtdir"]}')
+check_denied "create with read-only volume bound with no mode -> 403" "$S" "$BODY" 'volume mount "/etc/jwt_dir" must be read-only (:ro)'
+
+S=$(create_hc '{"Binds":["/etc/jwt_dir:/jwtdir:ro"]}')
+check_not_denied "create with read-only volume bound :ro" "$S"
+
+S=$(create_hc '{"Binds":["/home/beacon:/data:rshared"]}')
+check_denied "create with an rshared bind -> 403" "$S" "$BODY" 'bind option "rshared" on volume mount "/home/beacon" is not allowed'
+
+S=$(create_hc '{"CapAdd":["SYS_ADMIN"]}')
+check_denied "create with CapAdd -> 403" "$S" "$BODY" 'HostConfig.CapAdd is not allowed for service beacon'
+
+S=$(create_hc '{"PidMode":"host"}')
+check_denied "create with PidMode host -> 403" "$S" "$BODY" 'HostConfig.PidMode value "host" is not allowed'
+
+S=$(create_hc '{"Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/x","CgroupPermissions":"rwm"}]}')
+check_denied "create with Devices -> 403" "$S" "$BODY" 'HostConfig.Devices is not allowed'
+
+S=$(create_hc '{"GroupAdd":["0"]}')
+check_denied "create with GroupAdd -> 403" "$S" "$BODY" 'HostConfig.GroupAdd is not allowed'
+
+S=$(create_hc '{"MaskedPaths":[]}')
+check_denied "create with MaskedPaths [] -> 403" "$S" "$BODY" 'HostConfig.MaskedPaths is not allowed'
+
+# The daemon matches field names without regard to case, so this would set
+# Privileged after the mutator's "Privileged": false.
+S=$(create_hc '{"privileged":true}')
+check_denied "create with lower-case privileged -> 403" "$S" "$BODY" 'HostConfig.privileged is not allowed'
+
+# At the top level: the router picks the policy and RegistryGate checks the
+# image from "Image", but the daemon would run the one under "image".
+S=$(post_json '{"Image":"chainsafe/lodestar:beacon","image":"alpine:latest","Cmd":["--rcConfig","/data/config.yml"]}' "$PROXY/containers/create")
+check_denied "create with an extra lower-case image -> 403" "$S" "$BODY" 'image is not allowed for service beacon (the daemon reads it as Image)'
+
+# The same inside NetworkingConfig: NetworkEndpointsGate (#87) reads only
+# EndpointsConfig, and the daemon would attach the network under
+# endpointsconfig as well.
+S=$(post_json '{"Image":"chainsafe/lodestar:beacon","Cmd":["--rcConfig","/data/config.yml"],"NetworkingConfig":{"EndpointsConfig":{"default":{}},"endpointsconfig":{"evil-net":{}}}}' "$PROXY/containers/create")
+check_denied "create with lower-case endpointsconfig -> 403" "$S" "$BODY" 'NetworkingConfig.endpointsconfig is not allowed'
+
+# The body Docker CLI 29 sends for `docker create <image> <cmd>`, sent on API
+# v1.45 like the rest of the suite: the CI runner's daemon is older than CLI 29.
+S=$(post_json '{"Hostname":"","Domainname":"","User":"","AttachStdin":false,"AttachStdout":true,"AttachStderr":true,"Tty":false,"OpenStdin":false,"StdinOnce":false,"Env":null,"Cmd":["--rcConfig","/data/config.yml"],"Image":"chainsafe/lodestar:beacon","Volumes":{},"WorkingDir":"","Entrypoint":null,"Labels":{},"HostConfig":{"Binds":null,"ContainerIDFile":"","LogConfig":{"Type":"","Config":{}},"NetworkMode":"default","PortBindings":{},"RestartPolicy":{"Name":"no","MaximumRetryCount":0},"AutoRemove":false,"VolumeDriver":"","VolumesFrom":null,"ConsoleSize":[0,0],"CapAdd":null,"CapDrop":null,"CgroupnsMode":"","Dns":null,"DnsOptions":[],"DnsSearch":[],"ExtraHosts":null,"GroupAdd":null,"IpcMode":"","Cgroup":"","Links":null,"OomScoreAdj":0,"PidMode":"","Privileged":false,"PublishAllPorts":false,"ReadonlyRootfs":false,"SecurityOpt":null,"UTSMode":"","UsernsMode":"","ShmSize":0,"Isolation":"","CpuShares":0,"Memory":0,"NanoCpus":0,"CgroupParent":"","BlkioWeight":0,"BlkioWeightDevice":[],"BlkioDeviceReadBps":[],"BlkioDeviceWriteBps":[],"BlkioDeviceReadIOps":[],"BlkioDeviceWriteIOps":[],"CpuPeriod":0,"CpuQuota":0,"CpuRealtimePeriod":0,"CpuRealtimeRuntime":0,"CpusetCpus":"","CpusetMems":"","Devices":[],"DeviceCgroupRules":null,"DeviceRequests":null,"MemoryReservation":0,"MemorySwap":0,"MemorySwappiness":-1,"OomKillDisable":false,"PidsLimit":0,"Ulimits":null,"CpuCount":0,"CpuPercent":0,"IOMaximumIOps":0,"IOMaximumBandwidth":0,"MaskedPaths":null,"ReadonlyPaths":null},"NetworkingConfig":{"EndpointsConfig":{"default":{}}}}' "$PROXY/v1.45/containers/create")
+check_not_denied "create with the Docker CLI 29 default body" "$S"
 
 # ─── Inline env vars (env_file is set in policy) ─────────
 
