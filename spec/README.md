@@ -6,7 +6,7 @@ This directory contains a [Quint](https://quint-lang.org/) formal specification 
 
 | File | Purpose |
 |------|---------|
-| `docker_socket_policy.qnt` | Request-handling spec: policy types, state machine, endpoint routing table, 9 invariants (6 P0 / 3 P1), 6 attack scenario simulations. Module `network_endpoints_model` models `NetworkingConfig.EndpointsConfig` under a forced `network_mode` (#87), one `run` test per table row, instances `network_endpoints` (all three after #87) and `network_endpoints_pre87` |
+| `docker_socket_policy.qnt` | Request-handling spec: policy types, state machine, endpoint routing table, 11 invariants (8 P0 / 3 P1), 6 attack scenario simulations. Module `network_endpoints_model` models `NetworkingConfig.EndpointsConfig` under a forced `network_mode` (#87), one `run` test per table row, instances `network_endpoints` (all three after #87) and `network_endpoints_pre87`. Also the create check on `HostConfig` (module `create_model`, #88): the default-deny field rules, `Mounts`, bind options, read-only volumes and case-insensitive field names, with one `run` test per table row. Instances `create` (all three after #88) and `create_pre88` (all three before #88); the state machine uses the `create` rules |
 | `listener.qnt` | Listening-socket startup: flag/group selection, existing-path checks, single-instance lock, 6 invariants, one `run` test per design-table row. Instances `listener_locked` (Go, Rust) and `listener_unlocked` (TypeScript) |
 | `listener-design.md` | Design of the listening socket (dockerd parity) that `listener.qnt` models |
 | `router.qnt` | The percent-encoded path deny, the empty interior segment deny, the dot segment deny, the segment-exact exec deny and `POST /containers/create` route, the segment-exact attach deny, the GET/HEAD-only read passthrough with `/_ping` standing for the read endpoints, container-name extraction and the container-lifecycle branch of the router only, not the full router. The daemon's percent-decoding as a fixed table. One `run` test per table row. Instances `router` (Go, TypeScript, and Rust after #48, #53, #49, #55, #76, #78 and #70), `router_pre48` (Rust's extraction rule before #48), `router_pre53` (Rust and TypeScript before #53, routing on the raw path), `router_pre55` (all three before #55, letting empty interior segments through), `router_readonly` (as `router`, with `--readonly`, #75), `router_pre76` (all three before #76, letting attach through), `router_pre78` (all three before #78, allowing the read endpoints for every method) and `router_pre70` (all three before #70, letting `.` and `..` segments through). Every instance includes the #49 exec and create rule, so the pre instances isolate one earlier rule each rather than being full snapshots. Module `pull_model` models the `POST /images/create` branch: which of the body and the query names the image, and image-name normalisation as a fixed table. Instances `pull` (all three after #83 and #84), `pull_pre83` (all three before #83, reading `fromImage` from the body), `pull_body_ignored` (the first #83 fix, which forwarded a pull's body) and `pull_pre84` (all three before #84, matching the spelling as sent) |
@@ -52,6 +52,9 @@ quint test spec/router.qnt --main=pull_pre84
 # Network endpoints under a forced network_mode (#87): the table tests on both instances
 quint test spec/docker_socket_policy.qnt --main=network_endpoints
 quint test spec/docker_socket_policy.qnt --main=network_endpoints_pre87
+# Create model (#88): the table tests, and the pre-fix witness
+quint test spec/docker_socket_policy.qnt --main=create
+quint test spec/docker_socket_policy.qnt --main=create_pre88
 
 # Formal model-checking via Apalache (exhaustive, requires Java)
 quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy.qnt
@@ -63,12 +66,14 @@ quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy
 
 | Invariant | What It Checks | Guard / Mutator |
 |-----------|---------------|-----------------|
-| `noPrivilegedAccess` | No created container has `privileged=true` | ContainerConfigMutator sets `privileged=false` |
+| `noPrivilegedAccess` | No created container has `privileged=true` | ContainerConfigMutator sets `privileged=false` on every create (#88: also without a `container_config`) |
 | `alwaysHostNetwork` | Every container's network mode matches its policy's configured value (caller cannot override) | ContainerConfigMutator enforces `networkMode` from policy |
 | `imagesAlwaysAllowed` | All images match an `allowed_image_prefix` | RegistryGate via `nondet` policy match |
 | `validImagesOnly` | No container has invalid image ref (`InvalidTag`, `InvalidDigest`) | `createContainer` guard rejects invalid variants |
 | `envOnlyFromFile` | No inline env vars when policy sets `env_file` | EnvFileGate → `envAllowed()` |
 | `proxyLives` | Proxy process stays running | Error-handling recovery |
+| `hostConfigInAllowlist` | Every `HostConfig` field the daemon read is allowed, with an allowed value (#88) | HostConfigGate → `createAllowed()` |
+| `hostMountsInWhitelist` | Every host path the daemon mounted is a policy volume, read-only when the volume is, and never propagating (#88) | MountSourceGate → `createAllowed()` |
 
 ### P1 Security Invariants (Should Never Fail)
 
@@ -230,6 +235,43 @@ Each implementation's router tests use the same row names in comments (added wit
 | `namedOwnKept` | `mynet` | `{"mynet": {Aliases}}` | `{"mynet": {Aliases}}` |
 | `namedExtraDenied` | `mynet` | `{"default": {}, "other": {}}` | deny |
 | `namedOwnOverDefault` | `mynet` | `{"default": {Aliases}, "mynet": {}}` | `{"mynet": {}}` |
+### Container create: HostConfig (`create_model` in `docker_socket_policy.qnt`)
+
+The create check of [#88](https://github.com/ChainSafe/docker-socket-policy/issues/88): ContainerConfigMutator, then MountSourceGate and HostConfigGate on the mutated body. `LEGACY_CREATE = true` models all three before #88; `false` all three after. Four properties are checked exhaustively over both model policies (`BEACON`: volumes `/home/beacon` and read-only `/etc/jwt_dir`, a full `container_config`; `TOOLS`: no volumes, no `container_config`) and every single-field, single-bind and single-mount request over the model's atoms, plus every `NetworkingConfig` holding the CLI's `default` entry and one more entry, under `EndpointsConfig` or `endpointsconfig`:
+
+| Property | Claim |
+|----------|-------|
+| `createChecksEveryField` | The rule: an allowed create has only exactly spelled field names, allowed values after the mutator, and allowed binds and mounts. Close to a tautology on `create`. |
+| `daemonSeesOnlyAllowlistedHostConfig` | What the daemon reads (fields under their canonical names) is allowlisted with allowed values, `Privileged` is zero, and every value the policy forces (`NetworkMode`, `SecurityOpt`) is the forced one. Does not mention the gate's rules or the flag. |
+| `daemonMountsOnlyWhitelisted` | Every host path the daemon mounts, from `Binds` or `Mounts`, is a policy volume, is not writable when the volume is read-only, and does not propagate. |
+| `daemonAttachesOnlyForcedNetwork` | When the policy forces `network_mode`, the daemon attaches no network but the mode (or the CLI's `default`), reading `EndpointsConfig` under any spelling. `NetworkEndpointsGate` (#87, in both instances) reads the exact key only. |
+
+`create` runs `createSoundTest` (all four hold) and the rows below; `create_pre88` runs `pre88UnsoundTest`, which asserts that the three security properties fail and that the #88 reproductions were allowed: a `Mounts` bind of `/`, a `:rw` and a mode-less bind of the read-only volume, `CapAdd`, `PidMode: host`, any bind on a policy with no volumes, `Privileged: true` reaching the daemon on a policy with no `container_config`, a zero-valued `securityopt` clearing a forced `SecurityOpt`, and an `endpointsconfig` entry attaching `evil-net` under a forced `host`. The deny rows run on `create` only.
+
+Rows, with the names the language tables use (the language tables have more rows, one per field):
+
+| Row (`run <row>Test`) | Request | Outcome |
+|-----|---------|---------|
+| `capAddDenied`, `devicesDenied`, `groupAddDenied`, `unknownFieldDenied` | a non-zero field outside the allowlist | deny |
+| `maskedPathsEmptyDenied` | `MaskedPaths: []` | deny |
+| `pidModeHostDenied`, `pidModeContainerDenied`, `ipcModeHostDenied` | `host` / `container:<id>` namespace modes | deny |
+| `ipcModePrivateAllowed` | `IpcMode: private` | allow |
+| `oomScoreAdjNegativeDenied` / `oomScoreAdjPositiveAllowed` | `OomScoreAdj` -1000 / 500 | deny / allow |
+| `capDropAllowed`, `memorySwappinessAllowed`, `networkModeAllowed` | any-value fields | allow |
+| `zeroValuesAllowed` | denied fields with zero values | allow |
+| `securityOptSeccompUnconfinedDenied` / `securityOptNoNewPrivilegesAllowed` | `SecurityOpt` on a policy without `security_options` | deny / allow |
+| `securityOptOverwrittenByPolicy` | `SecurityOpt: [seccomp=unconfined]` on `BEACON` | allow; the daemon reads the policy's list |
+| `caseVariantPrivilegedDenied`, `caseVariantZeroSecurityOptDenied` | `privileged: true`, `securityopt: null` | deny |
+| `networkingConfigVariantDenied` / `networkingConfigVariantBareDenied` | `NetworkingConfig` with `endpointsconfig: {evil-net}` on `BEACON` (forces `host`) / `TOOLS` | deny |
+| `privilegedNeutralised`, `privilegedNeutralisedEmptyContainerConfig` | `Privileged: true` on `BEACON` / `TOOLS` | allow; the daemon reads `false` |
+| `mountBindRootDenied`, `mountVolumeTypeDenied`, `mountTmpfsWithSourceDenied`, `mountPropagationRsharedDenied`, `mountNoVolumesDenied` | `Mounts` | deny |
+| `mountBindReadOnlyVolumeWritableDenied` / `mountBindReadOnlyVolumeReadOnlyAllowed` | bind of `/etc/jwt_dir`, `ReadOnly` false / true | deny / allow |
+| `mountBindAllowed`, `mountTmpfsAllowed`, `mountPropagationRprivateAllowed` | `Mounts` | allow |
+| `bindReadOnlyVolumeRwDenied`, `bindReadOnlyVolumeNoModeDenied`, `bindReadOnlyVolumeRoRwDenied` | `/etc/jwt_dir:…:rw`, no mode, `ro,rw` | deny |
+| `bindReadOnlyVolumeRoAllowed`, `bindReadOnlyVolumeRoZAllowed`, `bindAllowed` | `:ro`, `:ro,Z`, a read-write volume | allow |
+| `bindRsharedDenied`, `bindUnlistedDenied`, `bindNoVolumesDenied` | `Binds` | deny |
+
+The state machine imports `create_model(LEGACY_CREATE = false)`: `createContainer` takes the request's `HostConfig`, guards on `createAllowed`, and records what the daemon read; the P0 invariants `hostConfigInAllowlist` and `hostMountsInWhitelist` check it on every step of `make verify`, and `noPrivilegedAccess` now reads `Privileged` from it instead of rejecting privileged requests (the implementations neutralise them).
 
 ### Image pull (`router.qnt`, `pull_model`)
 
@@ -290,6 +332,8 @@ Two invariants are structurally tautological within the Quint model — they can
 - **Network endpoints are a pure function, not part of the state machine (#87).** `createContainer` records the forced `networkMode` but takes no `NetworkingConfig`, and nothing in the state machine models the daemon's start, so the endpoint rule sits in its own module beside it and is checked by `quint test`, not by `make verify`. When the policy does not force `network_mode`, `NetworkingConfig` is forwarded untouched; neither the model nor the implementations check it then. Whether the daemon accepts the settings kept on a re-keyed entry (aliases on the default `bridge` network, for example) is the daemon's decision; the model fixes only the keys. `extraNetworkDenied` and `onlyForcedNetwork` are close to tautologies on `network_endpoints`, since `handleEndpoints` tests the key set directly; `network_endpoints_pre87` shows they are not vacuous. Dropping the extra keys instead of denying would keep `onlyForcedNetwork` and fail `extraNetworkDenied`; that was rejected, because the caller asked for a network the policy does not allow and should be told. A malformed `NetworkingConfig` or `EndpointsConfig` (not a JSON object) is denied by the implementations under a forced mode; the model's maps cannot express it, so the language tests pin it.
 
 - **Image references are tokens, normalisation is a table (#84).** Quint cannot split a string, so `pull_model` cannot parse `[registry/]repository[:tag][@digest]`. `CANONICAL` lists the spellings in the universe and the repository each one names; the implementations compute the same thing with one parser per language, used for the request's image (create `Image` and pull `fromImage`), for the registry gate and for each policy prefix at load time. The parser's rules (the tag is after the last `:` that follows the last `/`; the first component is a registry when it contains `.` or `:` or is `localhost`; `docker.io`, `index.docker.io` and `registry-1.docker.io` are dropped, and so is `library/` before a single-component name; only the registry is lower-cased, and upper case in the path is invalid) are pinned by the same normalisation table in the Go, Rust and TypeScript tests, not by the model. So are the namespace-boundary prefix match (`prefix` or `prefix/…`), which the model reduces to equality, and the tag and digest rules.
+- **The create model is a small universe (#88).** Values are atoms (`"null"`, `"zero"`, `"[]"` and a few non-zero ones), a list field holds one entry, and the field names stand for the classes in the README's HostConfig table: `CapAdd`, `Devices`, `GroupAdd` for the must-be-zero fields, `FutureField` for a field the proxy does not know, `CapDrop` and `MemorySwappiness` for the any-value fields, `PidMode` and `IpcMode` for the namespace modes. Case folding is a fixed table (`CASE_FOLD`), as percent-decoding is in `router.qnt`: Quint cannot fold strings. The implementations fold ASCII case plus the Kelvin sign and the long s, as Go's `encoding/json` does, and check the top level of the body, `Mounts` entries and `BindOptions` too; the language tables cover those (`caseVariantLongSDenied`, `caseVariantKelvinDenied`, `topLevel*VariantDenied`, `mountCaseVariantDenied`, `networkingConfigVariantLongSDenied`). The other nested objects need no check: the mutator replaces `RestartPolicy` and `LogConfig` whole when the policy sets them and they are any-value otherwise, and no gate reads `Healthcheck` or an endpoint entry's settings by key. Dropping the `NetworkingConfig` variant check from `createAllowed` makes the two `networkingConfigVariant*` rows and `createSoundTest` fail. Requests are single-field, single-bind or single-mount; a request that combines a canonical field with a variant needs no separate case, because the daemon may keep either value and the property checks every value it may read. Bind parsing (`src:dst:opts`, the escaped colon in Go), the zero-value test on JSON types and the type checks (a `Binds` entry that is not a string) are language-only rows.
+- **Mutating the create rules makes the rows fail.** Dropping the case-variant check from `fieldOk` makes `caseVariantZeroSecurityOptDenied` and `createSoundTest` fail (`caseVariantPrivilegedDenied` still passes: `privileged` is not an allowlisted name, so the zero-value rule denies its `true`). Dropping the read-only clause from `mountOk` makes `mountBindReadOnlyVolumeWritableDenied` and `createSoundTest` fail.
 - **Listener fault bias.** `step` crashes an instance on 1 in 10 draws instead of half of all steps, so random runs actually interleave live instances. Every crash stays reachable from every phase, so the reachable state space is unchanged.
 
 ### Attack Scenarios Prevented by Invariants
@@ -303,6 +347,10 @@ Two invariants are structurally tautological within the Quint model — they can
 | Inline Env | Request `createContainer` with `VALIDATOR_KEY=secret` | `envFromFileOnly` — `envFile=true` policy rejects inline env |
 | Docker Socket Mount | Request `createContainer` with `/var/run/docker.sock` | `volumesWhitelisted` — `/var/run/docker.sock` not in policy |
 | Privileged Flag | Request `createContainer` with `--privileged` flag | `flagsAllowlisted` — `--privileged` is in `deniedFlags` |
+| Host Root Mount | `createContainer` with `Mounts: [{Type: bind, Source: /}]` | `hostMountsInWhitelist` — `/` is not a policy volume (#88) |
+| Read-only Volume Written | `createContainer` with `Binds: [/etc/jwt_dir:/jwtdir:rw]` | `hostMountsInWhitelist` — the volume is `read_write: false` (#88) |
+| Capabilities / Host PID | `createContainer` with `CapAdd: [SYS_ADMIN]` or `PidMode: host` | `hostConfigInAllowlist` — default-deny on `HostConfig` (#88) |
+| Case-variant Field | `createContainer` with `privileged: true` | `noPrivilegedAccess`, `hostConfigInAllowlist` — the variant is denied (#88) |
 
 ## State Machine
 
@@ -318,7 +366,8 @@ Two invariants are structurally tautological within the Quint model — they can
  │                                                      │
  │   createContainer(name, imageRef, ...)               │
  │     │ guards: nondet, imageNameAllowed, flagAllowed, │
- │     │         volumeAllowed, envAllowed, not(priv)   │
+ │     │         volumeAllowed, envAllowed,             │
+ │     │         createAllowed (HostConfig, #88)        │
  │     │         ValidImage only (invalid rejected)     │
  │     │ mutators: enforcedPrivileged, networkMode,     │
  │     │          effectiveFlags, effectiveVolumes,     │

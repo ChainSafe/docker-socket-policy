@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 118 unit + 77 integration + 15 socket | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 145 unit + 77 integration + 15 socket | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 169 unit (1 skipped) + 77 integration + 15 socket | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 119 unit + 94 integration + 15 socket | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 146 unit + 94 integration + 15 socket | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 300 unit (1 skipped) + 94 integration + 15 socket | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -159,6 +159,9 @@ volumes:
   - host_path: /home/beacon
     container_path: /data
     read_write: true
+  - host_path: /etc/jwt_dir
+    container_path: /jwtdir
+    read_write: false   # must be mounted read-only: -v /etc/jwt_dir:/jwtdir:ro
 env_file: /home/beacon/beacon.env
 allowed_cli_flags:
   - --rcConfig
@@ -168,6 +171,14 @@ denied_flags:
   - --volume
   - --cap-add
 ```
+
+`volumes` is the whole list of host paths a container may mount, through `-v`
+(`HostConfig.Binds`) or `--mount type=bind` (`HostConfig.Mounts`). A policy
+without `volumes` allows no bind mounts. `read_write: false` (the default when
+the key is left out in Go and TypeScript; Rust requires the key) is enforced:
+the bind must carry `:ro`, or the mount `ReadOnly: true`, and a bind without a
+mode is read-write in Docker, so it is denied. See
+[Container create: HostConfig rules](#container-create-hostconfig-rules).
 
 ### Use the Proxy
 
@@ -186,22 +197,47 @@ docker rm beacon
 docker exec -it beacon bash          # denied: exec not allowed
 docker run --privileged alpine sh    # denied: privileged containers blocked
 docker pull attacker/malware:latest  # denied: image not in allowlist
+docker run --cap-add SYS_ADMIN --pid host chainsafe/lodestar:next      # denied: HostConfig.CapAdd
+docker run --mount type=bind,src=/,dst=/host chainsafe/lodestar:next  # denied: mount source not in volumes
 ```
 
 ## Middleware Pipeline
 
 | Middleware | Type | What it checks |
 |------------|------|----------------|
-| ContainerConfigMutator | Mutator | Forces `network_mode`, `user`, `security_options`, `restart_policy` from policy, and makes `NetworkingConfig.EndpointsConfig` match a forced `network_mode` |
+| ContainerConfigMutator | Mutator | Forces `network_mode`, `user`, `security_options`, `restart_policy`, `log_driver` from policy, `HostConfig.Privileged: false` on every create, and makes `NetworkingConfig.EndpointsConfig` match a forced `network_mode` |
 | RegistryGate | Gate | Validates the normalised image ref against `allowed_image_prefixes`, then `image_tag_pattern` and `image_digest_allowed` |
-| MountSourceGate | Gate | Validates volume binds against whitelist |
+| MountSourceGate | Gate | Validates `HostConfig.Binds`, `HostConfig.Mounts` and top-level `Volumes` against `volumes`, including bind options and `read_write: false` |
 | EnvFileGate | Gate | Strips `Env` field from create body; env must come from locked `env_file` |
+| HostConfigGate | Gate | Default-deny on `HostConfig`: a field outside the allowlist must be absent or zero ([#88](https://github.com/ChainSafe/docker-socket-policy/issues/88)) |
 | CmdGate | Gate | Validates each CLI flag in `Cmd` array against allowlist + denylist |
 | NetworkEndpointsGate | Gate | With a forced `network_mode`, denies `NetworkingConfig.EndpointsConfig` entries for other networks |
 
 When a policy forces `network_mode` M, the endpoint entries in `NetworkingConfig.EndpointsConfig` must agree with it, or the daemon creates the container and then refuses to start it with `network default not found`: without `--network`, the Docker CLI sends an entry for `default` ([#87](https://github.com/ChainSafe/docker-socket-policy/issues/87)). Entries may be keyed `default` or M; any other key is denied with `network "<name>" is not allowed for service <service>; policy forces network_mode <M>`, since it would attach the container to a network the policy does not allow. For `host`, `none` and `container:<id>` the proxy then forwards an empty `EndpointsConfig`; for `bridge` or a named network it forwards exactly one entry, keyed M, with the settings (aliases, for example) of the caller's M entry, else of its `default` entry. A `NetworkingConfig` that is not a JSON object is denied. Without a forced `network_mode`, `NetworkingConfig` is forwarded as sent.
 
-The chain runs only on container create. `--readonly` is not a gate: the router denies every request that is not `GET` or `HEAD`, on every path, before any other check ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)). Attach is denied by the router for every method, so a websocket attach (`GET /containers/{name}/attach/ws`) cannot reach a container's stdin, with or without `--readonly` ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)).
+The chain runs only on container create. The mutator runs first, so the gates check the body that is forwarded to the daemon. `--readonly` is not a gate: the router denies every request that is not `GET` or `HEAD`, on every path, before any other check ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)). Attach is denied by the router for every method, so a websocket attach (`GET /containers/{name}/attach/ws`) cannot reach a container's stdin, with or without `--readonly` ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)).
+
+### Container create: HostConfig rules
+
+`HostConfig` is default-deny ([#88](https://github.com/ChainSafe/docker-socket-policy/issues/88)). Before #88 only the host paths in `HostConfig.Binds` were checked, so `--mount`, a bind mode, `--cap-add`, `--pid host`, `--device` and every other `HostConfig` field reached the daemon unchanged. Now each key is checked against this table, after the mutator has run; any key not listed, including fields the Engine API adds later, must be absent or hold a zero value (`null`, `false`, `0`, `""`, `[]` or `{}`), or the create is denied with 403 `HostConfig.<Key> is not allowed for service <name>`. The body a plain `docker create` or `docker run` sends passes: the CLI sends most fields with zero values.
+
+| `HostConfig` key | Rule |
+|------------------|------|
+| `Binds` | Host path must be a policy `volumes` entry. Bind options: `ro`, `rw`, `z`, `Z`, `nocopy`, `private`, `rprivate`; `shared`, `rshared`, `slave`, `rslave` and anything else are denied. A `read_write: false` volume needs `ro` (no mode means read-write). |
+| `Mounts` | `Type: bind`: `Source` must be a policy `volumes` entry; `ReadOnly: true` for a `read_write: false` volume; `BindOptions.Propagation` empty, `private` or `rprivate`; `BindOptions.ReadOnlyNonRecursive` must be zero. `Type: tmpfs`: allowed, without a `Source`. Every other type (`volume`, `image`, `npipe`, `cluster`) is denied. Other entry keys besides `Target`, `Consistency` and `TmpfsOptions` must be zero. |
+| `NetworkMode`, `RestartPolicy`, `LogConfig` | Any value; overwritten when the policy sets `network_mode`, `restart_policy` or `log_driver`. |
+| `SecurityOpt` | Each entry must be in the policy's `security_options` or be `no-new-privileges` / `no-new-privileges:true`. Overwritten when the policy sets `security_options`. |
+| `Privileged` | Forced to `false` by the mutator on every create, so `true` is neutralised, not denied. |
+| `PidMode`, `UTSMode`, `UsernsMode`, `Cgroup` | `""` only. |
+| `IpcMode` | `""`, `private`, `shareable` or `none`. |
+| `CgroupnsMode` | `""` or `private`. |
+| `Isolation` | `""` or `default`. |
+| `OomScoreAdj` | `0` or more. |
+| `MaskedPaths`, `ReadonlyPaths` | Absent or `null` only: an empty list unmasks `/proc` (`--security-opt systempaths=unconfined`). |
+| `CapDrop`, `ReadonlyRootfs`, `Init`, `AutoRemove`, `ConsoleSize`, `ShmSize`, `PortBindings`, `PublishAllPorts`, `Dns`, `DnsOptions`, `DnsSearch`, `ExtraHosts`, `Tmpfs`, `Ulimits`, `Memory`, `MemoryReservation`, `MemorySwap`, `MemorySwappiness`, `NanoCpus`, `CpuShares`, `CpuPeriod`, `CpuQuota`, `CpusetCpus`, `CpusetMems`, `PidsLimit`, `BlkioWeight`, `ContainerIDFile` | Any value. |
+| Everything else: `CapAdd`, `Devices`, `DeviceRequests`, `DeviceCgroupRules`, `GroupAdd`, `VolumesFrom`, `Links`, `Sysctls`, `CgroupParent`, `Runtime`, `VolumeDriver`, `OomKillDisable`, `Annotations`, `StorageOpt`, the other resource fields, and unknown keys | Absent or zero. |
+
+The daemon matches JSON field names without regard to case, and the last match wins, so `"privileged": true` would set `Privileged` after the mutator's `"Privileged": false`, and `"securityopt": null` would clear a forced `SecurityOpt`. A key that the daemon would read as a known field but that is not spelled exactly like it (`privileged`, `hostConfig`, `user`, `image`, …) is denied, at the top level of the body, in `HostConfig`, in `Mounts` entries and their `BindOptions`, and in `NetworkingConfig`, whether or not the policy forces `network_mode`: `NetworkEndpointsGate` reads `EndpointsConfig` only, and the daemon would attach the networks under `endpointsconfig` too. Inside `RestartPolicy` and `LogConfig` the spelling does not matter: the mutator replaces the whole object when the policy sets it, and otherwise any value is allowed; no gate reads `Healthcheck` or the settings inside an endpoint entry. The policy's `ports` field is parsed but not enforced; `PortBindings` is not restricted by it.
 
 ## Endpoint Access
 
@@ -388,7 +424,8 @@ proxy's `--config-dir`.
 
 A policy is a per-service *template*, chosen by the `Image` of the request. It
 fixes what a container from that image may look like: volumes, network mode,
-env file, user, CLI flags. A policy says nothing about *who* may ask for it. A
+env file, user, CLI flags, and no other host access (`HostConfig` is
+default-deny, #88). A policy says nothing about *who* may ask for it. A
 caller who names `chainsafe/lodestar` gets the policy for that image, whichever
 service the caller belongs to. This is intended, not a gap: callers on a
 shared socket are all the same caller as far as the kernel can tell (for
@@ -456,7 +493,7 @@ not at the socket.
 
 ## Formal Verification
 
-This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for writes under `--readonly` ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)), percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)), dot segments ([#70](https://github.com/ChainSafe/docker-socket-policy/issues/70)), exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)) and attach ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)), the GET/HEAD-only read passthrough ([#78](https://github.com/ChainSafe/docker-socket-policy/issues/78)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 12 properties are checked exhaustively over the methods `GET`, `HEAD`, `POST`, `DELETE` and every path of 1 to 3 segments over the model's word set; exec is denied by the router, not by a middleware gate.
+This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 11 invariants on every state transition. The same file models the create check on `HostConfig` ([#88](https://github.com/ChainSafe/docker-socket-policy/issues/88)): the default-deny field rules, `Mounts`, bind options and read-only volumes, and the case-insensitive field names the daemon accepts; its properties are checked exhaustively over every single-field, single-bind and single-mount request of the model, and instance `create_pre88` shows that they failed before the fix. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for writes under `--readonly` ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)), percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)), dot segments ([#70](https://github.com/ChainSafe/docker-socket-policy/issues/70)), exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)) and attach ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)), the GET/HEAD-only read passthrough ([#78](https://github.com/ChainSafe/docker-socket-policy/issues/78)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 12 properties are checked exhaustively over the methods `GET`, `HEAD`, `POST`, `DELETE` and every path of 1 to 3 segments over the model's word set; exec is denied by the router, not by a middleware gate.
 
 The request-handling spec also has a module, `network_endpoints_model`, for the endpoint entries under a forced `network_mode` ([#87](https://github.com/ChainSafe/docker-socket-policy/issues/87)). Its 3 properties (extra networks are denied, an allowed create names no network but the forced one, and every allowed create starts) are checked over five network modes and every endpoint map over seven keys; `network_endpoints_pre87` shows all three failing before the fix.
 
@@ -466,7 +503,7 @@ The CI pipeline runs verification on every push and PR. A violation blocks the b
 make typecheck            # Quint type-check (proves type safety)
 make verify               # Random-simulation verification (default evaluator)
 make verify BACKEND=rust  # Same, using the faster Rust backend
-make test-spec            # Quint `run` tests for listener.qnt, router.qnt and network_endpoints (one per table row)
+make test-spec            # Quint `run` tests for listener.qnt, router.qnt, network_endpoints and the create model (one per table row)
 make validate             # All checks: typecheck + verify + go vet + go test
 ```
 
