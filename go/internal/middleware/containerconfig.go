@@ -6,14 +6,20 @@ import (
 	"github.com/ChainSafe/docker-socket-policy/go/internal/policy"
 )
 
+// ContainerConfigMutator overwrites the fields the policy's container_config
+// sets. It forces HostConfig.Privileged to false on every create, even when
+// container_config is empty (#88). A HostConfig that is not an object is left
+// alone for HostConfigGate to deny.
 type ContainerConfigMutator struct{}
 
 func (m *ContainerConfigMutator) Mutate(r *http.Request, p *policy.Policy, body map[string]interface{}) {
 	cc := p.ContainerConfig
-	if cc.NetworkMode == "" && cc.RestartPolicy == "" && len(cc.SecurityOptions) == 0 && cc.User == "" && cc.LogDriver == "" {
-		return
-	}
 
+	if raw, ok := body["HostConfig"]; ok && raw != nil {
+		if _, isObj := raw.(map[string]interface{}); !isObj {
+			return
+		}
+	}
 	hostConfig, _ := body["HostConfig"].(map[string]interface{})
 	if hostConfig == nil {
 		hostConfig = make(map[string]interface{})
@@ -32,7 +38,13 @@ func (m *ContainerConfigMutator) Mutate(r *http.Request, p *policy.Policy, body 
 	}
 
 	if len(cc.SecurityOptions) > 0 {
-		hostConfig["SecurityOpt"] = cc.SecurityOptions
+		// Stored as a generic JSON list, like a parsed body, so that
+		// HostConfigGate reads it the same way.
+		opts := make([]interface{}, len(cc.SecurityOptions))
+		for i, o := range cc.SecurityOptions {
+			opts[i] = o
+		}
+		hostConfig["SecurityOpt"] = opts
 	}
 
 	hostConfig["Privileged"] = false

@@ -20,6 +20,7 @@ export class Chain {
     this.gates.push(new RegistryGate());
     this.gates.push(new MountSourceGate());
     this.gates.push(new EnvFileGate());
+    this.gates.push(new HostConfigGate());
     this.gates.push(new CmdGate());
     this.gates.push(new NetworkEndpointsGate());
   }
@@ -66,33 +67,453 @@ export class RegistryGate implements Gate {
   }
 }
 
+type JsonObject = Record<string, unknown>;
+
+function isObject(v: unknown): v is JsonObject {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+// Keys in byte order, so that the first deny is the same one Go and Rust report.
+function sortedKeys(obj: JsonObject): string[] {
+  return Object.keys(obj).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+// null, false, 0, "", [] and {}.
+function isZeroValue(v: unknown): boolean {
+  if (v === null || v === undefined || v === false || v === 0 || v === "") return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (isObject(v)) return Object.keys(v).length === 0;
+  return false;
+}
+
+// Folds a key the way the daemon's JSON decoder matches field names: ASCII
+// case, plus the Kelvin sign (U+212A) as k and the long s (U+017F) as s.
+function foldKey(s: string): string {
+  let out = "";
+  for (const c of s) {
+    if (c >= "A" && c <= "Z") out += c.toLowerCase();
+    else if (c === "K") out += "k";
+    else if (c === "ſ") out += "s";
+    else out += c;
+  }
+  return out;
+}
+
+// Denies a key that the daemon would read as one of fields but that is not
+// spelled exactly like it.
+function checkFieldCase(prefix: string, obj: JsonObject, fields: readonly string[], policy: Policy): string | null {
+  for (const key of sortedKeys(obj)) {
+    const folded = foldKey(key);
+    for (const f of fields) {
+      if (key !== f && folded === foldKey(f)) {
+        return `${prefix}${key} is not allowed for service ${policy.service_name} (the daemon reads it as ${prefix}${f})`;
+      }
+    }
+  }
+  return null;
+}
+
+// Go's %q / Rust's {:?} for the strings in deny messages.
+function quote(s: string): string {
+  return JSON.stringify(s);
+}
+
+// The bind options allowed in a Binds entry. The propagation modes shared,
+// rshared, slave and rslave are not among them.
+const BIND_MODES = new Set(["ro", "rw", "z", "Z", "nocopy", "private", "rprivate"]);
+
+const MOUNT_FIELDS = [
+  "Type",
+  "Source",
+  "Target",
+  "ReadOnly",
+  "Consistency",
+  "BindOptions",
+  "VolumeOptions",
+  "ImageOptions",
+  "TmpfsOptions",
+  "ClusterOptions",
+] as const;
+
+// May hold any value in a Mounts entry; Type, Source, ReadOnly and
+// BindOptions have their own rules, and every other key must be zero.
+const MOUNT_ANY_VALUE = new Set(["Target", "Consistency", "TmpfsOptions"]);
+
+const BIND_OPTION_FIELDS = [
+  "Propagation",
+  "NonRecursive",
+  "CreateMountpoint",
+  "ReadOnlyNonRecursive",
+  "ReadOnlyForceRecursive",
+] as const;
+
+// May hold any value in BindOptions; Propagation has its own rule, and every
+// other key, ReadOnlyNonRecursive included, must be zero.
+const BIND_OPTION_ANY_VALUE = new Set(["NonRecursive", "CreateMountpoint", "ReadOnlyForceRecursive"]);
+
+function findVolume(hostPath: string, policy: Policy) {
+  return policy.volumes?.find((v) => v.host_path === hostPath);
+}
+
+function checkBinds(raw: unknown, policy: Policy): string | null {
+  if (raw === undefined || raw === null) return null;
+  const notList = `HostConfig.Binds must be a list of strings for service ${policy.service_name}`;
+  if (!Array.isArray(raw)) return notList;
+  for (const bind of raw) {
+    if (typeof bind !== "string") return notList;
+    const parts = bind.split(":");
+    if (bind === "" || parts.length > 3) {
+      return `bind ${quote(bind)} is not a valid bind for service ${policy.service_name}`;
+    }
+    const hostPath = parts[0];
+    const vol = findVolume(hostPath, policy);
+    if (!vol) {
+      return `volume mount ${quote(hostPath)} is not in the whitelist for service ${policy.service_name}`;
+    }
+    const opts = parts.length === 3 && parts[2] !== "" ? parts[2].split(",") : [];
+    for (const o of opts) {
+      if (!BIND_MODES.has(o)) {
+        return `bind option ${quote(o)} on volume mount ${quote(hostPath)} is not allowed for service ${policy.service_name}`;
+      }
+    }
+    if (!vol.read_write && (!opts.includes("ro") || opts.includes("rw"))) {
+      return `volume mount ${quote(hostPath)} must be read-only (:ro) for service ${policy.service_name}`;
+    }
+  }
+  return null;
+}
+
+function checkMounts(raw: unknown, policy: Policy): string | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) return `HostConfig.Mounts must be a list for service ${policy.service_name}`;
+  for (const m of raw) {
+    if (!isObject(m)) return `HostConfig.Mounts entry must be an object for service ${policy.service_name}`;
+    const err = checkMount(m, policy);
+    if (err !== null) return err;
+  }
+  return null;
+}
+
+function checkMount(mount: JsonObject, policy: Policy): string | null {
+  const caseErr = checkFieldCase("HostConfig.Mounts.", mount, MOUNT_FIELDS, policy);
+  if (caseErr !== null) return caseErr;
+  for (const key of sortedKeys(mount)) {
+    if (key === "Type" || key === "Source" || key === "ReadOnly" || MOUNT_ANY_VALUE.has(key)) continue;
+    if (key === "BindOptions") {
+      const err = checkBindOptions(mount[key], policy);
+      if (err !== null) return err;
+      continue;
+    }
+    if (!isZeroValue(mount[key])) {
+      return `HostConfig.Mounts.${key} is not allowed for service ${policy.service_name}`;
+    }
+  }
+
+  const mountType = typeof mount["Type"] === "string" ? mount["Type"] : "";
+  const source = typeof mount["Source"] === "string" ? mount["Source"] : "";
+  if (mountType === "tmpfs") {
+    if (!isZeroValue(mount["Source"])) {
+      return `tmpfs mount must not have a Source for service ${policy.service_name}`;
+    }
+    return null;
+  }
+  if (mountType === "bind") {
+    const vol = findVolume(source, policy);
+    if (!vol) {
+      return `mount source ${quote(source)} is not in the whitelist for service ${policy.service_name}`;
+    }
+    if (!vol.read_write && mount["ReadOnly"] !== true) {
+      return `mount of ${quote(source)} must be read-only (ReadOnly: true) for service ${policy.service_name}`;
+    }
+    return null;
+  }
+  return `mount type ${quote(mountType)} is not allowed for service ${policy.service_name}`;
+}
+
+function checkBindOptions(raw: unknown, policy: Policy): string | null {
+  if (raw === undefined || raw === null) return null;
+  if (!isObject(raw)) return `HostConfig.Mounts.BindOptions must be an object for service ${policy.service_name}`;
+  const caseErr = checkFieldCase("HostConfig.Mounts.BindOptions.", raw, BIND_OPTION_FIELDS, policy);
+  if (caseErr !== null) return caseErr;
+  for (const key of sortedKeys(raw)) {
+    const value = raw[key];
+    if (key === "Propagation") {
+      if (value === null) continue;
+      if (typeof value !== "string") {
+        return `mount propagation ${JSON.stringify(value)} is not allowed for service ${policy.service_name}`;
+      }
+      if (value !== "" && value !== "private" && value !== "rprivate") {
+        return `mount propagation ${quote(value)} is not allowed for service ${policy.service_name}`;
+      }
+      continue;
+    }
+    if (BIND_OPTION_ANY_VALUE.has(key)) continue;
+    if (!isZeroValue(value)) {
+      return `HostConfig.Mounts.BindOptions.${key} is not allowed for service ${policy.service_name}`;
+    }
+  }
+  return null;
+}
+
+// MountSourceGate checks every host path a create request mounts against the
+// policy's volumes: HostConfig.Binds, HostConfig.Mounts and the top-level
+// Volumes keys. A policy with no volumes allows no binds. A volume with
+// read_write: false must be mounted read-only (#88).
 export class MountSourceGate implements Gate {
   check(_method: string, _path: string, policy: Policy, body: Record<string, unknown>): string | null {
-    const volumes = policy.volumes;
-    if (!volumes?.length) return null;
+    const hostConfig = body["HostConfig"];
+    if (isObject(hostConfig)) {
+      const err = checkBinds(hostConfig["Binds"], policy) ?? checkMounts(hostConfig["Mounts"], policy);
+      if (err !== null) return err;
+    }
 
-    const hostConfig = body["HostConfig"] as Record<string, unknown> | undefined;
-    if (hostConfig) {
-      const binds = hostConfig["Binds"] as string[] | undefined;
-      if (binds) {
-        for (const bind of binds) {
-          const hostPath = bind.split(":")[0];
-          if (!volumes.some((v) => v.host_path === hostPath)) {
-            return `volume mount "${hostPath}" is not in the whitelist`;
-          }
+    const topVolumes = body["Volumes"];
+    if (isObject(topVolumes)) {
+      for (const hostPath of sortedKeys(topVolumes)) {
+        if (!findVolume(hostPath, policy)) {
+          return `volume ${quote(hostPath)} is not in the whitelist for service ${policy.service_name}`;
         }
       }
     }
 
-    const topVolumes = body["Volumes"] as Record<string, unknown> | undefined;
-    if (topVolumes) {
-      for (const hostPath of Object.keys(topVolumes)) {
-        if (!volumes.some((v) => v.host_path === hostPath)) {
-          return `volume "${hostPath}" is not in the whitelist`;
-        }
-      }
+    return null;
+  }
+}
+
+// Every HostConfig field of the Docker Engine API (v1.44 and later, including
+// the embedded Resources fields), plus a few removed ones. Used only to catch
+// case variants of field names.
+const HOST_CONFIG_FIELDS = [
+  "Binds",
+  "ContainerIDFile",
+  "LogConfig",
+  "NetworkMode",
+  "PortBindings",
+  "RestartPolicy",
+  "AutoRemove",
+  "VolumeDriver",
+  "VolumesFrom",
+  "Mounts",
+  "ConsoleSize",
+  "Annotations",
+  "CapAdd",
+  "CapDrop",
+  "CgroupnsMode",
+  "Dns",
+  "DnsOptions",
+  "DnsSearch",
+  "ExtraHosts",
+  "GroupAdd",
+  "IpcMode",
+  "Cgroup",
+  "Links",
+  "OomScoreAdj",
+  "PidMode",
+  "Privileged",
+  "PublishAllPorts",
+  "ReadonlyRootfs",
+  "SecurityOpt",
+  "StorageOpt",
+  "Tmpfs",
+  "UTSMode",
+  "UsernsMode",
+  "ShmSize",
+  "Sysctls",
+  "Runtime",
+  "Isolation",
+  "MaskedPaths",
+  "ReadonlyPaths",
+  "Init",
+  "Capabilities",
+  "CpuShares",
+  "Memory",
+  "CgroupParent",
+  "BlkioWeight",
+  "BlkioWeightDevice",
+  "BlkioDeviceReadBps",
+  "BlkioDeviceWriteBps",
+  "BlkioDeviceReadIOps",
+  "BlkioDeviceWriteIOps",
+  "CpuPeriod",
+  "CpuQuota",
+  "CpuRealtimePeriod",
+  "CpuRealtimeRuntime",
+  "CpusetCpus",
+  "CpusetMems",
+  "Devices",
+  "DeviceCgroupRules",
+  "DeviceRequests",
+  "KernelMemory",
+  "KernelMemoryTCP",
+  "MemoryReservation",
+  "MemorySwap",
+  "MemorySwappiness",
+  "NanoCpus",
+  "OomKillDisable",
+  "PidsLimit",
+  "Ulimits",
+  "CpuCount",
+  "CpuPercent",
+  "IOMaximumIOps",
+  "IOMaximumBandwidth",
+] as const;
+
+// Every top-level field of the create body (the container Config, HostConfig
+// and NetworkingConfig), used to catch case variants.
+const CREATE_BODY_FIELDS = [
+  "Hostname",
+  "Domainname",
+  "User",
+  "AttachStdin",
+  "AttachStdout",
+  "AttachStderr",
+  "ExposedPorts",
+  "Tty",
+  "OpenStdin",
+  "StdinOnce",
+  "Env",
+  "Cmd",
+  "Healthcheck",
+  "ArgsEscaped",
+  "Image",
+  "Volumes",
+  "WorkingDir",
+  "Entrypoint",
+  "NetworkDisabled",
+  "MacAddress",
+  "OnBuild",
+  "Labels",
+  "StopSignal",
+  "StopTimeout",
+  "Shell",
+  "HostConfig",
+  "NetworkingConfig",
+] as const;
+
+// Every field of NetworkingConfig.
+const NETWORKING_CONFIG_FIELDS = ["EndpointsConfig"] as const;
+
+// May hold any value. NetworkMode, RestartPolicy and LogConfig are
+// overwritten by the mutator when the policy sets them.
+const HOST_CONFIG_ANY_VALUE = new Set([
+  "NetworkMode",
+  "RestartPolicy",
+  "LogConfig",
+  "CapDrop",
+  "ReadonlyRootfs",
+  "Init",
+  "AutoRemove",
+  "ConsoleSize",
+  "ShmSize",
+  "PortBindings",
+  "PublishAllPorts",
+  "Dns",
+  "DnsOptions",
+  "DnsSearch",
+  "ExtraHosts",
+  "Tmpfs",
+  "Ulimits",
+  "Memory",
+  "MemoryReservation",
+  "MemorySwap",
+  "MemorySwappiness",
+  "NanoCpus",
+  "CpuShares",
+  "CpuPeriod",
+  "CpuQuota",
+  "CpusetCpus",
+  "CpusetMems",
+  "PidsLimit",
+  "BlkioWeight",
+  "ContainerIDFile",
+]);
+
+// The values a namespace field may take besides "". "host" and
+// "container:<id>" are denied.
+const HOST_CONFIG_MODES = new Map<string, readonly string[]>([
+  ["PidMode", []],
+  ["IpcMode", ["private", "shareable", "none"]],
+  ["UTSMode", []],
+  ["UsernsMode", []],
+  ["CgroupnsMode", ["private"]],
+  ["Cgroup", []],
+  ["Isolation", ["default"]],
+]);
+
+const NO_NEW_PRIVILEGES = new Set(["no-new-privileges", "no-new-privileges:true"]);
+
+function checkSecurityOpt(value: unknown, policy: Policy): string | null {
+  if (value === null) return null;
+  if (!Array.isArray(value)) return `HostConfig.SecurityOpt must be a list for service ${policy.service_name}`;
+  for (const e of value) {
+    if (typeof e !== "string") {
+      return `HostConfig.SecurityOpt entry ${JSON.stringify(e)} is not allowed for service ${policy.service_name}`;
+    }
+    if (NO_NEW_PRIVILEGES.has(e) || policy.container_config?.security_options?.includes(e)) continue;
+    return `HostConfig.SecurityOpt entry ${quote(e)} is not allowed for service ${policy.service_name}`;
+  }
+  return null;
+}
+
+// HostConfigGate is the default-deny check on HostConfig (#88). It runs after
+// ContainerConfigMutator, on the body that is forwarded, so values the policy
+// forces (Privileged, NetworkMode, SecurityOpt, ...) are what it sees.
+//
+// A key in HOST_CONFIG_ANY_VALUE may hold any value. SecurityOpt, OomScoreAdj
+// and the namespace modes have their own rules. Binds and Mounts are checked
+// by MountSourceGate. Every other key, known or not, must be absent or hold a
+// zero value (null, false, 0, "", [] or {}); MaskedPaths and ReadonlyPaths
+// must be absent or null, because an empty list unmasks /proc.
+//
+// The daemon matches JSON keys without regard to case, and the last match
+// wins, so "privileged": true would set Privileged and "securityopt": null
+// would clear a forced SecurityOpt. A key that folds to a known field name but
+// is not spelled exactly like it is denied, here and at the top level.
+export class HostConfigGate implements Gate {
+  check(_method: string, _path: string, policy: Policy, body: Record<string, unknown>): string | null {
+    const topErr = checkFieldCase("", body, CREATE_BODY_FIELDS, policy);
+    if (topErr !== null) return topErr;
+    // NetworkEndpointsGate and the mutator read NetworkingConfig.EndpointsConfig
+    // by its exact name; the daemon would also read "endpointsconfig".
+    const nc = body["NetworkingConfig"];
+    if (isObject(nc)) {
+      const ncErr = checkFieldCase("NetworkingConfig.", nc, NETWORKING_CONFIG_FIELDS, policy);
+      if (ncErr !== null) return ncErr;
     }
 
+    const hc = body["HostConfig"];
+    if (hc === undefined || hc === null) return null;
+    if (!isObject(hc)) return `HostConfig must be an object for service ${policy.service_name}`;
+    const caseErr = checkFieldCase("HostConfig.", hc, HOST_CONFIG_FIELDS, policy);
+    if (caseErr !== null) return caseErr;
+
+    for (const key of sortedKeys(hc)) {
+      const value = hc[key];
+      // Binds and Mounts: MountSourceGate.
+      if (key === "Binds" || key === "Mounts" || HOST_CONFIG_ANY_VALUE.has(key)) continue;
+      if (key === "MaskedPaths" || key === "ReadonlyPaths") {
+        if (value !== null) return `HostConfig.${key} is not allowed for service ${policy.service_name}`;
+        continue;
+      }
+      if (key === "SecurityOpt") {
+        const err = checkSecurityOpt(value, policy);
+        if (err !== null) return err;
+        continue;
+      }
+      if (key === "OomScoreAdj") {
+        if (value !== null && !(typeof value === "number" && value >= 0)) {
+          return `HostConfig.OomScoreAdj value ${JSON.stringify(value)} is not allowed for service ${policy.service_name}`;
+        }
+        continue;
+      }
+      const modes = HOST_CONFIG_MODES.get(key);
+      if (modes !== undefined) {
+        if (value === null || value === "" || (typeof value === "string" && modes.includes(value))) continue;
+        const shown = typeof value === "string" ? quote(value) : JSON.stringify(value);
+        return `HostConfig.${key} value ${shown} is not allowed for service ${policy.service_name}`;
+      }
+      if (!isZeroValue(value)) return `HostConfig.${key} is not allowed for service ${policy.service_name}`;
+    }
     return null;
   }
 }
@@ -164,10 +585,6 @@ export class CmdGate implements Gate {
   }
 }
 
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
 /** NetworkingConfig.EndpointsConfig of a create body: null when absent or null, "malformed" when not an object. */
 function endpointsConfig(body: Record<string, unknown>): Record<string, unknown> | null | "malformed" {
   const nc = body["NetworkingConfig"];
@@ -230,18 +647,24 @@ function forceEndpoints(mode: string, body: Record<string, unknown>): void {
   body["NetworkingConfig"] = nc;
 }
 
+// ContainerConfigMutator overwrites the fields the policy's container_config
+// sets. It forces HostConfig.Privileged to false on every create, even without
+// a container_config (#88). A HostConfig that is not an object is left alone
+// for HostConfigGate to deny.
 export class ContainerConfigMutator implements Mutator {
   mutate(policy: Policy, body: Record<string, unknown>): void {
+    const existing = body["HostConfig"];
+    if (existing !== undefined && existing !== null && !isObject(existing)) return;
+    const hostConfig: JsonObject = isObject(existing) ? existing : {};
+    body["HostConfig"] = hostConfig;
+    hostConfig["Privileged"] = false;
+
     const cc = policy.container_config;
     if (!cc) return;
-
-    const hostConfig = (body["HostConfig"] as Record<string, unknown>) ?? {};
-    body["HostConfig"] = hostConfig;
 
     if (cc.network_mode) hostConfig["NetworkMode"] = cc.network_mode;
     if (cc.restart_policy) hostConfig["RestartPolicy"] = { Name: cc.restart_policy };
     if (cc.security_options?.length) hostConfig["SecurityOpt"] = cc.security_options;
-    hostConfig["Privileged"] = false;
     if (cc.user) body["User"] = cc.user;
     if (cc.log_driver) {
       hostConfig["LogConfig"] = { Type: cc.log_driver, Config: cc.log_options ?? {} };

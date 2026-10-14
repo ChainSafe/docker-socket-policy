@@ -37,6 +37,7 @@ impl Chain {
         gates.push(Box::new(RegistryGate));
         gates.push(Box::new(MountSourceGate));
         gates.push(Box::new(EnvFileGate));
+        gates.push(Box::new(HostConfigGate));
         gates.push(Box::new(CmdGate));
         gates.push(Box::new(NetworkEndpointsGate));
 
@@ -109,7 +110,225 @@ impl Gate for RegistryGate {
     }
 }
 
+type JsonObject = serde_json::Map<String, serde_json::Value>;
+
+/// MountSourceGate checks every host path a create request mounts against the
+/// policy's volumes: `HostConfig.Binds`, `HostConfig.Mounts` and the top-level
+/// `Volumes` keys. A policy with no volumes allows no binds. A volume with
+/// `read_write: false` must be mounted read-only (#88).
 pub struct MountSourceGate;
+
+/// The bind options allowed in a `Binds` entry. The propagation modes
+/// shared, rshared, slave and rslave are not among them.
+const BIND_MODES: &[&str] = &["ro", "rw", "z", "Z", "nocopy", "private", "rprivate"];
+
+const MOUNT_FIELDS: &[&str] = &[
+    "Type",
+    "Source",
+    "Target",
+    "ReadOnly",
+    "Consistency",
+    "BindOptions",
+    "VolumeOptions",
+    "ImageOptions",
+    "TmpfsOptions",
+    "ClusterOptions",
+];
+
+/// May hold any value in a `Mounts` entry; Type, Source, ReadOnly and
+/// BindOptions have their own rules, and every other key must be zero.
+const MOUNT_ANY_VALUE: &[&str] = &["Target", "Consistency", "TmpfsOptions"];
+
+const BIND_OPTION_FIELDS: &[&str] = &[
+    "Propagation",
+    "NonRecursive",
+    "CreateMountpoint",
+    "ReadOnlyNonRecursive",
+    "ReadOnlyForceRecursive",
+];
+
+/// May hold any value in `BindOptions`; Propagation has its own rule, and
+/// every other key, ReadOnlyNonRecursive included, must be zero.
+const BIND_OPTION_ANY_VALUE: &[&str] = &["NonRecursive", "CreateMountpoint", "ReadOnlyForceRecursive"];
+
+fn find_volume<'a>(host_path: &str, policy: &'a Policy) -> Option<&'a crate::policy::Volume> {
+    policy.volumes.as_ref()?.iter().find(|v| v.host_path == host_path)
+}
+
+fn check_binds(raw: Option<&serde_json::Value>, policy: &Policy) -> std::result::Result<(), String> {
+    let raw = match raw {
+        None | Some(serde_json::Value::Null) => return Ok(()),
+        Some(r) => r,
+    };
+    let not_list = || {
+        format!(
+            "HostConfig.Binds must be a list of strings for service {}",
+            policy.service_name
+        )
+    };
+    let binds = raw.as_array().ok_or_else(not_list)?;
+    for bind in binds {
+        let bind_str = bind.as_str().ok_or_else(not_list)?;
+        let parts: Vec<&str> = bind_str.split(':').collect();
+        if bind_str.is_empty() || parts.len() > 3 {
+            return Err(format!(
+                "bind {:?} is not a valid bind for service {}",
+                bind_str, policy.service_name
+            ));
+        }
+        let host_path = parts[0];
+        let vol = find_volume(host_path, policy).ok_or_else(|| {
+            format!(
+                "volume mount {:?} is not in the whitelist for service {}",
+                host_path, policy.service_name
+            )
+        })?;
+        let opts: Vec<&str> = if parts.len() == 3 && !parts[2].is_empty() {
+            parts[2].split(',').collect()
+        } else {
+            Vec::new()
+        };
+        for o in &opts {
+            if !BIND_MODES.contains(o) {
+                return Err(format!(
+                    "bind option {:?} on volume mount {:?} is not allowed for service {}",
+                    o, host_path, policy.service_name
+                ));
+            }
+        }
+        if !vol.read_write && (!opts.contains(&"ro") || opts.contains(&"rw")) {
+            return Err(format!(
+                "volume mount {:?} must be read-only (:ro) for service {}",
+                host_path, policy.service_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_mounts(raw: Option<&serde_json::Value>, policy: &Policy) -> std::result::Result<(), String> {
+    let raw = match raw {
+        None | Some(serde_json::Value::Null) => return Ok(()),
+        Some(r) => r,
+    };
+    let mounts = raw
+        .as_array()
+        .ok_or_else(|| format!("HostConfig.Mounts must be a list for service {}", policy.service_name))?;
+    for m in mounts {
+        let mount = m.as_object().ok_or_else(|| {
+            format!(
+                "HostConfig.Mounts entry must be an object for service {}",
+                policy.service_name
+            )
+        })?;
+        check_mount(mount, policy)?;
+    }
+    Ok(())
+}
+
+fn check_mount(mount: &JsonObject, policy: &Policy) -> std::result::Result<(), String> {
+    check_field_case("HostConfig.Mounts.", mount.keys(), MOUNT_FIELDS, policy)?;
+    for key in sorted_keys(mount.keys()) {
+        let value = &mount[key.as_str()];
+        match key.as_str() {
+            "Type" | "Source" | "ReadOnly" => {}
+            "BindOptions" => check_bind_options(value, policy)?,
+            k if MOUNT_ANY_VALUE.contains(&k) => {}
+            k => {
+                if !is_zero_value(value) {
+                    return Err(format!(
+                        "HostConfig.Mounts.{} is not allowed for service {}",
+                        k, policy.service_name
+                    ));
+                }
+            }
+        }
+    }
+
+    let mount_type = mount.get("Type").and_then(|v| v.as_str()).unwrap_or("");
+    let source = mount.get("Source").and_then(|v| v.as_str()).unwrap_or("");
+    match mount_type {
+        "tmpfs" => {
+            if !mount.get("Source").map_or(true, is_zero_value) {
+                return Err(format!(
+                    "tmpfs mount must not have a Source for service {}",
+                    policy.service_name
+                ));
+            }
+            Ok(())
+        }
+        "bind" => {
+            let vol = find_volume(source, policy).ok_or_else(|| {
+                format!(
+                    "mount source {:?} is not in the whitelist for service {}",
+                    source, policy.service_name
+                )
+            })?;
+            let read_only = mount.get("ReadOnly").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !vol.read_write && !read_only {
+                return Err(format!(
+                    "mount of {:?} must be read-only (ReadOnly: true) for service {}",
+                    source, policy.service_name
+                ));
+            }
+            Ok(())
+        }
+        t => Err(format!(
+            "mount type {:?} is not allowed for service {}",
+            t, policy.service_name
+        )),
+    }
+}
+
+fn check_bind_options(raw: &serde_json::Value, policy: &Policy) -> std::result::Result<(), String> {
+    if raw.is_null() {
+        return Ok(());
+    }
+    let opts = raw.as_object().ok_or_else(|| {
+        format!(
+            "HostConfig.Mounts.BindOptions must be an object for service {}",
+            policy.service_name
+        )
+    })?;
+    check_field_case(
+        "HostConfig.Mounts.BindOptions.",
+        opts.keys(),
+        BIND_OPTION_FIELDS,
+        policy,
+    )?;
+    for key in sorted_keys(opts.keys()) {
+        let value = &opts[key.as_str()];
+        match key.as_str() {
+            "Propagation" => match value {
+                serde_json::Value::Null => {}
+                serde_json::Value::String(s) if s.is_empty() || s == "private" || s == "rprivate" => {}
+                serde_json::Value::String(s) => {
+                    return Err(format!(
+                        "mount propagation {:?} is not allowed for service {}",
+                        s, policy.service_name
+                    ))
+                }
+                v => {
+                    return Err(format!(
+                        "mount propagation {} is not allowed for service {}",
+                        v, policy.service_name
+                    ))
+                }
+            },
+            k if BIND_OPTION_ANY_VALUE.contains(&k) => {}
+            k => {
+                if !is_zero_value(value) {
+                    return Err(format!(
+                        "HostConfig.Mounts.BindOptions.{} is not allowed for service {}",
+                        k, policy.service_name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Gate for MountSourceGate {
     fn check(
         &self,
@@ -118,31 +337,374 @@ impl Gate for MountSourceGate {
         policy: &Policy,
         body: &HashMap<String, serde_json::Value>,
     ) -> std::result::Result<(), String> {
-        let volumes = match &policy.volumes {
-            Some(v) if !v.is_empty() => v,
-            _ => return Ok(()),
-        };
-
         if let Some(host_config) = body.get("HostConfig").and_then(|v| v.as_object()) {
-            if let Some(binds) = host_config.get("Binds").and_then(|v| v.as_array()) {
-                for bind in binds {
-                    let bind_str = bind.as_str().unwrap_or("");
-                    let host_path = bind_str.split(':').next().unwrap_or(bind_str);
-                    if !volumes.iter().any(|v| v.host_path == host_path) {
-                        return Err(format!("volume mount {:?} is not in the whitelist", host_path));
+            check_binds(host_config.get("Binds"), policy)?;
+            check_mounts(host_config.get("Mounts"), policy)?;
+        }
+
+        if let Some(body_volumes) = body.get("Volumes").and_then(|v| v.as_object()) {
+            for host_path in sorted_keys(body_volumes.keys()) {
+                if find_volume(&host_path, policy).is_none() {
+                    return Err(format!(
+                        "volume {:?} is not in the whitelist for service {}",
+                        host_path, policy.service_name
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// HostConfigGate is the default-deny check on `HostConfig` (#88). It runs
+/// after ContainerConfigMutator, on the body that is forwarded, so values the
+/// policy forces (Privileged, NetworkMode, SecurityOpt, ...) are what it sees.
+///
+/// A key in `HOST_CONFIG_ANY_VALUE` may hold any value. SecurityOpt,
+/// OomScoreAdj and the namespace modes have their own rules. Binds and Mounts
+/// are checked by MountSourceGate. Every other key, known or not, must be
+/// absent or hold a zero value (null, false, 0, "", [] or {}); MaskedPaths and
+/// ReadonlyPaths must be absent or null, because an empty list unmasks /proc.
+///
+/// The daemon matches JSON keys without regard to case, and the last match
+/// wins, so `"privileged": true` would set Privileged and `"securityopt": null`
+/// would clear a forced SecurityOpt. A key that folds to a known field name
+/// but is not spelled exactly like it is denied, here and at the top level.
+pub struct HostConfigGate;
+
+/// Every HostConfig field of the Docker Engine API (v1.44 and later,
+/// including the embedded Resources fields), plus a few removed ones. Used
+/// only to catch case variants of field names.
+const HOST_CONFIG_FIELDS: &[&str] = &[
+    "Binds",
+    "ContainerIDFile",
+    "LogConfig",
+    "NetworkMode",
+    "PortBindings",
+    "RestartPolicy",
+    "AutoRemove",
+    "VolumeDriver",
+    "VolumesFrom",
+    "Mounts",
+    "ConsoleSize",
+    "Annotations",
+    "CapAdd",
+    "CapDrop",
+    "CgroupnsMode",
+    "Dns",
+    "DnsOptions",
+    "DnsSearch",
+    "ExtraHosts",
+    "GroupAdd",
+    "IpcMode",
+    "Cgroup",
+    "Links",
+    "OomScoreAdj",
+    "PidMode",
+    "Privileged",
+    "PublishAllPorts",
+    "ReadonlyRootfs",
+    "SecurityOpt",
+    "StorageOpt",
+    "Tmpfs",
+    "UTSMode",
+    "UsernsMode",
+    "ShmSize",
+    "Sysctls",
+    "Runtime",
+    "Isolation",
+    "MaskedPaths",
+    "ReadonlyPaths",
+    "Init",
+    "Capabilities",
+    "CpuShares",
+    "Memory",
+    "CgroupParent",
+    "BlkioWeight",
+    "BlkioWeightDevice",
+    "BlkioDeviceReadBps",
+    "BlkioDeviceWriteBps",
+    "BlkioDeviceReadIOps",
+    "BlkioDeviceWriteIOps",
+    "CpuPeriod",
+    "CpuQuota",
+    "CpuRealtimePeriod",
+    "CpuRealtimeRuntime",
+    "CpusetCpus",
+    "CpusetMems",
+    "Devices",
+    "DeviceCgroupRules",
+    "DeviceRequests",
+    "KernelMemory",
+    "KernelMemoryTCP",
+    "MemoryReservation",
+    "MemorySwap",
+    "MemorySwappiness",
+    "NanoCpus",
+    "OomKillDisable",
+    "PidsLimit",
+    "Ulimits",
+    "CpuCount",
+    "CpuPercent",
+    "IOMaximumIOps",
+    "IOMaximumBandwidth",
+];
+
+/// Every top-level field of the create body (the container Config,
+/// HostConfig and NetworkingConfig), used to catch case variants.
+const CREATE_BODY_FIELDS: &[&str] = &[
+    "Hostname",
+    "Domainname",
+    "User",
+    "AttachStdin",
+    "AttachStdout",
+    "AttachStderr",
+    "ExposedPorts",
+    "Tty",
+    "OpenStdin",
+    "StdinOnce",
+    "Env",
+    "Cmd",
+    "Healthcheck",
+    "ArgsEscaped",
+    "Image",
+    "Volumes",
+    "WorkingDir",
+    "Entrypoint",
+    "NetworkDisabled",
+    "MacAddress",
+    "OnBuild",
+    "Labels",
+    "StopSignal",
+    "StopTimeout",
+    "Shell",
+    "HostConfig",
+    "NetworkingConfig",
+];
+
+/// Every field of NetworkingConfig.
+const NETWORKING_CONFIG_FIELDS: &[&str] = &["EndpointsConfig"];
+
+/// May hold any value. NetworkMode, RestartPolicy and LogConfig are
+/// overwritten by the mutator when the policy sets them.
+const HOST_CONFIG_ANY_VALUE: &[&str] = &[
+    "NetworkMode",
+    "RestartPolicy",
+    "LogConfig",
+    "CapDrop",
+    "ReadonlyRootfs",
+    "Init",
+    "AutoRemove",
+    "ConsoleSize",
+    "ShmSize",
+    "PortBindings",
+    "PublishAllPorts",
+    "Dns",
+    "DnsOptions",
+    "DnsSearch",
+    "ExtraHosts",
+    "Tmpfs",
+    "Ulimits",
+    "Memory",
+    "MemoryReservation",
+    "MemorySwap",
+    "MemorySwappiness",
+    "NanoCpus",
+    "CpuShares",
+    "CpuPeriod",
+    "CpuQuota",
+    "CpusetCpus",
+    "CpusetMems",
+    "PidsLimit",
+    "BlkioWeight",
+    "ContainerIDFile",
+];
+
+/// The values a namespace field may take besides "". "host" and
+/// "container:<id>" are denied.
+fn host_config_modes(key: &str) -> Option<&'static [&'static str]> {
+    match key {
+        "PidMode" | "UTSMode" | "UsernsMode" | "Cgroup" => Some(&[]),
+        "IpcMode" => Some(&["private", "shareable", "none"]),
+        "CgroupnsMode" => Some(&["private"]),
+        "Isolation" => Some(&["default"]),
+        _ => None,
+    }
+}
+
+const NO_NEW_PRIVILEGES: &[&str] = &["no-new-privileges", "no-new-privileges:true"];
+
+/// Folds a key the way the daemon's JSON decoder matches field names: ASCII
+/// case, plus the Kelvin sign (U+212A) as k and the long s (U+017F) as s.
+fn fold_key(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{212a}' => 'k',
+            '\u{17f}' => 's',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+fn sorted_keys<'a, I: Iterator<Item = &'a String>>(keys: I) -> Vec<String> {
+    let mut v: Vec<String> = keys.cloned().collect();
+    v.sort();
+    v
+}
+
+/// Denies a key that the daemon would read as one of `fields` but that is
+/// not spelled exactly like it.
+fn check_field_case<'a, I: Iterator<Item = &'a String>>(
+    prefix: &str,
+    keys: I,
+    fields: &[&str],
+    policy: &Policy,
+) -> std::result::Result<(), String> {
+    for key in sorted_keys(keys) {
+        let folded = fold_key(&key);
+        for f in fields {
+            if key != *f && folded == fold_key(f) {
+                return Err(format!(
+                    "{}{} is not allowed for service {} (the daemon reads it as {}{})",
+                    prefix, key, policy.service_name, prefix, f
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// null, false, 0, "", [] and {}.
+fn is_zero_value(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(b) => !b,
+        serde_json::Value::Number(n) => n.as_f64() == Some(0.0),
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+    }
+}
+
+fn check_security_opt(value: &serde_json::Value, policy: &Policy) -> std::result::Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let list = value.as_array().ok_or_else(|| {
+        format!(
+            "HostConfig.SecurityOpt must be a list for service {}",
+            policy.service_name
+        )
+    })?;
+    let policy_opts = policy
+        .container_config
+        .as_ref()
+        .and_then(|c| c.security_options.as_ref());
+    for e in list {
+        let s = match e.as_str() {
+            Some(s) => s,
+            None => {
+                return Err(format!(
+                    "HostConfig.SecurityOpt entry {} is not allowed for service {}",
+                    e, policy.service_name
+                ))
+            }
+        };
+        if NO_NEW_PRIVILEGES.contains(&s) || policy_opts.is_some_and(|o| o.iter().any(|x| x == s)) {
+            continue;
+        }
+        return Err(format!(
+            "HostConfig.SecurityOpt entry {:?} is not allowed for service {}",
+            s, policy.service_name
+        ));
+    }
+    Ok(())
+}
+
+fn check_mode(
+    key: &str,
+    value: &serde_json::Value,
+    allowed: &[&str],
+    policy: &Policy,
+) -> std::result::Result<(), String> {
+    match value {
+        serde_json::Value::Null => Ok(()),
+        serde_json::Value::String(s) if s.is_empty() || allowed.contains(&s.as_str()) => Ok(()),
+        serde_json::Value::String(s) => Err(format!(
+            "HostConfig.{} value {:?} is not allowed for service {}",
+            key, s, policy.service_name
+        )),
+        v => Err(format!(
+            "HostConfig.{} value {} is not allowed for service {}",
+            key, v, policy.service_name
+        )),
+    }
+}
+
+impl Gate for HostConfigGate {
+    fn check(
+        &self,
+        _method: &str,
+        _path: &str,
+        policy: &Policy,
+        body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
+        check_field_case("", body.keys(), CREATE_BODY_FIELDS, policy)?;
+        // NetworkEndpointsGate and the mutator read
+        // NetworkingConfig.EndpointsConfig by its exact name; the daemon would
+        // also read "endpointsconfig".
+        if let Some(nc) = body.get("NetworkingConfig").and_then(|v| v.as_object()) {
+            check_field_case("NetworkingConfig.", nc.keys(), NETWORKING_CONFIG_FIELDS, policy)?;
+        }
+
+        let hc = match body.get("HostConfig") {
+            None | Some(serde_json::Value::Null) => return Ok(()),
+            Some(serde_json::Value::Object(hc)) => hc,
+            Some(_) => {
+                return Err(format!(
+                    "HostConfig must be an object for service {}",
+                    policy.service_name
+                ))
+            }
+        };
+        check_field_case("HostConfig.", hc.keys(), HOST_CONFIG_FIELDS, policy)?;
+
+        for key in sorted_keys(hc.keys()) {
+            let value = &hc[key.as_str()];
+            match key.as_str() {
+                // MountSourceGate.
+                "Binds" | "Mounts" => {}
+                k if HOST_CONFIG_ANY_VALUE.contains(&k) => {}
+                "MaskedPaths" | "ReadonlyPaths" => {
+                    if !value.is_null() {
+                        return Err(format!(
+                            "HostConfig.{} is not allowed for service {}",
+                            key, policy.service_name
+                        ));
+                    }
+                }
+                "SecurityOpt" => check_security_opt(value, policy)?,
+                "OomScoreAdj" => {
+                    if !value.is_null() && !value.as_f64().is_some_and(|n| n >= 0.0) {
+                        return Err(format!(
+                            "HostConfig.OomScoreAdj value {} is not allowed for service {}",
+                            value, policy.service_name
+                        ));
+                    }
+                }
+                k => {
+                    if let Some(modes) = host_config_modes(k) {
+                        check_mode(k, value, modes, policy)?;
+                    } else if !is_zero_value(value) {
+                        return Err(format!(
+                            "HostConfig.{} is not allowed for service {}",
+                            k, policy.service_name
+                        ));
                     }
                 }
             }
         }
-
-        if let Some(body_volumes) = body.get("Volumes").and_then(|v| v.as_object()) {
-            for host_path in body_volumes.keys() {
-                if !volumes.iter().any(|v| v.host_path == *host_path) {
-                    return Err(format!("volume {:?} is not in the whitelist", host_path));
-                }
-            }
-        }
-
         Ok(())
     }
 }
@@ -365,18 +927,29 @@ fn force_endpoints(mode: &str, body: &mut HashMap<String, serde_json::Value>) {
     }
 }
 
+/// ContainerConfigMutator overwrites the fields the policy's
+/// `container_config` sets. It forces `HostConfig.Privileged` to false on
+/// every create, even without a `container_config` (#88). A `HostConfig` that
+/// is not an object is left alone for HostConfigGate to deny.
 pub struct ContainerConfigMutator;
 impl Mutator for ContainerConfigMutator {
     fn mutate(&self, policy: &Policy, body: &mut HashMap<String, serde_json::Value>) {
+        let host_config = body
+            .entry("HostConfig".to_string())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        if host_config.is_null() {
+            *host_config = serde_json::Value::Object(Default::default());
+        }
+        let hc = match host_config.as_object_mut() {
+            Some(hc) => hc,
+            None => return,
+        };
+        hc.insert("Privileged".to_string(), serde_json::Value::Bool(false));
+
         let cc = match &policy.container_config {
             Some(c) => c,
             None => return,
         };
-
-        let host_config = body
-            .entry("HostConfig".to_string())
-            .or_insert_with(|| serde_json::Value::Object(Default::default()));
-        let hc = host_config.as_object_mut().unwrap();
 
         if let Some(nm) = &cc.network_mode {
             hc.insert("NetworkMode".to_string(), serde_json::Value::String(nm.clone()));
@@ -391,7 +964,12 @@ impl Mutator for ContainerConfigMutator {
                 serde_json::Value::Array(so.iter().map(|s| serde_json::Value::String(s.clone())).collect()),
             );
         }
-        hc.insert("Privileged".to_string(), serde_json::Value::Bool(false));
+        if let Some(driver) = &cc.log_driver {
+            hc.insert(
+                "LogConfig".to_string(),
+                serde_json::json!({"Type": driver, "Config": cc.log_options.clone().unwrap_or_default()}),
+            );
+        }
         if let Some(u) = &cc.user {
             body.insert("User".to_string(), serde_json::Value::String(u.clone()));
         }
