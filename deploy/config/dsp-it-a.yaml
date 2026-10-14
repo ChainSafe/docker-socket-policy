@@ -13,3 +13,7 @@ allowed_image_prefixes:
 
 container_config:
   user: '1111:1111'
+  # Two forced supplementary groups for the #93 checks; dsp-it-b has none.
+  group_add:
+    - '64190'
+    - '64191'

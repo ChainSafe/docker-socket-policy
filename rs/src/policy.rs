@@ -942,6 +942,119 @@ value_pattern: ^\d+[kmg]$
                 )],
                 "container_names must not be empty",
             ),
+            // container_config.group_add (#93).
+            (
+                "group_add GIDs and names",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', '4294967295', jwt, _x-1, 'samba$', abcdefghijklmnopqrstuvwxyz012345]\n",
+                )],
+                "",
+            ),
+            (
+                "group_add empty",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: []\n",
+                )],
+                "",
+            ),
+            (
+                "group_add 0",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', '0']\n",
+                )],
+                r#"policy file a.yaml: group_add entry "0" is the root group, which is not allowed"#,
+            ),
+            (
+                "group_add 00",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['00']\n",
+                )],
+                r#"policy file a.yaml: group_add entry "00" is the root group, which is not allowed"#,
+            ),
+            (
+                "group_add root",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [root]\n",
+                )],
+                r#"policy file a.yaml: group_add entry "root" is the root group, which is not allowed"#,
+            ),
+            (
+                "group_add duplicate",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', jwt, '64190']\n",
+                )],
+                r#"policy file a.yaml: duplicate group_add entry "64190""#,
+            ),
+            (
+                "group_add duplicate GID with leading zero",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', '064190']\n",
+                )],
+                r#"policy file a.yaml: duplicate group_add entry "064190""#,
+            ),
+            (
+                "group_add GID too large",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['4294967296']\n",
+                )],
+                r#"policy file a.yaml: invalid group_add entry "4294967296""#,
+            ),
+            (
+                "group_add upper-case name",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [Jwt]\n",
+                )],
+                r#"policy file a.yaml: invalid group_add entry "Jwt""#,
+            ),
+            (
+                "group_add name with a space",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['a b']\n",
+                )],
+                r#"policy file a.yaml: invalid group_add entry "a b""#,
+            ),
+            (
+                "group_add name starting with a dash",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['-x']\n",
+                )],
+                r#"policy file a.yaml: invalid group_add entry "-x""#,
+            ),
+            (
+                "group_add name of 33 characters",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [abcdefghijklmnopqrstuvwxyz0123456]\n",
+                )],
+                r#"policy file a.yaml: invalid group_add entry "abcdefghijklmnopqrstuvwxyz0123456""#,
+            ),
+            (
+                "group_add empty string",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['']\n",
+                )],
+                r#"policy file a.yaml: invalid group_add entry """#,
+            ),
+            (
+                "group_add unquoted number",
+                vec![(
+                    "a.yaml",
+                    "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [64190]\n",
+                )],
+                "group_add entries must be strings",
+            ),
         ];
         let mut mismatches = Vec::new();
         for (name, files, want) in cases {
@@ -954,6 +1067,18 @@ value_pattern: ^\d+[kmg]$
             }
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// An empty group_add is the same as an unset one (#93).
+    #[test]
+    fn test_manager_empty_group_add_is_unset() {
+        let m = load_dir(&[(
+            "a.yaml",
+            "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: []\n",
+        )])
+        .unwrap();
+        let cc = m.get("a").unwrap().container_config.as_ref().unwrap();
+        assert_eq!(cc.group_add, None);
     }
 
     /// #85 selection: the one policy matching the image and accepting the

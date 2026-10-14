@@ -233,6 +233,95 @@ describe("Manager container names", () => {
         { "a.yaml": "service_name: a\ncontainer_names: []\nallowed_image_prefixes: [alpine]\n" },
         "container_names must not be empty",
       ],
+      // container_config.group_add (#93).
+      [
+        "group_add GIDs and names",
+        {
+          "a.yaml":
+            "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', '4294967295', jwt, _x-1, 'samba$', abcdefghijklmnopqrstuvwxyz012345]\n",
+        },
+        "",
+      ],
+      [
+        "group_add empty",
+        { "a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: []\n" },
+        "",
+      ],
+      [
+        "group_add 0",
+        {
+          "a.yaml":
+            "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', '0']\n",
+        },
+        'policy file a.yaml: group_add entry "0" is the root group, which is not allowed',
+      ],
+      [
+        "group_add 00",
+        { "a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['00']\n" },
+        'policy file a.yaml: group_add entry "00" is the root group, which is not allowed',
+      ],
+      [
+        "group_add root",
+        { "a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [root]\n" },
+        'policy file a.yaml: group_add entry "root" is the root group, which is not allowed',
+      ],
+      [
+        "group_add duplicate",
+        {
+          "a.yaml":
+            "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', jwt, '64190']\n",
+        },
+        'policy file a.yaml: duplicate group_add entry "64190"',
+      ],
+      [
+        "group_add duplicate GID with leading zero",
+        {
+          "a.yaml":
+            "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', '064190']\n",
+        },
+        'policy file a.yaml: duplicate group_add entry "064190"',
+      ],
+      [
+        "group_add GID too large",
+        {
+          "a.yaml":
+            "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['4294967296']\n",
+        },
+        'policy file a.yaml: invalid group_add entry "4294967296"',
+      ],
+      [
+        "group_add upper-case name",
+        { "a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [Jwt]\n" },
+        'policy file a.yaml: invalid group_add entry "Jwt"',
+      ],
+      [
+        "group_add name with a space",
+        { "a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['a b']\n" },
+        'policy file a.yaml: invalid group_add entry "a b"',
+      ],
+      [
+        "group_add name starting with a dash",
+        { "a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['-x']\n" },
+        'policy file a.yaml: invalid group_add entry "-x"',
+      ],
+      [
+        "group_add name of 33 characters",
+        {
+          "a.yaml":
+            "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [abcdefghijklmnopqrstuvwxyz0123456]\n",
+        },
+        'policy file a.yaml: invalid group_add entry "abcdefghijklmnopqrstuvwxyz0123456"',
+      ],
+      [
+        "group_add empty string",
+        { "a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['']\n" },
+        'policy file a.yaml: invalid group_add entry ""',
+      ],
+      [
+        "group_add unquoted number",
+        { "a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [64190]\n" },
+        "group_add entries must be strings",
+      ],
     ];
     const mismatches: string[] = [];
     for (const [name, files, want] of cases) {
@@ -250,6 +339,16 @@ describe("Manager container names", () => {
         mismatches.push(`${name}: error ${err}, want ${want}`);
     }
     assert.deepEqual(mismatches, []);
+  });
+
+  // An empty group_add is the same as an unset one (#93).
+  it("treats an empty group_add as unset", () => {
+    writeFileSync(
+      join(tmpDir, "a.yaml"),
+      "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: []\n",
+    );
+    const m = new Manager(tmpDir);
+    assert.equal(m.get("a")!.container_config!.group_add, undefined);
   });
 
   // #85 selection: the one policy matching the image and accepting the name,

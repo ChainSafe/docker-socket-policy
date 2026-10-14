@@ -807,6 +807,54 @@ check_denied "DELETE /v1.45/containers/<runner short ID> -> 403 (uncovered, #86)
 S=$(delete_status "$PROXY/containers/no-such-container")
 check_denied "DELETE /containers/no-such-container -> 403 (daemon 404, #86)" "$S" "$BODY" 'container no-such-container is not managed by any policy'
 
+# ─── Forced supplementary groups (#93) ───────────────────
+
+# deploy/config/dsp-it-a.yaml forces group_add ['64190', '64191']; dsp-it-b
+# has no group_add. community.docker.docker_container's groups: becomes
+# HostConfig.GroupAdd, a list of strings. Each create is inspected through the
+# proxy (reads pass) and removed. Before #93 the proxy forced no list and
+# denied any non-empty GroupAdd.
+echo ""
+echo "--- Forced group_add (#93) ---"
+
+FORCED_GROUPS='"GroupAdd":["64190","64191"]'
+
+# create_groups NAME HOSTCONFIG_JSON: create NAME from this runner's image.
+create_groups() {
+  delete_status "$PROXY/containers/$1?force=1" >/dev/null
+  post_json "{\"Image\":\"$IT_IMAGE\",\"Cmd\":[\"sleep\",\"300\"],\"HostConfig\":$2}" "$PROXY/containers/create?name=$1"
+}
+
+# inspect_groups NAME: the container's HostConfig.GroupAdd as the daemon
+# reports it, or "none"; then remove the container.
+inspect_groups() {
+  : >"$BODY"
+  curl -s -o "$BODY" $TIMEOUT --unix-socket "$PROXY_SOCK" "$PROXY/containers/$1/json" 2>/dev/null || true
+  g=$(grep -oE '"GroupAdd":(null|\[[^]]*\])' "$BODY" | head -n 1)
+  delete_status "$PROXY/containers/$1?force=1" >/dev/null
+  echo "${g:-none}"
+}
+
+S=$(create_groups dsp-it-a '{}')
+check "create dsp-it-a without GroupAdd -> 201" "201" "$S"
+check "dsp-it-a without GroupAdd: the daemon has the forced list" "$FORCED_GROUPS" "$(inspect_groups dsp-it-a)"
+
+S=$(create_groups dsp-it-a '{"GroupAdd":["64190","64191"]}')
+check "create dsp-it-a with the forced list -> 201" "201" "$S"
+check "dsp-it-a with the forced list: the daemon has it unchanged" "$FORCED_GROUPS" "$(inspect_groups dsp-it-a)"
+
+S=$(create_groups dsp-it-a '{"GroupAdd":["0","docker"]}')
+check "create dsp-it-a with another GroupAdd -> 201 (replaced, not denied)" "201" "$S"
+check "dsp-it-a with another GroupAdd: the daemon has the forced list" "$FORCED_GROUPS" "$(inspect_groups dsp-it-a)"
+
+S=$(create_groups dsp-it-a '{"groupadd":["0"]}')
+remove_if_created "$S"
+check_denied "create dsp-it-a with lower-case groupadd -> 403" "$S" "$BODY" 'HostConfig.groupadd is not allowed for service dsp-it-a'
+
+S=$(create_groups dsp-it-b '{"GroupAdd":["64190","64191"]}')
+remove_if_created "$S"
+check_denied "create dsp-it-b (no group_add) with GroupAdd -> 403" "$S" "$BODY" 'HostConfig.GroupAdd is not allowed for service dsp-it-b'
+
 # ─── Read-only mode (#75) ────────────────────────────────
 
 # The same config behind --readonly. Every request whose method is not GET or
