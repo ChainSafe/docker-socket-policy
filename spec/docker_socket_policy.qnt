@@ -42,6 +42,145 @@ module policy {
   }
 }
 
+// ─── Module: network_endpoints_model ────────────────────────────────────
+//
+// How ContainerConfigMutator and NetworkEndpointsGate treat
+// NetworkingConfig.EndpointsConfig when the policy forces
+// container_config.network_mode (#87). The state machine below records the
+// forced HostConfig.NetworkMode (`alwaysHostNetwork`); this module adds the
+// endpoint entries, which the daemon reads alongside it.
+//
+// EndpointsConfig is a map from network name to that entry's settings: ""
+// stands for `{}` and "a" for an entry with settings such as Aliases. An
+// absent NetworkingConfig and an empty EndpointsConfig are both `Map()`.
+// `container:x` stands for every `container:<name|id>` mode.
+//
+// ENFORCE_ENDPOINTS = false models all three before #87: the mutator forced
+// HostConfig.NetworkMode and forwarded EndpointsConfig as the caller sent
+// it. Without `--network` the Docker CLI sends {"default": {}}, so the
+// create succeeded and the start failed with `network default not found`.
+// true models all three after the fix: a key other than "default" and the
+// forced mode M is denied; otherwise host, none and container:x get no
+// entries, and bridge or a named network gets exactly one entry keyed M,
+// with the settings of the caller's M entry, else of its "default" entry,
+// else `{}`.
+
+module network_endpoints_model {
+  const ENFORCE_ENDPOINTS: bool
+
+  type Endpoints = str -> str
+  type EndpointsOutcome = { allowed: bool, endpoints: Endpoints }
+
+  pure val NETWORK_MODES = Set("host", "none", "container:x", "bridge", "mynet")
+  pure val ENDPOINT_KEYS = Set("default", "host", "none", "container:x", "bridge", "mynet", "other")
+  pure val ENDPOINT_SETTINGS = Set("", "a")
+
+  // Every EndpointsConfig over ENDPOINT_KEYS and ENDPOINT_SETTINGS.
+  pure val ENDPOINT_REQUESTS: Set[Endpoints] =
+    ENDPOINT_KEYS.powerset().fold(Set(), (acc, ks) => acc.union(ks.setOfMaps(ENDPOINT_SETTINGS)))
+
+  // Modes in which the container joins no network of its own.
+  pure def detachedMode(m: str): bool =
+    m == "host" or m == "none" or m == "container:x"
+
+  pure def forcedEntry(m: str, eps: Endpoints): str =
+    if (eps.keys().contains(m)) eps.get(m)
+    else if (eps.keys().contains("default")) eps.get("default")
+    else ""
+
+  pure def forceEndpoints(m: str, eps: Endpoints): Endpoints =
+    if (detachedMode(m)) Map() else Map(m -> forcedEntry(m, eps))
+
+  // The create request's endpoints after the gate and the mutator, for a
+  // policy that forces network mode m.
+  pure def handleEndpoints(m: str, eps: Endpoints): EndpointsOutcome =
+    if (not(ENFORCE_ENDPOINTS)) { allowed: true, endpoints: eps }
+    else if (eps.keys().forall(k => k == "default" or k == m))
+      { allowed: true, endpoints: forceEndpoints(m, eps) }
+    else { allowed: false, endpoints: eps }
+
+  // The daemon starts the container only when every endpoint key names its
+  // NetworkMode. Checked on Engine 29.8.2, API 1.41 to 1.56: with NetworkMode
+  // host, none or bridge, a "default" entry fails the start with
+  // `network default not found`, and an empty EndpointsConfig starts.
+  pure def daemonStarts(m: str, eps: Endpoints): bool =
+    eps.keys().forall(k => k == m)
+
+  // Rule: an endpoint key other than "default" and the forced mode is denied.
+  val extraNetworkDenied = NETWORK_MODES.forall(m => ENDPOINT_REQUESTS.forall(eps =>
+    eps.keys().exists(k => k != "default" and k != m) implies not(handleEndpoints(m, eps).allowed)
+  ))
+
+  // Security: an allowed create names no network but the forced one.
+  val onlyForcedNetwork = NETWORK_MODES.forall(m => ENDPOINT_REQUESTS.forall(eps =>
+    val o = handleEndpoints(m, eps)
+    o.allowed implies o.endpoints.keys().subseteq(Set(m))
+  ))
+
+  // The bug: every allowed create also starts.
+  val allowedCreatesStart = NETWORK_MODES.forall(m => ENDPOINT_REQUESTS.forall(eps =>
+    val o = handleEndpoints(m, eps)
+    o.allowed implies daemonStarts(m, o.endpoints)
+  ))
+}
+
+module network_endpoints {
+  import network_endpoints_model(ENFORCE_ENDPOINTS = true).*
+
+  pure def allowedWith(m: str, eps: Endpoints, want: Endpoints): bool =
+    handleEndpoints(m, eps) == { allowed: true, endpoints: want }
+
+  pure def denied(m: str, eps: Endpoints): bool =
+    not(handleEndpoints(m, eps).allowed)
+
+  run endpointsSoundTest =
+    assert(and { extraNetworkDenied, onlyForcedNetwork, allowedCreatesStart })
+
+  run hostNoEndpointsTest = assert(allowedWith("host", Map(), Map()))
+  run hostDefaultClearedTest = assert(allowedWith("host", Map("default" -> ""), Map()))
+  run hostOwnClearedTest = assert(allowedWith("host", Map("host" -> "a"), Map()))
+  run hostExtraDeniedTest = assert(denied("host", Map("default" -> "", "other" -> "")))
+
+  run noneNoEndpointsTest = assert(allowedWith("none", Map(), Map()))
+  run noneDefaultClearedTest = assert(allowedWith("none", Map("default" -> ""), Map()))
+  run noneOwnClearedTest = assert(allowedWith("none", Map("none" -> "a"), Map()))
+  run noneExtraDeniedTest = assert(denied("none", Map("default" -> "", "other" -> "")))
+
+  run containerNoEndpointsTest = assert(allowedWith("container:x", Map(), Map()))
+  run containerDefaultClearedTest = assert(allowedWith("container:x", Map("default" -> ""), Map()))
+  run containerOwnClearedTest = assert(allowedWith("container:x", Map("container:x" -> "a"), Map()))
+  run containerExtraDeniedTest = assert(denied("container:x", Map("default" -> "", "other" -> "")))
+
+  run bridgeNoEndpointsTest = assert(allowedWith("bridge", Map(), Map("bridge" -> "")))
+  run bridgeDefaultRekeyedTest = assert(allowedWith("bridge", Map("default" -> "a"), Map("bridge" -> "a")))
+  run bridgeOwnKeptTest = assert(allowedWith("bridge", Map("bridge" -> "a"), Map("bridge" -> "a")))
+  run bridgeExtraDeniedTest = assert(denied("bridge", Map("default" -> "", "other" -> "")))
+
+  run namedNoEndpointsTest = assert(allowedWith("mynet", Map(), Map("mynet" -> "")))
+  run namedDefaultRekeyedTest = assert(allowedWith("mynet", Map("default" -> "a"), Map("mynet" -> "a")))
+  run namedOwnKeptTest = assert(allowedWith("mynet", Map("mynet" -> "a"), Map("mynet" -> "a")))
+  run namedExtraDeniedTest = assert(denied("mynet", Map("default" -> "", "other" -> "")))
+  run namedOwnOverDefaultTest = assert(allowedWith("mynet", Map("default" -> "a", "mynet" -> ""), Map("mynet" -> "")))
+}
+
+// All three before #87: EndpointsConfig went through as the caller sent it.
+// The Docker CLI's {"default": {}} was allowed with network_mode host, and
+// the daemon then refused to start the container; an extra entry was allowed
+// too.
+module network_endpoints_pre87 {
+  import network_endpoints_model(ENFORCE_ENDPOINTS = false).*
+
+  run pre87UnsoundTest =
+    assert(and {
+      not(extraNetworkDenied),
+      not(onlyForcedNetwork),
+      not(allowedCreatesStart),
+      handleEndpoints("host", Map("default" -> "")) == { allowed: true, endpoints: Map("default" -> "") },
+      not(daemonStarts("host", Map("default" -> ""))),
+      handleEndpoints("host", Map("default" -> "", "other" -> "")).allowed,
+    })
+}
+
 // ─── Module: docker_socket_policy ───────────────────────────────────────
 
 module docker_socket_policy {
