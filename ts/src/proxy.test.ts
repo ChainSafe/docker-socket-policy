@@ -883,7 +883,16 @@ describe("Router container names", () => {
       // An invalid or undecodable name is denied.
       ["name=-beacon", lodestar, Action.Deny, undefined, "invalid container name"],
       ["name=bea%2Fcon", lodestar, Action.Deny, undefined, "invalid container name"],
+      // Decoded as the daemon's r.Form does.
+      ["name=%62eacon", lodestar, Action.CreateContainer, "beacon", undefined],
+      ["name=validator%2D2", lodestar, Action.CreateContainer, "validator", undefined],
+      // The daemon takes the first of a repeated name; the proxy denies it.
+      ["name=beacon&name=monitoring", lodestar, Action.Deny, undefined, "duplicate name query parameter"],
+      ["name=beacon&n%61me=validator", lodestar, Action.Deny, undefined, "duplicate name query parameter"],
+      // A query the daemon rejects is denied, as for the pull (#83).
       ["name=%zz", lodestar, Action.Deny, undefined, "invalid query string"],
+      ["platform=%zz&name=beacon", lodestar, Action.Deny, undefined, "invalid query string"],
+      ["name=beacon;x=1", lodestar, Action.Deny, undefined, "invalid query string"],
     ];
     const mismatches: string[] = [];
     for (const [query, body, want, service, msg] of cases) {

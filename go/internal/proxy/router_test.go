@@ -1093,7 +1093,16 @@ func TestRouteCreateSelectsByName(t *testing.T) {
 		// An invalid or undecodable name is denied.
 		{"name=-beacon", lodestar, ActionDeny, "", "invalid container name"},
 		{"name=bea%2Fcon", lodestar, ActionDeny, "", "invalid container name"},
+		// Decoded as the daemon's r.Form does.
+		{"name=%62eacon", lodestar, ActionCreateContainer, "beacon", ""},
+		{"name=validator%2D2", lodestar, ActionCreateContainer, "validator", ""},
+		// The daemon takes the first of a repeated name; the proxy denies it.
+		{"name=beacon&name=monitoring", lodestar, ActionDeny, "", "duplicate name query parameter"},
+		{"name=beacon&n%61me=validator", lodestar, ActionDeny, "", "duplicate name query parameter"},
+		// A query the daemon rejects is denied, as for the pull (#83).
 		{"name=%zz", lodestar, ActionDeny, "", "invalid query string"},
+		{"platform=%zz&name=beacon", lodestar, ActionDeny, "", "invalid query string"},
+		{"name=beacon;x=1", lodestar, ActionDeny, "", "invalid query string"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.query, func(t *testing.T) {

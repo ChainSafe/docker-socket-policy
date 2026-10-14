@@ -195,6 +195,11 @@ func createName(rawQuery string) (name, msg string) {
 	if err != nil {
 		return "", "invalid query string"
 	}
+	// The daemon takes the first of a repeated name (r.Form.Get). Deny it
+	// rather than pick, as the pull does for its parameters.
+	if len(q["name"]) > 1 {
+		return "", "duplicate name query parameter"
+	}
 	name = strings.TrimPrefix(q.Get("name"), "/")
 	if name != "" && !policy.ValidContainerName(name) {
 		return "", "invalid container name"

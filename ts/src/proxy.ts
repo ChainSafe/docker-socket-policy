@@ -239,6 +239,9 @@ function queryUnescape(s: string): string | undefined {
 function createName(query: string): { name: string } | { error: string } {
   const params = parseQuery(query);
   if (!params) return { error: "invalid query string" };
+  // The daemon takes the first of a repeated name (r.Form.Get). Deny it rather
+  // than pick, as the pull does for its parameters.
+  if (params.filter(([k]) => k === "name").length > 1) return { error: "duplicate name query parameter" };
   let name = params.find(([k]) => k === "name")?.[1] ?? "";
   if (name.startsWith("/")) name = name.slice(1);
   if (name !== "" && !validContainerName(name)) return { error: "invalid container name" };

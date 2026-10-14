@@ -366,6 +366,11 @@ fn deny(msg: &str) -> RouteResult {
 /// the daemon would reject or an invalid name (#85).
 fn create_name(query: &str) -> Result<String, &'static str> {
     let params = parse_query(query).ok_or("invalid query string")?;
+    // The daemon takes the first of a repeated name (r.Form.Get). Deny it
+    // rather than pick, as the pull does for its parameters.
+    if params.iter().filter(|(k, _)| k == "name").count() > 1 {
+        return Err("duplicate name query parameter");
+    }
     let name = params
         .iter()
         .find(|(k, _)| k == "name")
@@ -1896,6 +1901,51 @@ mod tests {
                 Some("invalid container name"),
             ),
             ("name=%zz", &lodestar, Action::Deny, None, Some("invalid query string")),
+            // Decoded as the daemon's r.Form does.
+            (
+                "name=%62eacon",
+                &lodestar,
+                Action::CreateContainer,
+                Some("beacon"),
+                None,
+            ),
+            (
+                "name=validator%2D2",
+                &lodestar,
+                Action::CreateContainer,
+                Some("validator"),
+                None,
+            ),
+            // The daemon takes the first of a repeated name; the proxy denies it.
+            (
+                "name=beacon&name=monitoring",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("duplicate name query parameter"),
+            ),
+            (
+                "name=beacon&n%61me=validator",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("duplicate name query parameter"),
+            ),
+            // A query the daemon rejects is denied, as for the pull (#83).
+            (
+                "platform=%zz&name=beacon",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("invalid query string"),
+            ),
+            (
+                "name=beacon;x=1",
+                &lodestar,
+                Action::Deny,
+                None,
+                Some("invalid query string"),
+            ),
         ];
         let mut mismatches = Vec::new();
         for (query, body, action, service, msg) in cases {

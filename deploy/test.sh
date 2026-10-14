@@ -763,6 +763,12 @@ S=$(post_json "$IT_BODY" "$PROXY/containers/create?name=dsp-it-c")
 remove_if_created "$S"
 check_denied "create ?name=dsp-it-c -> 403 (no policy accepts the name, #85)" "$S" "$BODY" "container name dsp-it-c not allowed for image $IT_IMAGE by any policy"
 
+# The daemon takes the first of a repeated name (r.Form.Get); the proxy denies
+# the request rather than guess which one an auditor would read.
+S=$(post_json "$IT_BODY" "$PROXY/containers/create?name=dsp-it-a&name=dsp-it-c")
+remove_if_created "$S"
+check_denied "create ?name=dsp-it-a&name=dsp-it-c -> 403 (duplicate name, #85)" "$S" "$BODY" 'duplicate name query parameter'
+
 S=$(post_json "$IT_BODY" "$PROXY/containers/create")
 remove_if_created "$S"
 check_denied "create without ?name= -> 403 (both policies set container_names, #85)" "$S" "$BODY" "image $IT_IMAGE requires a container name"
