@@ -339,3 +339,34 @@ describe("Chain", () => {
     assert.deepEqual(mismatches, []);
   });
 });
+
+// Pins the registry gate's reference parser (#84): a registry port is not a
+// tag, Docker Hub spellings match the normalised prefix, and the tag pattern
+// sees only the tag. The policy's prefixes are normalised, as the manager
+// stores them. Same rows in Go and Rust.
+describe("RegistryGate reference parsing (#84)", () => {
+  it("parses registry ports, Docker Hub spellings and tags", () => {
+    const gate = new RegistryGate();
+    const policy = makePolicy({
+      allowed_image_prefixes: ["chainsafe/lodestar", "localhost:5000/team", "registry.example.com:443/a"],
+      image_tag_pattern: "^(v[0-9]+|[0-9.]+)$",
+    });
+    const cases: [string, string | null][] = [
+      ["localhost:5000/team/app:1.2", null],
+      ["localhost:5000/team/app", null],
+      ["docker.io/chainsafe/lodestar:v1", null],
+      ["registry.example.com:443/a", null],
+      ["Registry.Example.com:443/a:2", null],
+      ["localhost:5000/team/app:latest", 'image tag "latest" does not match pattern "^(v[0-9]+|[0-9.]+)$"'],
+      ["localhost:5000/other:1", 'image "localhost:5000/other" is not in allowed prefixes'],
+      ["chainsafe/Lodestar:v1", 'invalid image reference "chainsafe/Lodestar:v1"'],
+    ];
+    const mismatches: string[] = [];
+    for (const [image, wantErr] of cases) {
+      const got = gate.check("POST", "/containers/create", policy, { Image: image });
+      const ok = wantErr === null ? got === null : got !== null && got.includes(wantErr);
+      if (!ok) mismatches.push(`${image}: got ${got}, want ${wantErr}`);
+    }
+    assert.deepEqual(mismatches, []);
+  });
+});

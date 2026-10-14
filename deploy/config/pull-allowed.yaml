@@ -1,0 +1,6 @@
+# Integration-only policy: lets deploy/test.sh pull a real image through the
+# proxy (#83). busybox is a few MB, so the pull is quick.
+service_name: pull-allowed
+allowed_image_prefixes:
+  - busybox
+image_tag_pattern: '^latest$'

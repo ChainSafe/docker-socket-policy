@@ -87,7 +87,11 @@ impl Handler {
                 None
             };
 
-        let route = self.router.route(&method, &path, body_json.as_ref());
+        // Route on the raw target: the path still percent-encoded (#53), and the
+        // query, which the image pull reads (#83).
+        let route = self
+            .router
+            .route_request(&method, &target, !body_bytes.is_empty(), body_json.as_ref());
 
         if route.action == Action::Deny {
             let msg = route.deny_msg.unwrap_or_default();
@@ -516,6 +520,50 @@ mod tests {
         assert_eq!(uri.query(), Some(query));
     }
 
+    /// #83: a pull with a body is never forwarded. The daemon reads a form
+    /// body's fromImage over the query's, so an allowed image in the query
+    /// and another in the body would pull the body's. Any body is denied,
+    /// whatever its Content-Type.
+    #[tokio::test]
+    async fn test_handler_pull_denies_body() {
+        let cases = [
+            ("application/x-www-form-urlencoded", "fromImage=busybox&tag=latest"),
+            ("application/json", r#"{"fromImage":"alpine"}"#),
+            ("text/plain", "x"),
+        ];
+        for (content_type, body) in cases {
+            let policy: crate::policy::Policy =
+                serde_yaml::from_str("service_name: probe\nallowed_image_prefixes:\n  - alpine\n").unwrap();
+            let mut policies = std::collections::HashMap::new();
+            policies.insert("probe".to_string(), policy);
+            let router = Arc::new(Router::new(Manager::from_map(policies)));
+            let captured_uri = Arc::new(std::sync::Mutex::new(None));
+            let transport = UriRecordingTransport {
+                captured_uri: captured_uri.clone(),
+            };
+            let audit = AuditLogger::new("/dev/null").unwrap();
+            let handler = Handler::new(router, Chain::new(), audit, Box::new(transport));
+            let req = Request::post("http://localhost/v1.56/images/create?fromImage=alpine&tag=3.19")
+                .header("content-type", content_type)
+                .body(Full::new(Bytes::from(body)))
+                .unwrap();
+            let resp = handler.handle(req).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{}", content_type);
+            let got = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                "image pull must not have a request body",
+                "{}",
+                content_type
+            );
+            assert!(
+                captured_uri.lock().unwrap().is_none(),
+                "{}: expected no forward",
+                content_type
+            );
+        }
+    }
+
     /// #55: the audit uri is the raw request target, query and escapes
     /// included, for allowed and denied requests alike.
     #[tokio::test]
@@ -709,5 +757,52 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "mismatches:\n{}", mismatches.join("\n"));
+    }
+
+    /// #83: the handler hands the query to the router. A pull sent the Docker
+    /// CLI way, empty body and image in the query, is forwarded with its
+    /// query unchanged, and a disallowed one is not forwarded.
+    #[tokio::test]
+    async fn test_handler_pull_routes_on_query() {
+        let make = || {
+            let policy: crate::policy::Policy =
+                serde_yaml::from_str("service_name: probe\nallowed_image_prefixes:\n  - alpine\n").unwrap();
+            let mut policies = std::collections::HashMap::new();
+            policies.insert("probe".to_string(), policy);
+            let router = Arc::new(Router::new(Manager::from_map(policies)));
+            let captured_uri = Arc::new(std::sync::Mutex::new(None));
+            let transport = UriRecordingTransport {
+                captured_uri: captured_uri.clone(),
+            };
+            let audit = AuditLogger::new("/dev/null").unwrap();
+            (
+                Handler::new(router, Chain::new(), audit, Box::new(transport)),
+                captured_uri,
+            )
+        };
+
+        let (handler, captured_uri) = make();
+        let query = "fromImage=docker.io%2Flibrary%2Falpine&tag=3.19";
+        let req = Request::post(format!("http://localhost/v1.56/images/create?{}", query))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let captured = captured_uri.lock().unwrap();
+        let uri = captured.as_ref().expect("expected the allowed pull to be forwarded");
+        assert_eq!(uri.query(), Some(query));
+
+        let (handler, captured_uri) = make();
+        let req = Request::post("http://localhost/v1.56/images/create?fromImage=busybox&tag=latest")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handler.handle(req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "image busybox not allowed by any policy"
+        );
+        assert!(captured_uri.lock().unwrap().is_none(), "expected no forward");
     }
 }

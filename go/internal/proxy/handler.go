@@ -72,8 +72,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Route on the raw path: r.URL.Path is already decoded and would hide %-escapes (#53).
+	// The query goes along for the image pull, which reads it (#83).
 	path := r.URL.EscapedPath()
-	route := h.router.Route(r.Method, path, bodyJSON)
+	target := path
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	route := h.router.RouteRequest(r.Method, target, len(body) > 0, bodyJSON)
 
 	extra := map[string]interface{}{
 		"method": r.Method,

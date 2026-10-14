@@ -137,21 +137,6 @@ describe("Router", () => {
     assert.equal(r.action, Action.Allow);
   });
 
-  it("allows POST /images/create for allowed image", () => {
-    const r = router.route("POST", "/images/create", { fromImage: "nginx:latest" });
-    assert.equal(r.action, Action.Allow);
-  });
-
-  it("denies POST /images/create for unknown image", () => {
-    const r = router.route("POST", "/images/create", { fromImage: "unknown:latest" });
-    assert.equal(r.action, Action.Deny);
-  });
-
-  it("denies POST /images/create with empty body", () => {
-    const r = router.route("POST", "/images/create", {});
-    assert.equal(r.action, Action.Deny);
-  });
-
   it("allows GET passthrough for unknown paths", () => {
     const r = router.route("GET", "/containers/foo/logs");
     assert.equal(r.action, Action.Allow);
@@ -339,7 +324,6 @@ describe("Router", () => {
   // two segments. Rows mirror the exec* and create* runs in spec/router.qnt.
   it("matches exec and create endpoints on whole path segments", () => {
     const createBody = { Image: "nginx:latest" };
-    const pullBody = { fromImage: "nginx:latest" };
     const exec = "exec is not allowed";
     const cases: [string, string, Record<string, unknown> | undefined, Action, string | undefined][] = [
       // execSubpathDeleteDeniedTest (#49)
@@ -361,7 +345,7 @@ describe("Router", () => {
       // Exec is matched under containers or exec only (#49, language-only).
       ["GET", "/images/exec", undefined, Action.Allow, undefined],
       // An allowed image, so only the path decides (#49, language-only).
-      ["POST", "/images/create/extra", pullBody, Action.Deny, undefined],
+      ["POST", "/images/create/extra?fromImage=nginx&tag=latest", undefined, Action.Deny, undefined],
       // A name ending in exec is a plain name (#49, language-only).
       ["GET", "/containers/myexec/json", undefined, Action.Allow, undefined],
       // A name starting with exec is a plain name (#49, language-only).
@@ -457,7 +441,6 @@ describe("Router", () => {
     const ro = new Router(m).withReadonly(true);
     const post = "read-only mode: POST requests are not allowed";
     const createBody = { Image: "chainsafe/lodestar:latest" };
-    const pullBody = { fromImage: "chainsafe/lodestar", tag: "latest" };
     const cases: [string, string, Record<string, unknown> | undefined, Action, string | undefined][] = [
       // readonlyGetAllowedTest (#75)
       ["GET", "/containers/json", undefined, Action.Allow, undefined],
@@ -472,7 +455,7 @@ describe("Router", () => {
       // readonlyDeleteDeniedTest (#75)
       ["DELETE", "/containers/mycontainer", undefined, Action.Deny, "read-only mode: DELETE requests are not allowed"],
       // #75: an image pull of an allowed image.
-      ["POST", "/images/create?fromImage=chainsafe/lodestar&tag=latest", pullBody, Action.Deny, post],
+      ["POST", "/images/create?fromImage=chainsafe%2Flodestar&tag=latest", undefined, Action.Deny, post],
       // readonlyCreateDeniedTest (#75): an allowed image, so only the flag decides.
       ["POST", "/containers/create", createBody, Action.Deny, post],
       // #75: methods outside the spec's universe.
@@ -633,6 +616,202 @@ describe("Router", () => {
       if (r.action !== want || r.denyMsg !== wantMsg) {
         mismatches.push(
           `${method} ${path}: got ${Action[r.action]}/${r.denyMsg ?? "-"}, want ${Action[want]}/${wantMsg ?? "-"}`,
+        );
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
+});
+
+const TEST_DIGEST = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+// The policy set for the #83 and #84 tables. beacon's prefixes are written in
+// spellings that normalisation must reduce at load time:
+// docker.io/chainsafe/lodestar is chainsafe/lodestar, and the registry host
+// Registry.Example.com:443 is lower-cased.
+function createPullManager(dir: string): Manager {
+  writeFileSync(
+    join(dir, "probe.yaml"),
+    "service_name: probe\nallowed_image_prefixes:\n  - alpine\nimage_digest_allowed: true\n",
+  );
+  writeFileSync(
+    join(dir, "beacon.yaml"),
+    "service_name: beacon\nallowed_image_prefixes:\n  - docker.io/chainsafe/lodestar\n  - ghcr.io/chainsafe/lodestar\n  - localhost:5000/x\n  - Registry.Example.com:443/a\nimage_tag_pattern: '^(v[0-9]+|[0-9]+)$'\n",
+  );
+  return new Manager(dir);
+}
+
+describe("Router image pull and normalisation (#83, #84)", () => {
+  let tmpDir: string;
+  let router: Router;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "proxy-pull-test-"));
+    router = new Router(createPullManager(tmpDir));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // Cross-language parity guard for #83 and #84. POST /images/create is
+  // routed on its query string, the way the Docker CLI sends it: fromImage
+  // (fully qualified, URL-encoded) and tag, with an empty body. The body is
+  // ignored, fromSrc (import) is denied, and the image gets the create checks:
+  // a policy prefix on the normalised repository, then that policy's tag
+  // pattern and digest rule. Rows mirror the pull* runs in spec/router.qnt;
+  // the rest are language-only.
+  it("routes POST /images/create on the query string", () => {
+    const alpineBody = { fromImage: "alpine" };
+    const notAllowed = (image: string) => `image ${image} not allowed by any policy`;
+    const required = "fromImage query parameter is required for image pull";
+    const fromSrc = "image import (fromSrc) is not allowed";
+    const bodyMsg = "image pull must not have a request body";
+    const encDigest = encodeURIComponent(TEST_DIGEST);
+    const cases: [string, Record<string, unknown> | undefined, Action, string, string][] = [
+      // pullCliAllowedTest (#83): the issue's reproduction, as the CLI sends it.
+      ["/v1.56/images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.19", undefined, Action.Allow, "probe", ""],
+      // pullShortNameAllowedTest (#84)
+      ["/images/create?fromImage=alpine&tag=3.19", undefined, Action.Allow, "probe", ""],
+      // pullLibraryNameAllowedTest (#84)
+      ["/images/create?fromImage=library%2Falpine&tag=latest", undefined, Action.Allow, "probe", ""],
+      // pullCliOrgAllowedTest (#84): the prefix is written docker.io/chainsafe/lodestar.
+      ["/images/create?fromImage=docker.io%2Fchainsafe%2Flodestar&tag=v1", undefined, Action.Allow, "beacon", ""],
+      // #84: the tag in fromImage, on another Docker Hub host name.
+      ["/images/create?fromImage=index.docker.io%2Flibrary%2Falpine%3A3.19", undefined, Action.Allow, "probe", ""],
+      // #83: the CLI sends a digest in tag.
+      [`/images/create?fromImage=alpine&tag=${encDigest}`, undefined, Action.Allow, "probe", ""],
+      // #83: a digest in fromImage.
+      [`/images/create?fromImage=alpine%40${encDigest}`, undefined, Action.Allow, "probe", ""],
+      // #83: image_digest_allowed is false for beacon.
+      [
+        `/images/create?fromImage=ghcr.io%2Fchainsafe%2Flodestar&tag=${encDigest}`,
+        undefined,
+        Action.Deny,
+        "",
+        "image digests not allowed for service beacon",
+      ],
+      // #84: a registry port is not a tag.
+      ["/images/create?fromImage=localhost%3A5000%2Fx%2Fy&tag=2", undefined, Action.Allow, "beacon", ""],
+      // #84: the registry host is compared lower-cased.
+      ["/images/create?fromImage=REGISTRY.example.com%3A443%2Fa&tag=1", undefined, Action.Allow, "beacon", ""],
+      // #83: the tag pattern applies to pulls.
+      [
+        "/images/create?fromImage=chainsafe%2Flodestar&tag=latest",
+        undefined,
+        Action.Deny,
+        "",
+        'image tag "latest" does not match pattern "^(v[0-9]+|[0-9]+)$"',
+      ],
+      // pullDisallowedCliDeniedTest (#83)
+      [
+        "/images/create?fromImage=docker.io%2Fattacker%2Fmalware&tag=latest",
+        undefined,
+        Action.Deny,
+        "",
+        notAllowed("docker.io/attacker/malware"),
+      ],
+      // pullOtherRegistryDeniedTest (#84): another registry is not Docker Hub's alpine.
+      [
+        "/images/create?fromImage=localhost%3A5000%2Falpine&tag=1",
+        undefined,
+        Action.Deny,
+        "",
+        notAllowed("localhost:5000/alpine"),
+      ],
+      // #84: the prefix match stays on namespace boundaries.
+      ["/images/create?fromImage=alpine-evil&tag=1", undefined, Action.Deny, "", notAllowed("alpine-evil")],
+      // pullNoFromImageDeniedTest (#83)
+      ["/images/create", undefined, Action.Deny, "", required],
+      // #83: the old contract, fromImage in a JSON body: a pull has no body.
+      ["/images/create", { fromImage: "alpine:3.19" }, Action.Deny, "", bodyMsg],
+      // pullBodyIgnoredDeniedTest (#83): the daemon would pull the query's image.
+      ["/images/create?fromImage=attacker%2Fmalware&tag=latest", alpineBody, Action.Deny, "", bodyMsg],
+      // pullJsonBodyDeniedTest (#83): any body is denied, even one that agrees.
+      ["/images/create?fromImage=alpine&tag=3.19", alpineBody, Action.Deny, "", bodyMsg],
+      // pullImportDeniedTest (#83): the daemon would import the tarball as alpine:latest.
+      [
+        "/images/create?fromSrc=http%3A%2F%2Fexample.com%2Fx.tar&repo=alpine&tag=latest",
+        undefined,
+        Action.Deny,
+        "",
+        fromSrc,
+      ],
+      // pullImportWithImageDeniedTest (#83)
+      ["/images/create?fromImage=alpine&tag=latest&fromSrc=-", undefined, Action.Deny, "", fromSrc],
+      // #83: a tag in fromImage and in tag is ambiguous.
+      [
+        "/images/create?fromImage=alpine%3A3.19&tag=3.20",
+        undefined,
+        Action.Deny,
+        "",
+        "fromImage alpine:3.19 already has a tag or digest; the tag query parameter is ambiguous",
+      ],
+      // #83: no tag and no digest pulls every tag.
+      [
+        "/images/create?fromImage=alpine",
+        undefined,
+        Action.Deny,
+        "",
+        "image pull without a tag or digest pulls every tag and is not allowed",
+      ],
+      // #84: upper case in the repository path is invalid.
+      ["/images/create?fromImage=Alpine&tag=latest", undefined, Action.Deny, "", 'invalid image reference "Alpine"'],
+      // #83: a repeated parameter could be read two ways.
+      [
+        "/images/create?fromImage=alpine&fromImage=attacker%2Fmalware&tag=1",
+        undefined,
+        Action.Deny,
+        "",
+        "duplicate fromImage query parameter",
+      ],
+      // #83: the daemon rejects a malformed query; so does the proxy.
+      ["/images/create?fromImage=alpine%zz&tag=1", undefined, Action.Deny, "", "invalid query string"],
+      // #53 still holds: the percent check reads the path, not the query.
+      ["/images/%63reate?fromImage=alpine&tag=1", undefined, Action.Deny, "", "percent-encoded path not allowed"],
+    ];
+    const mismatches: string[] = [];
+    for (const [path, body, want, service, wantMsg] of cases) {
+      const r = router.route("POST", path, body);
+      if (r.action !== want || (r.service ?? "") !== service || (r.denyMsg ?? "") !== wantMsg) {
+        mismatches.push(
+          `POST ${path}: got ${Action[r.action]}/${r.service ?? ""}/${r.denyMsg ?? ""}, want ${Action[want]}/${service}/${wantMsg}`,
+        );
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
+
+  // The normalisation table for #84, on the create route: each spelling
+  // selects the policy its normalised repository matches, and a path with
+  // upper case is invalid. The same table runs in Go and Rust.
+  it("normalises image references before policy matching", () => {
+    const notAllowed = (image: string) => `image ${image} not allowed by any policy`;
+    const cases: [string, Action, string, string][] = [
+      ["alpine", Action.CreateContainer, "probe", ""],
+      ["library/alpine", Action.CreateContainer, "probe", ""],
+      ["docker.io/library/alpine", Action.CreateContainer, "probe", ""],
+      ["docker.io/alpine", Action.CreateContainer, "probe", ""],
+      ["index.docker.io/library/alpine:3.19", Action.CreateContainer, "probe", ""],
+      ["docker.io/chainsafe/lodestar:v1", Action.CreateContainer, "beacon", ""],
+      ["chainsafe/lodestar:v1", Action.CreateContainer, "beacon", ""],
+      ["registry-1.docker.io/chainsafe/lodestar:v1", Action.CreateContainer, "beacon", ""],
+      [`ghcr.io/chainsafe/lodestar@${TEST_DIGEST}`, Action.CreateContainer, "beacon", ""],
+      ["localhost:5000/x/y:2", Action.CreateContainer, "beacon", ""],
+      ["registry.example.com:443/a", Action.CreateContainer, "beacon", ""],
+      ["Alpine:latest", Action.Deny, "", 'invalid image reference "Alpine:latest"'],
+      ["chainsafe/Lodestar:v1", Action.Deny, "", 'invalid image reference "chainsafe/Lodestar:v1"'],
+      ["alpine-evil", Action.Deny, "", notAllowed("alpine-evil")],
+      ["ghcr.io/library/alpine", Action.Deny, "", notAllowed("ghcr.io/library/alpine")],
+      ["ghcr.io/chainsafe/lodestar-evil", Action.Deny, "", notAllowed("ghcr.io/chainsafe/lodestar-evil")],
+      ["localhost:5000/xy:1", Action.Deny, "", notAllowed("localhost:5000/xy:1")],
+    ];
+    const mismatches: string[] = [];
+    for (const [image, want, service, wantMsg] of cases) {
+      const r = router.route("POST", "/containers/create", { Image: image });
+      if (r.action !== want || (r.service ?? "") !== service || (r.denyMsg ?? "") !== wantMsg) {
+        mismatches.push(
+          `create ${image}: got ${Action[r.action]}/${r.service ?? ""}/${r.denyMsg ?? ""}, want ${Action[want]}/${service}/${wantMsg}`,
         );
       }
     }

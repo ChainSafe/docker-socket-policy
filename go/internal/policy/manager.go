@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -72,6 +71,15 @@ func loadPolicy(filePath string) (*Policy, error) {
 		return nil, fmt.Errorf("policy file %s missing required field 'allowed_image_prefixes'", filePath)
 	}
 
+	// Prefixes are compared in normalised form (#84).
+	for i, prefix := range p.AllowedImagePrefixes {
+		normalized, err := NormalizeImagePrefix(prefix)
+		if err != nil {
+			return nil, fmt.Errorf("policy file %s has an invalid allowed_image_prefixes entry %q", filePath, prefix)
+		}
+		p.AllowedImagePrefixes[i] = normalized
+	}
+
 	return &p, nil
 }
 
@@ -83,27 +91,21 @@ func (m *Manager) Get(serviceName string) (*Policy, error) {
 	return p, nil
 }
 
+// GetByImage returns the policy whose prefixes match the reference's
+// normalised repository (#84). An invalid reference matches nothing.
 func (m *Manager) GetByImage(imageRef string) (*Policy, error) {
-	imageName := extractImageName(imageRef)
+	ref, err := ParseImageRef(imageRef)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, p := range m.policiesByName {
-		if matchesImagePrefix(imageName, p.AllowedImagePrefixes) {
+		if MatchesImagePrefix(ref.Name, p.AllowedImagePrefixes) {
 			return p, nil
 		}
 	}
 
 	return nil, fmt.Errorf("no policy found for image: %s", imageRef)
-}
-
-// matchesImagePrefix matches a full image name against a prefix allowing only
-// namespace boundaries ("prefix" or "prefix/..."), never a bare substring.
-func matchesImagePrefix(imageName string, prefixes []string) bool {
-	for _, prefix := range prefixes {
-		if imageName == prefix || strings.HasPrefix(imageName, prefix+"/") {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *Manager) List() []string {
@@ -112,12 +114,4 @@ func (m *Manager) List() []string {
 		names = append(names, name)
 	}
 	return names
-}
-
-func extractImageName(imageRef string) string {
-	idx := strings.IndexAny(imageRef, ":@")
-	if idx == -1 {
-		return imageRef
-	}
-	return imageRef[:idx]
 }

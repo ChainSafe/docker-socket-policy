@@ -1,4 +1,4 @@
-use crate::policy::Policy;
+use crate::policy::{check_image_tag, matches_image_prefix, parse_image_ref, Policy};
 use std::collections::HashMap;
 
 #[cfg(test)]
@@ -98,44 +98,12 @@ impl Gate for RegistryGate {
             _ => return Ok(()),
         };
 
-        let (image_name, tag_or_digest) = if let Some(idx) = image.find(|c: char| c == ':' || c == '@') {
-            (&image[..idx], &image[idx + 1..])
-        } else {
-            (image, "")
-        };
-
-        let allowed = policy
-            .allowed_image_prefixes
-            .iter()
-            .any(|prefix| image_name == prefix || image_name.starts_with(&format!("{}/", prefix)));
-        if !allowed {
-            return Err(format!("image {:?} is not in allowed prefixes", image_name));
+        // The same parser as the router, so a registry port is not a tag (#84).
+        let image_ref = parse_image_ref(image)?;
+        if !matches_image_prefix(&image_ref.name, &policy.allowed_image_prefixes) {
+            return Err(format!("image {:?} is not in allowed prefixes", image_ref.name));
         }
-
-        if !tag_or_digest.is_empty() {
-            if tag_or_digest.len() > 128 {
-                return Err("image tag/digest exceeds 128 characters".into());
-            }
-
-            if tag_or_digest.starts_with("sha256:") {
-                if !policy.image_digest_allowed {
-                    return Err(format!("image digests not allowed for service {}", policy.service_name));
-                }
-                let re =
-                    regex::Regex::new(r"^sha256:[a-f0-9]{64}$").map_err(|e| format!("invalid digest regex: {}", e))?;
-                if !re.is_match(tag_or_digest) {
-                    return Err(format!("invalid digest format: {}", tag_or_digest));
-                }
-            } else if let Some(ref pattern) = policy.image_tag_pattern {
-                let re = regex::Regex::new(pattern).map_err(|e| format!("invalid tag pattern regex: {}", e))?;
-                if !re.is_match(tag_or_digest) {
-                    return Err(format!(
-                        "image tag {:?} does not match pattern {:?}",
-                        tag_or_digest, pattern
-                    ));
-                }
-            }
-        }
+        check_image_tag(policy, &image_ref)?;
 
         Ok(())
     }
@@ -1164,6 +1132,61 @@ mod tests {
             mismatches.is_empty(),
             "{} mismatches:\n{}",
             mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    /// Pins the registry gate's reference parser (#84): a registry port is
+    /// not a tag, Docker Hub spellings match the normalised prefix, and the
+    /// tag pattern sees only the tag. The policy's prefixes are normalised,
+    /// as the manager stores them. Same rows in Go and TypeScript.
+    #[test]
+    fn test_registry_gate_parses_references() {
+        let gate = RegistryGate;
+        let mut policy = make_policy(
+            "test",
+            vec![
+                "chainsafe/lodestar",
+                "localhost:5000/team",
+                "registry.example.com:443/a",
+            ],
+        );
+        policy.image_tag_pattern = Some("^(v[0-9]+|[0-9.]+)$".into());
+        let cases = [
+            ("localhost:5000/team/app:1.2", None),
+            ("localhost:5000/team/app", None),
+            ("docker.io/chainsafe/lodestar:v1", None),
+            ("registry.example.com:443/a", None),
+            ("Registry.Example.com:443/a:2", None),
+            (
+                "localhost:5000/team/app:latest",
+                Some(r#"image tag "latest" does not match pattern "^(v[0-9]+|[0-9.]+)$""#),
+            ),
+            (
+                "localhost:5000/other:1",
+                Some(r#"image "localhost:5000/other" is not in allowed prefixes"#),
+            ),
+            (
+                "chainsafe/Lodestar:v1",
+                Some(r#"invalid image reference "chainsafe/Lodestar:v1""#),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (image, want_err) in cases {
+            let body = body_from_json(serde_json::json!({ "Image": image }));
+            let got = gate.check("POST", "/containers/create", &policy, &body);
+            let ok = match (&got, want_err) {
+                (Ok(()), None) => true,
+                (Err(e), Some(want)) => e.contains(want),
+                _ => false,
+            };
+            if !ok {
+                mismatches.push(format!("{}: got {:?}, want {:?}", image, got, want_err));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "registry gate mismatches:\n{}",
             mismatches.join("\n")
         );
     }

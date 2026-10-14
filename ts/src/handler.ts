@@ -53,7 +53,7 @@ export class Handler {
       }
     }
 
-    const route = this.router.route(method, path, bodyJSON);
+    const route = this.router.route(method, path, bodyJSON, bodyBytes.length > 0);
 
     if (route.action === Action.Deny) {
       const msg = route.denyMsg ?? "denied";

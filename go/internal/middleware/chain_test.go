@@ -507,3 +507,42 @@ func TestChain_NetworkEndpoints(t *testing.T) {
 		t.Fatalf("%d mismatches:\n%s", len(mismatches), strings.Join(mismatches, "\n"))
 	}
 }
+
+// TestRegistryGate_ParsesReferences pins the registry gate's reference parser
+// (#84): a registry port is not a tag, Docker Hub spellings match the
+// normalised prefix, and the tag pattern sees only the tag. The policy's
+// prefixes are normalised, as the manager stores them. Same rows in Rust and
+// TypeScript.
+func TestRegistryGate_ParsesReferences(t *testing.T) {
+	gate := &RegistryGate{}
+	r := testRequest("POST", "/containers/create")
+	p := testPolicy(map[string]interface{}{
+		"allowed_image_prefixes": []string{"chainsafe/lodestar", "localhost:5000/team", "registry.example.com:443/a"},
+	})
+	p.ImageTagPattern = `^(v[0-9]+|[0-9.]+)$`
+
+	tests := []struct {
+		image   string
+		wantErr string
+	}{
+		{"localhost:5000/team/app:1.2", ""},
+		{"localhost:5000/team/app", ""},
+		{"docker.io/chainsafe/lodestar:v1", ""},
+		{"registry.example.com:443/a", ""},
+		{"Registry.Example.com:443/a:2", ""},
+		{"localhost:5000/team/app:latest", `image tag "latest" does not match pattern "^(v[0-9]+|[0-9.]+)$"`},
+		{"localhost:5000/other:1", `image "localhost:5000/other" is not in allowed prefixes`},
+		{"chainsafe/Lodestar:v1", `invalid image reference "chainsafe/Lodestar:v1"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.image, func(t *testing.T) {
+			err := gate.Check(r, p, map[string]interface{}{"Image": tt.image})
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("Check(%s) = %v, want nil", tt.image, err)
+			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
+				t.Errorf("Check(%s) = %v, want error containing %q", tt.image, err, tt.wantErr)
+			}
+		})
+	}
+}

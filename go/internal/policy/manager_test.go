@@ -3,6 +3,7 @@ package policy
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -206,21 +207,82 @@ allowed_image_prefixes:
 	}
 }
 
-func TestExtractImageName(t *testing.T) {
+// TestParseImageRef is the #84 normalisation table, on the parser itself.
+// The same rows run in Rust and TypeScript.
+func TestParseImageRef(t *testing.T) {
+	const digest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	tests := []struct {
-		ref      string
-		expected string
+		in      string
+		want    ImageRef
+		invalid bool
 	}{
-		{"chainsafe/lodestar:next", "chainsafe/lodestar"},
-		{"chainsafe/lodestar@sha256:abc123", "chainsafe/lodestar"},
-		{"ubuntu", "ubuntu"},
-		{"registry.example.com/image:v1.0", "registry.example.com/image"},
+		{in: "alpine", want: ImageRef{Name: "alpine"}},
+		{in: "library/alpine", want: ImageRef{Name: "alpine"}},
+		{in: "docker.io/library/alpine", want: ImageRef{Name: "alpine"}},
+		{in: "index.docker.io/library/alpine:3.19", want: ImageRef{Name: "alpine", Tag: "3.19"}},
+		{in: "registry-1.docker.io/library/alpine", want: ImageRef{Name: "alpine"}},
+		{in: "docker.io/chainsafe/lodestar:v1", want: ImageRef{Name: "chainsafe/lodestar", Tag: "v1"}},
+		{in: "ghcr.io/chainsafe/lodestar@" + digest, want: ImageRef{Name: "ghcr.io/chainsafe/lodestar", Digest: digest}},
+		{in: "localhost:5000/x/y:2", want: ImageRef{Name: "localhost:5000/x/y", Tag: "2"}},
+		{in: "registry.example.com:443/a", want: ImageRef{Name: "registry.example.com:443/a"}},
+		{in: "REGISTRY.Example.com:443/a:V1", want: ImageRef{Name: "registry.example.com:443/a", Tag: "V1"}},
+		{in: "docker.io/library/a/b", want: ImageRef{Name: "library/a/b"}},
+		{in: "ghcr.io/library/alpine", want: ImageRef{Name: "ghcr.io/library/alpine"}},
+		{in: "localhost/x", want: ImageRef{Name: "localhost/x"}},
+		{in: "localhost", want: ImageRef{Name: "localhost"}},
+		{in: "alpine:3.19@" + digest, want: ImageRef{Name: "alpine", Tag: "3.19", Digest: digest}},
+		{in: "Alpine", invalid: true},
+		{in: "chainsafe/Lodestar", invalid: true},
+		{in: "alpine:", invalid: true},
+		{in: "alpine@", invalid: true},
+		{in: "", invalid: true},
+		{in: "a//b", invalid: true},
+		{in: "/alpine", invalid: true},
+		{in: "alpine/", invalid: true},
+		{in: "-alpine", invalid: true},
+		{in: "alpine:a/b", invalid: true},
+		{in: "a:b/c", invalid: true},
+		{in: "alpine:t$g", invalid: true},
 	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, err := ParseImageRef(tt.in)
+			if tt.invalid {
+				want := `invalid image reference "` + tt.in + `"`
+				if err == nil || err.Error() != want {
+					t.Errorf("ParseImageRef(%q) = %+v, %v; want error %q", tt.in, got, err, want)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Errorf("ParseImageRef(%q) = %+v, %v; want %+v", tt.in, got, err, tt.want)
+			}
+		})
+	}
+}
 
-	for _, tc := range tests {
-		got := extractImageName(tc.ref)
-		if got != tc.expected {
-			t.Errorf("extractImageName(%q) = %q, want %q", tc.ref, got, tc.expected)
+// TestManagerNormalizesPrefixes checks that prefixes are normalised at load
+// time, and that a prefix with a tag or an invalid one fails the load (#84).
+func TestManagerNormalizesPrefixes(t *testing.T) {
+	dir := t.TempDir()
+	write := func(content string) {
+		if err := os.WriteFile(filepath.Join(dir, "a.yaml"), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("service_name: a\nallowed_image_prefixes:\n  - docker.io/library/alpine\n  - GHCR.io/team\n")
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	p, _ := m.Get("a")
+	if got := strings.Join(p.AllowedImagePrefixes, ","); got != "alpine,ghcr.io/team" {
+		t.Errorf("prefixes = %s, want alpine,ghcr.io/team", got)
+	}
+	for _, bad := range []string{"alpine:3.19", "Alpine"} {
+		write("service_name: a\nallowed_image_prefixes:\n  - \"" + bad + "\"\n")
+		if _, err := NewManager(dir); err == nil || !strings.Contains(err.Error(), "invalid allowed_image_prefixes entry") {
+			t.Errorf("%s: NewManager error = %v, want an invalid entry error", bad, err)
 		}
 	}
 }

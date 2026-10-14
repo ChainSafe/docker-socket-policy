@@ -1,4 +1,4 @@
-use crate::policy::{Manager, Policy};
+use crate::policy::{check_image_tag, parse_image_ref, Manager, Policy};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,11 +38,30 @@ impl Router {
         self
     }
 
-    pub fn route(&self, method: &str, path: &str, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
+    /// Routes a request whose body, if any, is the parsed JSON body. It is
+    /// `route_request` with `has_body` set when `body` is `Some`.
+    pub fn route(&self, method: &str, target: &str, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
+        self.route_request(method, target, body.is_some(), body)
+    }
+
+    /// Routes a request. `target` is the raw request target: the path, still
+    /// percent-encoded, and the query string, if any. The path checks read
+    /// the path only; the image pull reads the query (#83). `has_body`
+    /// reports a non-empty raw body of any Content-Type; `body` is that body
+    /// parsed as JSON, or `None`.
+    pub fn route_request(
+        &self,
+        method: &str,
+        target: &str,
+        has_body: bool,
+        body: Option<&HashMap<String, serde_json::Value>>,
+    ) -> RouteResult {
         // Read-only mode denies every write, for every path (#75).
         if self.readonly && method != "GET" && method != "HEAD" {
             return deny(&format!("read-only mode: {} requests are not allowed", method));
         }
+
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
         // The daemon decodes the path before routing, so deny any escape (#53).
         if path.contains('%') {
@@ -103,7 +122,7 @@ impl Router {
 
         // Image pull
         if method == "POST" && path == "/images/create" {
-            return self.route_image_pull(body);
+            return self.route_image_pull(query, has_body);
         }
 
         // Default GET/HEAD passthrough
@@ -123,6 +142,9 @@ impl Router {
         let image = body.get("Image").and_then(|v| v.as_str()).unwrap_or("");
         if image.is_empty() {
             return deny("image field is required");
+        }
+        if let Err(msg) = parse_image_ref(image) {
+            return deny(&msg);
         }
 
         match self.manager.get_by_image(image) {
@@ -162,30 +184,118 @@ impl Router {
         }
     }
 
-    fn route_image_pull(&self, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
-        let body = match body {
-            Some(b) if !b.is_empty() => b,
-            _ => return deny("empty request body"),
-        };
-
-        let from_image = body.get("fromImage").and_then(|v| v.as_str()).unwrap_or("");
-        if from_image.is_empty() {
-            return deny("fromImage field is required for image pull");
+    /// Image pull (#83). The Docker CLI sends `fromImage` and `tag` in the
+    /// query string and no body.
+    /// The image then gets the create checks: a policy prefix on the
+    /// normalised repository (#84), and that policy's tag and digest rules.
+    fn route_image_pull(&self, raw_query: &str, has_body: bool) -> RouteResult {
+        // The daemon reads a form body's fromImage over the query's, so a
+        // body could name any image: a pull has no body, whatever its
+        // Content-Type.
+        if has_body {
+            return deny("image pull must not have a request body");
         }
-
-        match self.manager.get_by_image(from_image) {
-            Some(_) => RouteResult {
-                action: Action::Allow,
-                service: None,
-                policy: None,
-                body: None,
-                container: None,
-                image: Some(from_image.to_string()),
-                deny_msg: None,
-            },
-            None => deny(&format!("image {} not allowed by any policy", from_image)),
+        let params = match parse_query(raw_query) {
+            Some(p) => p,
+            None => return deny("invalid query string"),
+        };
+        for key in ["fromImage", "tag", "fromSrc"] {
+            if params.iter().filter(|(k, _)| k == key).count() > 1 {
+                return deny(&format!("duplicate {} query parameter", key));
+            }
+        }
+        let get = |key: &str| params.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+        if get("fromSrc").is_some() {
+            return deny("image import (fromSrc) is not allowed");
+        }
+        let from_image = get("fromImage").unwrap_or("");
+        if from_image.is_empty() {
+            return deny("fromImage query parameter is required for image pull");
+        }
+        let mut image_ref = match parse_image_ref(from_image) {
+            Ok(r) => r,
+            Err(msg) => return deny(&msg),
+        };
+        let tag = get("tag").unwrap_or("");
+        if !tag.is_empty() {
+            if !image_ref.tag.is_empty() || !image_ref.digest.is_empty() {
+                return deny(&format!(
+                    "fromImage {} already has a tag or digest; the tag query parameter is ambiguous",
+                    from_image
+                ));
+            }
+            // The CLI sends a digest in tag; a tag never contains ':'.
+            let sep = if tag.contains(':') { '@' } else { ':' };
+            image_ref = match parse_image_ref(&format!("{}{}{}", from_image, sep, tag)) {
+                Ok(r) => r,
+                Err(msg) => return deny(&msg),
+            };
+        }
+        // With neither, the daemon pulls every tag of the repository.
+        if image_ref.tag.is_empty() && image_ref.digest.is_empty() {
+            return deny("image pull without a tag or digest pulls every tag and is not allowed");
+        }
+        let policy = match self.manager.get_by_image(&image_ref.name) {
+            Some(p) => p,
+            None => return deny(&format!("image {} not allowed by any policy", from_image)),
+        };
+        if let Err(msg) = check_image_tag(policy, &image_ref) {
+            return deny(&msg);
+        }
+        RouteResult {
+            action: Action::Allow,
+            service: Some(policy.service_name.clone()),
+            policy: None,
+            body: None,
+            container: None,
+            image: Some(from_image.to_string()),
+            deny_msg: None,
         }
     }
+}
+
+/// Parses a query string as Go's `url.ParseQuery` does, which is what the
+/// daemon uses: `&` separates pairs, `+` is a space, and a `;` or a bad
+/// `%` escape fails the whole query.
+fn parse_query(raw: &str) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for part in raw.split('&') {
+        if part.contains(';') {
+            return None;
+        }
+        if part.is_empty() {
+            continue;
+        }
+        let (k, v) = part.split_once('=').unwrap_or((part, ""));
+        out.push((query_unescape(k)?, query_unescape(v)?));
+    }
+    Some(out)
+}
+
+fn query_unescape(s: &str) -> Option<String> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hi = hex(*bytes.get(i + 1)?)?;
+                let lo = hex(*bytes.get(i + 2)?)?;
+                out.push(hi << 4 | lo);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn allow() -> RouteResult {
@@ -715,8 +825,6 @@ mod tests {
         let router = Router::new(make_manager(vec!["alpine"]));
         let create_body: HashMap<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({"Image": "alpine:latest"})).unwrap();
-        let pull_body: HashMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({"fromImage": "alpine:latest"})).unwrap();
         let exec = Some("exec is not allowed");
         let cases = [
             // execSubpathDeleteDeniedTest (#49)
@@ -744,7 +852,13 @@ mod tests {
             // Exec is matched under containers or exec only (#49, language-only).
             ("GET", "/images/exec", None, Action::Allow, None),
             // An allowed image, so only the path decides (#49, language-only).
-            ("POST", "/images/create/extra", Some(&pull_body), Action::Deny, None),
+            (
+                "POST",
+                "/images/create/extra?fromImage=alpine&tag=latest",
+                None,
+                Action::Deny,
+                None,
+            ),
             // A name ending in exec is a plain name (#49, language-only).
             ("GET", "/containers/myexec/json", None, Action::Allow, None),
             // A name starting with exec is a plain name (#49, language-only).
@@ -844,8 +958,6 @@ mod tests {
         let post = Some("read-only mode: POST requests are not allowed");
         let create_body: HashMap<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({"Image": "chainsafe/lodestar:latest"})).unwrap();
-        let pull_body: HashMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({"fromImage": "chainsafe/lodestar", "tag": "latest"})).unwrap();
         let cases = [
             // readonlyGetAllowedTest (#75)
             ("GET", "/containers/json", None, Action::Allow, None),
@@ -866,7 +978,13 @@ mod tests {
                 Some("read-only mode: DELETE requests are not allowed"),
             ),
             // #75: an image pull of an allowed image.
-            ("POST", "/images/create", Some(&pull_body), Action::Deny, post),
+            (
+                "POST",
+                "/images/create?fromImage=chainsafe%2Flodestar&tag=latest",
+                None,
+                Action::Deny,
+                post,
+            ),
             // readonlyCreateDeniedTest (#75): an allowed image, so only the flag decides.
             ("POST", "/containers/create", Some(&create_body), Action::Deny, post),
             // #75: methods outside the spec's universe.
@@ -1121,41 +1239,381 @@ mod tests {
         }
     }
 
+    const TEST_DIGEST: &str = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    /// The policy set for the #83 and #84 tables, loaded from YAML so that
+    /// the prefixes go through load-time normalisation: beacon's prefixes are
+    /// written docker.io/chainsafe/lodestar and Registry.Example.com:443/a.
+    fn pull_test_manager() -> Manager {
+        let dir = std::env::temp_dir().join(format!("dsp-pull-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("probe.yaml"),
+            "service_name: probe\nallowed_image_prefixes:\n  - alpine\nimage_digest_allowed: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("beacon.yaml"),
+            "service_name: beacon\nallowed_image_prefixes:\n  - docker.io/chainsafe/lodestar\n  - ghcr.io/chainsafe/lodestar\n  - localhost:5000/x\n  - Registry.Example.com:443/a\nimage_tag_pattern: '^(v[0-9]+|[0-9]+)$'\n",
+        )
+        .unwrap();
+        let manager = Manager::new(dir.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        manager
+    }
+
+    /// Cross-language parity guard for #83 and #84. POST /images/create is
+    /// routed on its query string, the way the Docker CLI sends it: fromImage
+    /// (fully qualified, URL-encoded) and tag, with an empty body. The body is
+    /// ignored, fromSrc (import) is denied, and the image gets the create
+    /// checks: a policy prefix on the normalised repository, then that
+    /// policy's tag pattern and digest rule. Rows mirror the pull* runs in
+    /// spec/router.qnt; the rest are language-only.
     #[test]
-    fn test_route_image_pull() {
-        let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> =
+    fn test_route_pull_query() {
+        let router = Router::new(pull_test_manager());
+        let alpine_body: HashMap<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({"fromImage": "alpine"})).unwrap();
-        let result = router.route("POST", "/images/create", Some(&map));
-        assert_eq!(result.action, Action::Allow);
-        assert_eq!(result.image, Some("alpine".into()));
+        let old_body: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"fromImage": "alpine:3.19"})).unwrap();
+        let not_allowed = |image: &str| format!("image {} not allowed by any policy", image);
+        let required = "fromImage query parameter is required for image pull".to_string();
+        let body_msg = "image pull must not have a request body".to_string();
+        let from_src = "image import (fromSrc) is not allowed".to_string();
+        let enc_digest = TEST_DIGEST.replace(':', "%3A");
+        let cases: Vec<(
+            String,
+            Option<&HashMap<String, serde_json::Value>>,
+            Action,
+            &str,
+            String,
+        )> = vec![
+            // pullCliAllowedTest (#83): the issue's reproduction, as the CLI sends it.
+            (
+                "/v1.56/images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.19".into(),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // pullShortNameAllowedTest (#84)
+            (
+                "/images/create?fromImage=alpine&tag=3.19".into(),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // pullLibraryNameAllowedTest (#84)
+            (
+                "/images/create?fromImage=library%2Falpine&tag=latest".into(),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // pullCliOrgAllowedTest (#84): the prefix is written docker.io/chainsafe/lodestar.
+            (
+                "/images/create?fromImage=docker.io%2Fchainsafe%2Flodestar&tag=v1".into(),
+                None,
+                Action::Allow,
+                "beacon",
+                String::new(),
+            ),
+            // #84: the tag in fromImage, on another Docker Hub host name.
+            (
+                "/images/create?fromImage=index.docker.io%2Flibrary%2Falpine%3A3.19".into(),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // #83: the CLI sends a digest in tag.
+            (
+                format!("/images/create?fromImage=alpine&tag={}", enc_digest),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // #83: a digest in fromImage.
+            (
+                format!("/images/create?fromImage=alpine%40{}", enc_digest),
+                None,
+                Action::Allow,
+                "probe",
+                String::new(),
+            ),
+            // #83: image_digest_allowed is false for beacon.
+            (
+                format!(
+                    "/images/create?fromImage=ghcr.io%2Fchainsafe%2Flodestar&tag={}",
+                    enc_digest
+                ),
+                None,
+                Action::Deny,
+                "",
+                "image digests not allowed for service beacon".into(),
+            ),
+            // #84: a registry port is not a tag.
+            (
+                "/images/create?fromImage=localhost%3A5000%2Fx%2Fy&tag=2".into(),
+                None,
+                Action::Allow,
+                "beacon",
+                String::new(),
+            ),
+            // #84: the registry host is compared lower-cased.
+            (
+                "/images/create?fromImage=REGISTRY.example.com%3A443%2Fa&tag=1".into(),
+                None,
+                Action::Allow,
+                "beacon",
+                String::new(),
+            ),
+            // #83: the tag pattern applies to pulls.
+            (
+                "/images/create?fromImage=chainsafe%2Flodestar&tag=latest".into(),
+                None,
+                Action::Deny,
+                "",
+                r#"image tag "latest" does not match pattern "^(v[0-9]+|[0-9]+)$""#.into(),
+            ),
+            // pullDisallowedCliDeniedTest (#83)
+            (
+                "/images/create?fromImage=docker.io%2Fattacker%2Fmalware&tag=latest".into(),
+                None,
+                Action::Deny,
+                "",
+                not_allowed("docker.io/attacker/malware"),
+            ),
+            // pullOtherRegistryDeniedTest (#84): another registry is not Docker Hub's alpine.
+            (
+                "/images/create?fromImage=localhost%3A5000%2Falpine&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                not_allowed("localhost:5000/alpine"),
+            ),
+            // #84: the prefix match stays on namespace boundaries.
+            (
+                "/images/create?fromImage=alpine-evil&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                not_allowed("alpine-evil"),
+            ),
+            // pullNoFromImageDeniedTest (#83)
+            ("/images/create".into(), None, Action::Deny, "", required.clone()),
+            // #83: the old contract, fromImage in a JSON body: a pull has no body.
+            (
+                "/images/create".into(),
+                Some(&old_body),
+                Action::Deny,
+                "",
+                body_msg.clone(),
+            ),
+            // pullBodyIgnoredDeniedTest (#83): the daemon would pull the query's image.
+            (
+                "/images/create?fromImage=attacker%2Fmalware&tag=latest".into(),
+                Some(&alpine_body),
+                Action::Deny,
+                "",
+                body_msg.clone(),
+            ),
+            // pullJsonBodyDeniedTest (#83): any body is denied, even one that agrees.
+            (
+                "/images/create?fromImage=alpine&tag=3.19".into(),
+                Some(&alpine_body),
+                Action::Deny,
+                "",
+                body_msg.clone(),
+            ),
+            // pullImportDeniedTest (#83): the daemon would import the tarball as alpine:latest.
+            (
+                "/images/create?fromSrc=http%3A%2F%2Fexample.com%2Fx.tar&repo=alpine&tag=latest".into(),
+                None,
+                Action::Deny,
+                "",
+                from_src.clone(),
+            ),
+            // pullImportWithImageDeniedTest (#83)
+            (
+                "/images/create?fromImage=alpine&tag=latest&fromSrc=-".into(),
+                None,
+                Action::Deny,
+                "",
+                from_src.clone(),
+            ),
+            // #83: a tag in fromImage and in tag is ambiguous.
+            (
+                "/images/create?fromImage=alpine%3A3.19&tag=3.20".into(),
+                None,
+                Action::Deny,
+                "",
+                "fromImage alpine:3.19 already has a tag or digest; the tag query parameter is ambiguous".into(),
+            ),
+            // #83: no tag and no digest pulls every tag.
+            (
+                "/images/create?fromImage=alpine".into(),
+                None,
+                Action::Deny,
+                "",
+                "image pull without a tag or digest pulls every tag and is not allowed".into(),
+            ),
+            // #84: upper case in the repository path is invalid.
+            (
+                "/images/create?fromImage=Alpine&tag=latest".into(),
+                None,
+                Action::Deny,
+                "",
+                r#"invalid image reference "Alpine""#.into(),
+            ),
+            // #83: a repeated parameter could be read two ways.
+            (
+                "/images/create?fromImage=alpine&fromImage=attacker%2Fmalware&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                "duplicate fromImage query parameter".into(),
+            ),
+            // #83: the daemon rejects a malformed query; so does the proxy.
+            (
+                "/images/create?fromImage=alpine%zz&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                "invalid query string".into(),
+            ),
+            // #53 still holds: the percent check reads the path, not the query.
+            (
+                "/images/%63reate?fromImage=alpine&tag=1".into(),
+                None,
+                Action::Deny,
+                "",
+                "percent-encoded path not allowed".into(),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (path, body, want, service, want_msg) in &cases {
+            let got = router.route("POST", path, *body);
+            let got_service = got.service.as_deref().unwrap_or("");
+            let got_msg = got.deny_msg.as_deref().unwrap_or("");
+            if got.action != *want || got_service != *service || got_msg != want_msg {
+                mismatches.push(format!(
+                    "POST {}: got {:?}/{:?}/{:?}, want {:?}/{:?}/{:?}",
+                    path, got.action, got_service, got_msg, want, service, want_msg
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "pull routing mismatches:\n{}",
+            mismatches.join("\n")
+        );
     }
 
+    /// The normalisation table for #84, on the create route: each spelling
+    /// selects the policy its normalised repository matches, and a path with
+    /// upper case is invalid. The same table runs in Go and TypeScript.
     #[test]
-    fn test_route_image_pull_empty_body() {
-        let router = Router::new(make_manager(vec!["alpine"]));
-        let result = router.route("POST", "/images/create", None);
-        assert_eq!(result.action, Action::Deny);
-    }
-
-    #[test]
-    fn test_route_image_pull_no_fromimage() {
-        let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({"tag": "latest"})).unwrap();
-        let result = router.route("POST", "/images/create", Some(&map));
-        assert_eq!(result.action, Action::Deny);
-        assert!(result.deny_msg.unwrap().contains("fromImage"));
-    }
-
-    #[test]
-    fn test_route_image_pull_not_found() {
-        let router = Router::new(make_manager(vec!["alpine"]));
-        let map: HashMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({"fromImage": "ubuntu"})).unwrap();
-        let result = router.route("POST", "/images/create", Some(&map));
-        assert_eq!(result.action, Action::Deny);
-        assert!(result.deny_msg.unwrap().contains("not allowed by any policy"));
+    fn test_route_image_normalization() {
+        let router = Router::new(pull_test_manager());
+        let not_allowed = |image: &str| format!("image {} not allowed by any policy", image);
+        let ghcr_digest = format!("ghcr.io/chainsafe/lodestar@{}", TEST_DIGEST);
+        let cases: Vec<(&str, Action, &str, String)> = vec![
+            ("alpine", Action::CreateContainer, "probe", String::new()),
+            ("library/alpine", Action::CreateContainer, "probe", String::new()),
+            (
+                "docker.io/library/alpine",
+                Action::CreateContainer,
+                "probe",
+                String::new(),
+            ),
+            ("docker.io/alpine", Action::CreateContainer, "probe", String::new()),
+            (
+                "index.docker.io/library/alpine:3.19",
+                Action::CreateContainer,
+                "probe",
+                String::new(),
+            ),
+            (
+                "docker.io/chainsafe/lodestar:v1",
+                Action::CreateContainer,
+                "beacon",
+                String::new(),
+            ),
+            (
+                "chainsafe/lodestar:v1",
+                Action::CreateContainer,
+                "beacon",
+                String::new(),
+            ),
+            (
+                "registry-1.docker.io/chainsafe/lodestar:v1",
+                Action::CreateContainer,
+                "beacon",
+                String::new(),
+            ),
+            (&ghcr_digest, Action::CreateContainer, "beacon", String::new()),
+            ("localhost:5000/x/y:2", Action::CreateContainer, "beacon", String::new()),
+            (
+                "registry.example.com:443/a",
+                Action::CreateContainer,
+                "beacon",
+                String::new(),
+            ),
+            (
+                "Alpine:latest",
+                Action::Deny,
+                "",
+                r#"invalid image reference "Alpine:latest""#.into(),
+            ),
+            (
+                "chainsafe/Lodestar:v1",
+                Action::Deny,
+                "",
+                r#"invalid image reference "chainsafe/Lodestar:v1""#.into(),
+            ),
+            ("alpine-evil", Action::Deny, "", not_allowed("alpine-evil")),
+            (
+                "ghcr.io/library/alpine",
+                Action::Deny,
+                "",
+                not_allowed("ghcr.io/library/alpine"),
+            ),
+            (
+                "ghcr.io/chainsafe/lodestar-evil",
+                Action::Deny,
+                "",
+                not_allowed("ghcr.io/chainsafe/lodestar-evil"),
+            ),
+            (
+                "localhost:5000/xy:1",
+                Action::Deny,
+                "",
+                not_allowed("localhost:5000/xy:1"),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (image, want, service, want_msg) in &cases {
+            let body: HashMap<String, serde_json::Value> =
+                serde_json::from_value(serde_json::json!({ "Image": image })).unwrap();
+            let got = router.route("POST", "/containers/create", Some(&body));
+            let got_service = got.service.as_deref().unwrap_or("");
+            let got_msg = got.deny_msg.as_deref().unwrap_or("");
+            if got.action != *want || got_service != *service || got_msg != want_msg {
+                mismatches.push(format!(
+                    "create {}: got {:?}/{:?}/{:?}, want {:?}/{:?}/{:?}",
+                    image, got.action, got_service, got_msg, want, service, want_msg
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "normalisation mismatches:\n{}",
+            mismatches.join("\n")
+        );
     }
 
     #[test]

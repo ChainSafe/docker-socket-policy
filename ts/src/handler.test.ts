@@ -84,6 +84,38 @@ const beaconConfig = {
     "service_name: beacon\nallowed_image_prefixes:\n  - chainsafe/lodestar\ncontainer_config:\n  network_mode: host\n",
 };
 
+// #83: a pull with a body is never forwarded. The daemon reads a form body's
+// fromImage over the query's, so an allowed image in the query and another in
+// the body would pull the body's. Any body is denied, whatever its
+// Content-Type.
+describe("Handler image pull with a body (#83)", () => {
+  it("denies a pull that has a body", async () => {
+    const dir = makeEnv({ "probe.yaml": "service_name: probe\nallowed_image_prefixes:\n  - alpine\n" });
+    try {
+      const cases: [string, string][] = [
+        ["application/x-www-form-urlencoded", "fromImage=busybox&tag=latest"],
+        ["application/json", '{"fromImage":"alpine"}'],
+        ["text/plain", "x"],
+      ];
+      for (const [contentType, body] of cases) {
+        const { handler, transport } = newHandler(dir);
+        const { res, recorder } = makeResponse();
+        await handler.handle(
+          makeRequest("POST", "/v1.56/images/create?fromImage=alpine&tag=3.19", body, {
+            "content-type": contentType,
+          }),
+          res,
+        );
+        assert.equal(recorder.statusCode, 403, contentType);
+        assert.equal(recorder.body, "image pull must not have a request body", contentType);
+        assert.equal(transport.lastRequest, undefined, contentType);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("Handler", () => {
   let tmpDir: string;
 
@@ -384,6 +416,34 @@ describe("Handler", () => {
     } finally {
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
+// #83: the handler hands the request target, query included, to the router.
+// A pull sent the Docker CLI way, empty body and image in the query, is
+// forwarded, and a disallowed one is not.
+describe("Handler image pull (#83)", () => {
+  it("routes a pull on its query string", async () => {
+    const dir = makeEnv({ "probe.yaml": "service_name: probe\nallowed_image_prefixes:\n  - alpine\n" });
+    try {
+      let { handler, transport } = newHandler(dir);
+      let { res, recorder } = makeResponse();
+      await handler.handle(
+        makeRequest("POST", "/v1.56/images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.19"),
+        res,
+      );
+      assert.equal(recorder.statusCode, 200);
+      assert.equal(transport.lastRequest?.url, "/v1.56/images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.19");
+
+      ({ handler, transport } = newHandler(dir));
+      ({ res, recorder } = makeResponse());
+      await handler.handle(makeRequest("POST", "/v1.56/images/create?fromImage=busybox&tag=latest"), res);
+      assert.equal(recorder.statusCode, 403);
+      assert.equal(recorder.body, "image busybox not allowed by any policy");
+      assert.equal(transport.lastRequest, undefined);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

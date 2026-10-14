@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -41,11 +42,24 @@ func (r *Router) WithReadonly(readonly bool) *Router {
 	return r
 }
 
-func (r *Router) Route(method, path string, body map[string]interface{}) *RouteResult {
+// Route routes a request whose body, if any, is the parsed JSON body. It is
+// RouteRequest with hasBody set when body is non-nil.
+func (r *Router) Route(method, target string, body map[string]interface{}) *RouteResult {
+	return r.RouteRequest(method, target, body != nil, body)
+}
+
+// RouteRequest routes a request. target is the raw request target: the path,
+// still percent-encoded, and the query string, if any. The path checks read
+// the path only; the image pull reads the query (#83). hasBody reports a
+// non-empty raw body of any Content-Type; body is that body parsed as JSON,
+// or nil.
+func (r *Router) RouteRequest(method, target string, hasBody bool, body map[string]interface{}) *RouteResult {
 	// Read-only mode denies every write, for every path (#75).
 	if r.readonly && method != "GET" && method != "HEAD" {
 		return &RouteResult{Action: ActionDeny, DenyMsg: fmt.Sprintf("read-only mode: %s requests are not allowed", method)}
 	}
+
+	path, rawQuery, _ := strings.Cut(target, "?")
 
 	// The daemon decodes the path before routing, so deny any escape (#53).
 	if strings.Contains(path, "%") {
@@ -118,7 +132,7 @@ func (r *Router) Route(method, path string, body map[string]interface{}) *RouteR
 	}
 
 	if path == "/images/create" && method == "POST" {
-		return r.routeImagePull(body)
+		return r.routeImagePull(rawQuery, hasBody)
 	}
 
 	if method == "GET" || method == "HEAD" {
@@ -139,6 +153,9 @@ func (r *Router) routeCreate(body map[string]interface{}) *RouteResult {
 	image, _ := body["Image"].(string)
 	if image == "" {
 		return &RouteResult{Action: ActionDeny, DenyMsg: "image field is required"}
+	}
+	if _, err := policy.ParseImageRef(image); err != nil {
+		return &RouteResult{Action: ActionDeny, DenyMsg: err.Error()}
 	}
 
 	p, err := r.manager.GetByImage(image)
@@ -169,21 +186,66 @@ func (r *Router) routeByContainerName(containerName, action string) *RouteResult
 	}
 }
 
-func (r *Router) routeImagePull(body map[string]interface{}) *RouteResult {
-	if len(body) == 0 {
-		return &RouteResult{Action: ActionDeny, DenyMsg: "empty request body"}
+// routeImagePull routes an image pull (#83). The Docker CLI sends fromImage
+// and tag in the query string and no body. The image then gets the create checks: a policy prefix on the
+// normalised repository (#84), and that policy's tag and digest rules.
+func (r *Router) routeImagePull(rawQuery string, hasBody bool) *RouteResult {
+	deny := func(msg string) *RouteResult { return &RouteResult{Action: ActionDeny, DenyMsg: msg} }
+
+	// The daemon reads a form body's fromImage over the query's, so a body
+	// could name any image: a pull has no body, whatever its Content-Type.
+	if hasBody {
+		return deny("image pull must not have a request body")
 	}
 
-	fromImage, _ := body["fromImage"].(string)
+	// The daemon parses the query with url.ParseQuery too, and rejects it on error.
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return deny("invalid query string")
+	}
+	for _, key := range []string{"fromImage", "tag", "fromSrc"} {
+		if len(q[key]) > 1 {
+			return deny(fmt.Sprintf("duplicate %s query parameter", key))
+		}
+	}
+	if q.Has("fromSrc") {
+		return deny("image import (fromSrc) is not allowed")
+	}
+	fromImage := q.Get("fromImage")
 	if fromImage == "" {
-		return &RouteResult{Action: ActionDeny, DenyMsg: "fromImage field is required for image pull"}
+		return deny("fromImage query parameter is required for image pull")
+	}
+	ref, err := policy.ParseImageRef(fromImage)
+	if err != nil {
+		return deny(err.Error())
+	}
+	if tag := q.Get("tag"); tag != "" {
+		if ref.Tag != "" || ref.Digest != "" {
+			return deny(fmt.Sprintf("fromImage %s already has a tag or digest; the tag query parameter is ambiguous", fromImage))
+		}
+		// The CLI sends a digest in tag; a tag never contains ':'.
+		sep := ":"
+		if strings.Contains(tag, ":") {
+			sep = "@"
+		}
+		if ref, err = policy.ParseImageRef(fromImage + sep + tag); err != nil {
+			return deny(err.Error())
+		}
+	}
+	// With neither, the daemon pulls every tag of the repository.
+	if ref.Tag == "" && ref.Digest == "" {
+		return deny("image pull without a tag or digest pulls every tag and is not allowed")
 	}
 
-	if _, err := r.manager.GetByImage(fromImage); err != nil {
-		return &RouteResult{Action: ActionDeny, DenyMsg: fmt.Sprintf("image %s not allowed by any policy", fromImage)}
+	p, err := r.manager.GetByImage(ref.Name)
+	if err != nil {
+		return deny(fmt.Sprintf("image %s not allowed by any policy", fromImage))
+	}
+	if err := policy.CheckImageTag(p, ref); err != nil {
+		return deny(err.Error())
 	}
 
-	return &RouteResult{Action: ActionAllow, Image: fromImage}
+	return &RouteResult{Action: ActionAllow, Service: p.ServiceName, Image: fromImage}
 }
 
 // stripAPIVersion strips one leading /v<N>/ or /v<N>.<M>/ (ASCII digits only), else returns path unchanged (#57).
