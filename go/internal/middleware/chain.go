@@ -33,6 +33,7 @@ func NewChain() *Chain {
 	c.gates = append(c.gates, &MountSourceGate{})
 	c.gates = append(c.gates, &EnvFileGate{})
 	c.gates = append(c.gates, &CmdGate{})
+	c.gates = append(c.gates, &NetworkEndpointsGate{})
 
 	c.mutators = append(c.mutators, &ContainerConfigMutator{})
 

@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 113 unit + 63 integration + 15 socket | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 145 unit + 63 integration + 15 socket | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 164 unit (1 skipped) + 63 integration + 15 socket | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 114 unit + 72 integration + 15 socket | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 146 unit + 72 integration + 15 socket | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 165 unit (1 skipped) + 72 integration + 15 socket | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -192,11 +192,14 @@ docker pull attacker/malware:latest  # denied: image not in allowlist
 
 | Middleware | Type | What it checks |
 |------------|------|----------------|
-| ContainerConfigMutator | Mutator | Forces `network_mode`, `user`, `security_options`, `restart_policy` from policy |
+| ContainerConfigMutator | Mutator | Forces `network_mode`, `user`, `security_options`, `restart_policy` from policy, and makes `NetworkingConfig.EndpointsConfig` match a forced `network_mode` |
 | RegistryGate | Gate | Validates image ref against `allowed_image_prefixes` |
 | MountSourceGate | Gate | Validates volume binds against whitelist |
 | EnvFileGate | Gate | Strips `Env` field from create body; env must come from locked `env_file` |
 | CmdGate | Gate | Validates each CLI flag in `Cmd` array against allowlist + denylist |
+| NetworkEndpointsGate | Gate | With a forced `network_mode`, denies `NetworkingConfig.EndpointsConfig` entries for other networks |
+
+When a policy forces `network_mode` M, the endpoint entries in `NetworkingConfig.EndpointsConfig` must agree with it, or the daemon creates the container and then refuses to start it with `network default not found`: without `--network`, the Docker CLI sends an entry for `default` ([#87](https://github.com/ChainSafe/docker-socket-policy/issues/87)). Entries may be keyed `default` or M; any other key is denied with `network "<name>" is not allowed for service <service>; policy forces network_mode <M>`, since it would attach the container to a network the policy does not allow. For `host`, `none` and `container:<id>` the proxy then forwards an empty `EndpointsConfig`; for `bridge` or a named network it forwards exactly one entry, keyed M, with the settings (aliases, for example) of the caller's M entry, else of its `default` entry. A `NetworkingConfig` that is not a JSON object is denied. Without a forced `network_mode`, `NetworkingConfig` is forwarded as sent.
 
 The chain runs only on container create. `--readonly` is not a gate: the router denies every request that is not `GET` or `HEAD`, on every path, before any other check ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)). Attach is denied by the router for every method, so a websocket attach (`GET /containers/{name}/attach/ws`) cannot reach a container's stdin, with or without `--readonly` ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)).
 
@@ -451,13 +454,15 @@ not at the socket.
 
 This project includes a [Quint](https://quint-lang.org/) formal specification that models the security invariants as a state machine. Random-simulation verification runs 10,000 sampled traces of up to 100 steps each, checking all 9 invariants on every state transition. A second module, `spec/listener.qnt`, models listening-socket startup (group selection, existing-path checks, the single-instance lock) with 6 more invariants. A third module, `spec/router.qnt`, models the router's denies for writes under `--readonly` ([#75](https://github.com/ChainSafe/docker-socket-policy/issues/75)), percent-encoded paths ([#53](https://github.com/ChainSafe/docker-socket-policy/issues/53)), empty interior segments ([#55](https://github.com/ChainSafe/docker-socket-policy/issues/55)), dot segments ([#70](https://github.com/ChainSafe/docker-socket-policy/issues/70)), exec ([#49](https://github.com/ChainSafe/docker-socket-policy/issues/49)) and attach ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)), the GET/HEAD-only read passthrough ([#78](https://github.com/ChainSafe/docker-socket-policy/issues/78)), the `POST /containers/create` route, container-name extraction and the container-lifecycle branch, not the full routing table ([#24](https://github.com/ChainSafe/docker-socket-policy/issues/24), [#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). Its 12 properties are checked exhaustively over the methods `GET`, `HEAD`, `POST`, `DELETE` and every path of 1 to 3 segments over the model's word set; exec is denied by the router, not by a middleware gate.
 
+The request-handling spec also has a module, `network_endpoints_model`, for the endpoint entries under a forced `network_mode` ([#87](https://github.com/ChainSafe/docker-socket-policy/issues/87)). Its 3 properties (extra networks are denied, an allowed create names no network but the forced one, and every allowed create starts) are checked over five network modes and every endpoint map over seven keys; `network_endpoints_pre87` shows all three failing before the fix.
+
 The CI pipeline runs verification on every push and PR. A violation blocks the build.
 
 ```bash
 make typecheck            # Quint type-check (proves type safety)
 make verify               # Random-simulation verification (default evaluator)
 make verify BACKEND=rust  # Same, using the faster Rust backend
-make test-spec            # Quint `run` tests for listener.qnt and router.qnt (one per table row)
+make test-spec            # Quint `run` tests for listener.qnt, router.qnt and network_endpoints (one per table row)
 make validate             # All checks: typecheck + verify + go vet + go test
 ```
 

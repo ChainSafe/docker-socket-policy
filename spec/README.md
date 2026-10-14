@@ -6,7 +6,7 @@ This directory contains a [Quint](https://quint-lang.org/) formal specification 
 
 | File | Purpose |
 |------|---------|
-| `docker_socket_policy.qnt` | Request-handling spec: policy types, state machine, endpoint routing table, 9 invariants (6 P0 / 3 P1), 6 attack scenario simulations |
+| `docker_socket_policy.qnt` | Request-handling spec: policy types, state machine, endpoint routing table, 9 invariants (6 P0 / 3 P1), 6 attack scenario simulations. Module `network_endpoints_model` models `NetworkingConfig.EndpointsConfig` under a forced `network_mode` (#87), one `run` test per table row, instances `network_endpoints` (all three after #87) and `network_endpoints_pre87` |
 | `listener.qnt` | Listening-socket startup: flag/group selection, existing-path checks, single-instance lock, 6 invariants, one `run` test per design-table row. Instances `listener_locked` (Go, Rust) and `listener_unlocked` (TypeScript) |
 | `listener-design.md` | Design of the listening socket (dockerd parity) that `listener.qnt` models |
 | `router.qnt` | The percent-encoded path deny, the empty interior segment deny, the dot segment deny, the segment-exact exec deny and `POST /containers/create` route, the segment-exact attach deny, the GET/HEAD-only read passthrough with `/_ping` standing for the read endpoints, container-name extraction and the container-lifecycle branch of the router only, not the full router. The daemon's percent-decoding as a fixed table. One `run` test per table row. Instances `router` (Go, TypeScript, and Rust after #48, #53, #49, #55, #76, #78 and #70), `router_pre48` (Rust's extraction rule before #48), `router_pre53` (Rust and TypeScript before #53, routing on the raw path), `router_pre55` (all three before #55, letting empty interior segments through), `router_readonly` (as `router`, with `--readonly`, #75), `router_pre76` (all three before #76, letting attach through), `router_pre78` (all three before #78, allowing the read endpoints for every method) and `router_pre70` (all three before #70, letting `.` and `..` segments through). Every instance includes the #49 exec and create rule, so the pre instances isolate one earlier rule each rather than being full snapshots |
@@ -44,6 +44,10 @@ quint test spec/router.qnt --main=router_readonly --match='^readonly.*Test$'
 quint test spec/router.qnt --main=router_pre76
 quint test spec/router.qnt --main=router_pre78
 quint test spec/router.qnt --main=router_pre70
+
+# Network endpoints under a forced network_mode (#87): the table tests on both instances
+quint test spec/docker_socket_policy.qnt --main=network_endpoints
+quint test spec/docker_socket_policy.qnt --main=network_endpoints_pre87
 
 # Formal model-checking via Apalache (exhaustive, requires Java)
 quint verify --max-steps=10 --invariants allInvariants spec/docker_socket_policy.qnt
@@ -189,6 +193,40 @@ The rows marked "all" above run on every `READONLY = false` instance; `router_re
 
 Each implementation's router tests use the same row names in comments (added with the #48, #53, #49, #55, #76, #78 and #70 fixes). `router_pre48` runs `pre48UnsoundTest`, which asserts that `lifecycleOnlyTargetsRealNames` fails and that both `emptyName*Denied` requests are allowed as an unknown container ([#48](https://github.com/ChainSafe/docker-socket-policy/issues/48)). `router_pre53` runs `pre53UnsoundTest`, which asserts that `routerSeesWhatDaemonSees` fails, that `DELETE /containers/%2F` and `POST /containers/%2F/start` are allowed as an unknown container, and that `GET /containers/%2F` is allowed through the passthrough. `router_pre55` runs `pre55UnsoundTest`, which asserts that `emptyInteriorDenied` fails and that `GET //exec/abc` is allowed through the passthrough: its first segment is empty, not `exec`, so the exec check misses it. `router_pre76` runs `pre76UnsoundTest`, which asserts that `attachNeverAllowed` fails and that `GET /containers/mycontainer/attach` is allowed through the passthrough ([#76](https://github.com/ChainSafe/docker-socket-policy/issues/76)). `router_pre78` runs `pre78UnsoundTest`, which asserts that `readPassthroughOnlyForReads` fails and that `POST /_ping` and `DELETE /_ping` are allowed as reads ([#78](https://github.com/ChainSafe/docker-socket-policy/issues/78)). `router_pre70` runs `pre70UnsoundTest`, which asserts that `dotSegmentsDenied` and `dotSegmentsHideNoExec` fail and that `GET /./exec/abc` is allowed through the passthrough ([#70](https://github.com/ChainSafe/docker-socket-policy/issues/70)).
 
+### Network endpoints under a forced `network_mode` (`docker_socket_policy.qnt`, #87)
+
+`alwaysHostNetwork` covers `HostConfig.NetworkMode` only. The daemon also reads `NetworkingConfig.EndpointsConfig`, and before #87 no implementation touched it: without `--network` the Docker CLI sends `{"default": {}}`, the create succeeded, and the start failed with `network default not found`. The module `network_endpoints_model` models what `NetworkEndpointsGate` and `ContainerConfigMutator` do with `EndpointsConfig` when the policy forces a mode M, as the pure function `handleEndpoints(M, endpoints)`. `EndpointsConfig` is a map from network name to settings (`""` for `{}`, `"a"` for an entry with settings such as `Aliases`); an absent `NetworkingConfig` is the empty map, and `container:x` stands for every `container:<name|id>` mode. A key other than `default` and M is denied with `network "<key>" is not allowed for service <S>; policy forces network_mode <M>`. Otherwise `host`, `none` and `container:x` get an empty `EndpointsConfig`, and `bridge` or a named network gets exactly one entry keyed M, with the settings of the caller's M entry, else of its `default` entry, else `{}`. `daemonStarts` is the daemon's start check as observed on Engine 29.8.2 (API 1.41 to 1.56): every endpoint key must name the container's `NetworkMode`. The properties range over the five modes and all 2187 maps over seven keys and two settings:
+
+- `extraNetworkDenied` holds when every request with a key other than `default` and M is denied (the rule).
+- `onlyForcedNetwork` holds when every allowed request names no network but M (the security property: an extra entry would attach the container to a network the policy does not allow).
+- `allowedCreatesStart` holds when every allowed request passes `daemonStarts` (the bug).
+
+`network_endpoints` runs `endpointsSoundTest`, which asserts all three, and one test per row. `network_endpoints_pre87` (all three before #87, `ENFORCE_ENDPOINTS = false`) runs `pre87UnsoundTest`, which asserts that all three properties fail, that `{"default": {}}` under `host` is forwarded unchanged and fails `daemonStarts`, and that an extra entry is allowed. The Go, Rust and TypeScript middleware tests use the same row names in comments.
+
+| Row (`run <row>Test`) | Forced mode | Request `EndpointsConfig` | Outcome |
+|-----|-----|-----|-----|
+| `hostNoEndpoints` | `host` | absent | `{}` |
+| `hostDefaultCleared` | `host` | `{"default": {}}` | `{}` |
+| `hostOwnCleared` | `host` | `{"host": {Aliases}}` | `{}` |
+| `hostExtraDenied` | `host` | `{"default": {}, "other": {}}` | deny |
+| `noneNoEndpoints` | `none` | absent | `{}` |
+| `noneDefaultCleared` | `none` | `{"default": {}}` | `{}` |
+| `noneOwnCleared` | `none` | `{"none": {Aliases}}` | `{}` |
+| `noneExtraDenied` | `none` | `{"default": {}, "other": {}}` | deny |
+| `containerNoEndpoints` | `container:x` | absent | `{}` |
+| `containerDefaultCleared` | `container:x` | `{"default": {}}` | `{}` |
+| `containerOwnCleared` | `container:x` | `{"container:x": {Aliases}}` | `{}` |
+| `containerExtraDenied` | `container:x` | `{"default": {}, "other": {}}` | deny |
+| `bridgeNoEndpoints` | `bridge` | absent | `{"bridge": {}}` |
+| `bridgeDefaultRekeyed` | `bridge` | `{"default": {Aliases}}` | `{"bridge": {Aliases}}` |
+| `bridgeOwnKept` | `bridge` | `{"bridge": {Aliases}}` | `{"bridge": {Aliases}}` |
+| `bridgeExtraDenied` | `bridge` | `{"default": {}, "other": {}}` | deny |
+| `namedNoEndpoints` | `mynet` | absent | `{"mynet": {}}` |
+| `namedDefaultRekeyed` | `mynet` | `{"default": {Aliases}}` | `{"mynet": {Aliases}}` |
+| `namedOwnKept` | `mynet` | `{"mynet": {Aliases}}` | `{"mynet": {Aliases}}` |
+| `namedExtraDenied` | `mynet` | `{"default": {}, "other": {}}` | deny |
+| `namedOwnOverDefault` | `mynet` | `{"default": {Aliases}, "mynet": {}}` | `{"mynet": {}}` |
+
 ### Modeling Notes
 
 Two invariants are structurally tautological within the Quint model — they can't be falsified by any action sequence the simulator generates, so they don't get real coverage from `quint run`/`quint verify`:
@@ -213,6 +251,7 @@ Two invariants are structurally tautological within the Quint model — they can
 - **`--readonly` is a router rule (#75).** Before #75 the flag reached only the middleware chain, and the handler runs the chain only on the create route, so lifecycle `POST`s, `DELETE /containers/{name}` and `POST /images/create` were forwarded in read-only mode. That was handler wiring, not routing, so there is no `pre75` instance: the `READONLY = false` instances are the behaviour without the flag, which before the fix was also the behaviour with it for every route but create. `readonlyAllowsOnlyReads` does not mention `READONLY`, so it is not vacuous: setting `router_readonly`'s `READONLY` to `false` makes `readonlySoundTest` and the three `readonly*Denied` rows fail. `METHODS` has no `PUT`; the implementations' tests cover it.
 - **Attach is a router rule; the upgrade refusal is not modelled (#76).** Before #76, `GET /containers/{name}/attach/ws` with `Upgrade: websocket` fell through to the GET passthrough, and Go relayed the daemon's `101`, giving the caller the container's stdin. The router now denies `attach` as a whole segment after `containers`, for every method, right after the exec check. As with `/containers/exec/…`, a container literally named `attach` is denied too (`attachNamedContainerDenied`). `attachNeverAllowed` fails on `router_pre76`, and setting `router`'s `ALLOW_ATTACH` to `true` makes `attachSoundTest` and three of the four `attach*` rows fail; `attachPostDenied` is a pin, since the lifecycle branch already denies `POST` when the last segment is not an action. The handler also refuses every request with an `Upgrade` header, or a `Connection` header listing `upgrade`, with `protocol upgrade not allowed`, before routing. That check is on headers, which the model does not have, so like the query string it is pinned by the language handler tests and the integration tests, not by the model.
 - **The read endpoints admit only `GET` and `HEAD`; the `CONNECT` refusal is not modelled (#78).** Before #78 an early clause in all three routers allowed `/_ping`, `/version`, `/info` and any path starting with `/events` for every method, so `POST /_ping` and `DELETE /version` reached the daemon, and `/eventsxyz` matched too. The clause is gone: `GET` and `HEAD` on those paths reach the read passthrough as before, and every other method falls through to the default deny. `readPassthroughOnlyForReads` fails on `router_pre78`, and setting `router`'s `ALLOW_ANY_METHOD_PING` to `true` makes `readPassthroughSoundTest`, `pingPostDenied` and `pingDeleteDenied` fail. The handlers also refuse every `CONNECT` request with `CONNECT is not allowed` before routing, ahead of the upgrade check; `METHODS` has no `CONNECT`, so that is pinned by the language handler tests and the integration tests, not by the model.
+- **Network endpoints are a pure function, not part of the state machine (#87).** `createContainer` records the forced `networkMode` but takes no `NetworkingConfig`, and nothing in the state machine models the daemon's start, so the endpoint rule sits in its own module beside it and is checked by `quint test`, not by `make verify`. When the policy does not force `network_mode`, `NetworkingConfig` is forwarded untouched; neither the model nor the implementations check it then. Whether the daemon accepts the settings kept on a re-keyed entry (aliases on the default `bridge` network, for example) is the daemon's decision; the model fixes only the keys. `extraNetworkDenied` and `onlyForcedNetwork` are close to tautologies on `network_endpoints`, since `handleEndpoints` tests the key set directly; `network_endpoints_pre87` shows they are not vacuous. Dropping the extra keys instead of denying would keep `onlyForcedNetwork` and fail `extraNetworkDenied`; that was rejected, because the caller asked for a network the policy does not allow and should be told. A malformed `NetworkingConfig` or `EndpointsConfig` (not a JSON object) is denied by the implementations under a forced mode; the model's maps cannot express it, so the language tests pin it.
 - **Listener fault bias.** `step` crashes an instance on 1 in 10 draws instead of half of all steps, so random runs actually interleave live instances. Every crash stays reachable from every phase, so the reachable state space is unchanged.
 
 ### Attack Scenarios Prevented by Invariants

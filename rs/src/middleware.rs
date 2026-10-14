@@ -38,6 +38,7 @@ impl Chain {
         gates.push(Box::new(MountSourceGate));
         gates.push(Box::new(EnvFileGate));
         gates.push(Box::new(CmdGate));
+        gates.push(Box::new(NetworkEndpointsGate));
 
         let mutators: Vec<Box<dyn Mutator>> = vec![Box::new(ContainerConfigMutator)];
 
@@ -294,6 +295,108 @@ impl Gate for CmdGate {
     }
 }
 
+/// The network mode the policy forces, if any (#87).
+fn forced_network_mode(policy: &Policy) -> Option<&str> {
+    policy
+        .container_config
+        .as_ref()
+        .and_then(|cc| cc.network_mode.as_deref())
+        .filter(|m| !m.is_empty())
+}
+
+/// NetworkingConfig.EndpointsConfig of a create body: Ok(None) when absent
+/// or null, Err when NetworkingConfig or EndpointsConfig is not an object.
+fn endpoints_config(
+    body: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<Option<&serde_json::Map<String, serde_json::Value>>, ()> {
+    match body.get("NetworkingConfig") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Object(nc)) => match nc.get("EndpointsConfig") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Object(eps)) => Ok(Some(eps)),
+            Some(_) => Err(()),
+        },
+        Some(_) => Err(()),
+    }
+}
+
+/// A network mode in which the container joins no network of its own.
+fn detached_network_mode(mode: &str) -> bool {
+    mode == "host" || mode == "none" || mode.starts_with("container:")
+}
+
+/// When the policy forces network_mode M, every key in
+/// NetworkingConfig.EndpointsConfig must be "default" or M (#87). Any other
+/// key would attach the container to a network the policy does not allow.
+/// ContainerConfigMutator leaves such a request unchanged, so this gate
+/// sees what the caller sent.
+pub struct NetworkEndpointsGate;
+impl Gate for NetworkEndpointsGate {
+    fn check(
+        &self,
+        _method: &str,
+        _path: &str,
+        policy: &Policy,
+        body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
+        let mode = match forced_network_mode(policy) {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+        let eps = match endpoints_config(body) {
+            Ok(Some(eps)) => eps,
+            Ok(None) => return Ok(()),
+            Err(()) => {
+                return Err(format!(
+                    "NetworkingConfig.EndpointsConfig must be a JSON object; policy forces network_mode {}",
+                    mode
+                ))
+            }
+        };
+        if let Some(k) = eps.keys().find(|k| k.as_str() != "default" && k.as_str() != mode) {
+            return Err(format!(
+                "network {:?} is not allowed for service {}; policy forces network_mode {}",
+                k, policy.service_name, mode
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Make NetworkingConfig.EndpointsConfig consistent with the forced network
+/// mode (#87): no entries for host, none and container:<id>; otherwise
+/// exactly one entry keyed by the mode, with the settings of the caller's
+/// entry for the mode, else of its "default" entry, else {}. A request that
+/// NetworkEndpointsGate denies is left unchanged.
+fn force_endpoints(mode: &str, body: &mut HashMap<String, serde_json::Value>) {
+    let eps = match endpoints_config(body) {
+        Ok(Some(eps)) => eps.clone(),
+        Ok(None) => serde_json::Map::new(),
+        Err(()) => return,
+    };
+    if eps.keys().any(|k| k.as_str() != "default" && k.as_str() != mode) {
+        return;
+    }
+    let mut forced = serde_json::Map::new();
+    if !detached_network_mode(mode) {
+        let entry = eps
+            .get(mode)
+            .or_else(|| eps.get("default"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        forced.insert(mode.to_string(), entry);
+    }
+    let nc = body
+        .entry("NetworkingConfig".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !nc.is_object() {
+        *nc = serde_json::json!({});
+    }
+    if let Some(nc) = nc.as_object_mut() {
+        nc.insert("EndpointsConfig".to_string(), serde_json::Value::Object(forced));
+    }
+}
+
 pub struct ContainerConfigMutator;
 impl Mutator for ContainerConfigMutator {
     fn mutate(&self, policy: &Policy, body: &mut HashMap<String, serde_json::Value>) {
@@ -323,6 +426,9 @@ impl Mutator for ContainerConfigMutator {
         hc.insert("Privileged".to_string(), serde_json::Value::Bool(false));
         if let Some(u) = &cc.user {
             body.insert("User".to_string(), serde_json::Value::String(u.clone()));
+        }
+        if let Some(mode) = forced_network_mode(policy) {
+            force_endpoints(mode, body);
         }
     }
 }
@@ -841,5 +947,224 @@ mod tests {
             "HostConfig": {"Env": []}
         }));
         assert!(gate.check("POST", "/containers/create", &policy, &body).is_ok());
+    }
+
+    /// When the policy forces network_mode, the endpoint entries in
+    /// NetworkingConfig.EndpointsConfig are made consistent with it (#87).
+    /// Before #87 they went through as sent, so the Docker CLI's
+    /// {"default": {}} made the start fail with "network default not found",
+    /// and an extra entry attached the container to a network the policy does
+    /// not allow. Rows mirror the runs in the network_endpoints module of
+    /// spec/docker_socket_policy.qnt; mynet stands for a named network and
+    /// container:beacon for container:x.
+    #[test]
+    fn test_chain_network_endpoints() {
+        let aliases = r#"{"Aliases":["a"]}"#;
+        let ec = |entries: &str| format!(r#"{{"EndpointsConfig":{{{}}}}}"#, entries);
+        let extra = |mode: &str| {
+            format!(
+                r#"network "other" is not allowed for service test; policy forces network_mode {}"#,
+                mode
+            )
+        };
+        let malformed = "NetworkingConfig.EndpointsConfig must be a JSON object; policy forces network_mode host";
+        let both = ec(r#""default":{},"other":{}"#);
+        // (row, forced mode ("" = none), NetworkingConfig sent ("" = absent),
+        //  NetworkingConfig forwarded when allowed, deny reason when denied)
+        let cases: Vec<(&str, &str, String, String, String)> = vec![
+            ("hostNoEndpoints", "host", String::new(), ec(""), String::new()),
+            (
+                "hostDefaultCleared",
+                "host",
+                ec(r#""default":{}"#),
+                ec(""),
+                String::new(),
+            ),
+            (
+                "hostOwnCleared",
+                "host",
+                ec(&format!(r#""host":{}"#, aliases)),
+                ec(""),
+                String::new(),
+            ),
+            ("hostExtraDenied", "host", both.clone(), String::new(), extra("host")),
+            ("noneNoEndpoints", "none", String::new(), ec(""), String::new()),
+            (
+                "noneDefaultCleared",
+                "none",
+                ec(r#""default":{}"#),
+                ec(""),
+                String::new(),
+            ),
+            (
+                "noneOwnCleared",
+                "none",
+                ec(&format!(r#""none":{}"#, aliases)),
+                ec(""),
+                String::new(),
+            ),
+            ("noneExtraDenied", "none", both.clone(), String::new(), extra("none")),
+            (
+                "containerNoEndpoints",
+                "container:beacon",
+                String::new(),
+                ec(""),
+                String::new(),
+            ),
+            (
+                "containerDefaultCleared",
+                "container:beacon",
+                ec(r#""default":{}"#),
+                ec(""),
+                String::new(),
+            ),
+            (
+                "containerOwnCleared",
+                "container:beacon",
+                ec(&format!(r#""container:beacon":{}"#, aliases)),
+                ec(""),
+                String::new(),
+            ),
+            (
+                "containerExtraDenied",
+                "container:beacon",
+                both.clone(),
+                String::new(),
+                extra("container:beacon"),
+            ),
+            (
+                "bridgeNoEndpoints",
+                "bridge",
+                String::new(),
+                ec(r#""bridge":{}"#),
+                String::new(),
+            ),
+            (
+                "bridgeDefaultRekeyed",
+                "bridge",
+                ec(&format!(r#""default":{}"#, aliases)),
+                ec(&format!(r#""bridge":{}"#, aliases)),
+                String::new(),
+            ),
+            (
+                "bridgeOwnKept",
+                "bridge",
+                ec(&format!(r#""bridge":{}"#, aliases)),
+                ec(&format!(r#""bridge":{}"#, aliases)),
+                String::new(),
+            ),
+            (
+                "bridgeExtraDenied",
+                "bridge",
+                both.clone(),
+                String::new(),
+                extra("bridge"),
+            ),
+            (
+                "namedNoEndpoints",
+                "mynet",
+                String::new(),
+                ec(r#""mynet":{}"#),
+                String::new(),
+            ),
+            (
+                "namedDefaultRekeyed",
+                "mynet",
+                ec(&format!(r#""default":{}"#, aliases)),
+                ec(&format!(r#""mynet":{}"#, aliases)),
+                String::new(),
+            ),
+            (
+                "namedOwnKept",
+                "mynet",
+                ec(&format!(r#""mynet":{}"#, aliases)),
+                ec(&format!(r#""mynet":{}"#, aliases)),
+                String::new(),
+            ),
+            ("namedExtraDenied", "mynet", both.clone(), String::new(), extra("mynet")),
+            (
+                "namedOwnOverDefault",
+                "mynet",
+                ec(&format!(r#""default":{},"mynet":{{}}"#, aliases)),
+                ec(r#""mynet":{}"#),
+                String::new(),
+            ),
+            // #87: a null NetworkingConfig or EndpointsConfig counts as absent.
+            (
+                "#87 null NetworkingConfig",
+                "host",
+                "null".into(),
+                ec(""),
+                String::new(),
+            ),
+            (
+                "#87 null EndpointsConfig",
+                "bridge",
+                r#"{"EndpointsConfig":null}"#.into(),
+                ec(r#""bridge":{}"#),
+                String::new(),
+            ),
+            // #87: a NetworkingConfig or EndpointsConfig that is not an object is denied.
+            (
+                "#87 EndpointsConfig array",
+                "host",
+                r#"{"EndpointsConfig":[]}"#.into(),
+                String::new(),
+                malformed.into(),
+            ),
+            (
+                "#87 NetworkingConfig string",
+                "host",
+                r#""default""#.into(),
+                String::new(),
+                malformed.into(),
+            ),
+            // #87 control: without a forced network_mode, NetworkingConfig is untouched.
+            ("#87 no forced mode", "", both.clone(), both.clone(), String::new()),
+        ];
+        let chain = Chain::new();
+        let mut mismatches = Vec::new();
+        for (row, mode, req, want, deny) in cases {
+            let mut policy = make_policy("test", vec!["alpine"]);
+            policy.container_config = Some(ContainerConfig {
+                network_mode: if mode.is_empty() { None } else { Some(mode.into()) },
+                restart_policy: Some("unless-stopped".into()),
+                security_options: None,
+                user: None,
+                log_driver: None,
+                log_options: None,
+            });
+            let mut body = body_from_json(serde_json::json!({"Image": "alpine:3.20"}));
+            if !req.is_empty() {
+                body.insert("NetworkingConfig".into(), serde_json::from_str(&req).unwrap());
+            }
+            let result = chain.execute("POST", "/containers/create", &policy, &body);
+            if !deny.is_empty() {
+                if result.allowed || !result.reason.contains(&deny) {
+                    mismatches.push(format!(
+                        "{}: got allowed={} {:?}, want deny {:?}",
+                        row, result.allowed, result.reason, deny
+                    ));
+                }
+                continue;
+            }
+            if !result.allowed {
+                mismatches.push(format!("{}: got deny {:?}, want {}", row, result.reason, want));
+                continue;
+            }
+            let out: HashMap<String, serde_json::Value> =
+                serde_json::from_slice(&result.modified_body.unwrap()).unwrap();
+            let want_v: serde_json::Value = serde_json::from_str(&want).unwrap();
+            let got = out.get("NetworkingConfig").cloned().unwrap_or(serde_json::Value::Null);
+            if got != want_v {
+                mismatches.push(format!("{}: got {}, want {}", row, got, want));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
     }
 }

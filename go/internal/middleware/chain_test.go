@@ -1,8 +1,11 @@
 package middleware
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -409,5 +412,98 @@ func TestMountSourceGate_DeniesTopLevelVolumes(t *testing.T) {
 	result := c.Execute(r, p, body)
 	if result.Allowed {
 		t.Fatal("expected non-whitelisted top-level Volumes key to be denied")
+	}
+}
+
+// TestChain_NetworkEndpoints: when the policy forces network_mode, the
+// endpoint entries in NetworkingConfig.EndpointsConfig are made consistent
+// with it (#87). Before #87 they went through as sent, so the Docker CLI's
+// {"default": {}} made the start fail with "network default not found", and
+// an extra entry attached the container to a network the policy does not
+// allow. Rows mirror the runs in the network_endpoints module of
+// spec/docker_socket_policy.qnt; mynet stands for a named network and
+// container:beacon for container:x.
+func TestChain_NetworkEndpoints(t *testing.T) {
+	const aliases = `{"Aliases":["a"]}`
+	ec := func(entries string) string { return `{"EndpointsConfig":{` + entries + `}}` }
+	extra := func(mode string) string {
+		return `network "other" is not allowed for service test; policy forces network_mode ` + mode
+	}
+	malformed := "NetworkingConfig.EndpointsConfig must be a JSON object; policy forces network_mode host"
+	cases := []struct {
+		row  string
+		mode string // "" means the policy does not force network_mode
+		req  string // NetworkingConfig as sent; "" means absent
+		want string // NetworkingConfig forwarded, when allowed
+		deny string // deny reason substring, when denied
+	}{
+		{"hostNoEndpoints", "host", "", ec(""), ""},
+		{"hostDefaultCleared", "host", ec(`"default":{}`), ec(""), ""},
+		{"hostOwnCleared", "host", ec(`"host":` + aliases), ec(""), ""},
+		{"hostExtraDenied", "host", ec(`"default":{},"other":{}`), "", extra("host")},
+		{"noneNoEndpoints", "none", "", ec(""), ""},
+		{"noneDefaultCleared", "none", ec(`"default":{}`), ec(""), ""},
+		{"noneOwnCleared", "none", ec(`"none":` + aliases), ec(""), ""},
+		{"noneExtraDenied", "none", ec(`"default":{},"other":{}`), "", extra("none")},
+		{"containerNoEndpoints", "container:beacon", "", ec(""), ""},
+		{"containerDefaultCleared", "container:beacon", ec(`"default":{}`), ec(""), ""},
+		{"containerOwnCleared", "container:beacon", ec(`"container:beacon":` + aliases), ec(""), ""},
+		{"containerExtraDenied", "container:beacon", ec(`"default":{},"other":{}`), "", extra("container:beacon")},
+		{"bridgeNoEndpoints", "bridge", "", ec(`"bridge":{}`), ""},
+		{"bridgeDefaultRekeyed", "bridge", ec(`"default":` + aliases), ec(`"bridge":` + aliases), ""},
+		{"bridgeOwnKept", "bridge", ec(`"bridge":` + aliases), ec(`"bridge":` + aliases), ""},
+		{"bridgeExtraDenied", "bridge", ec(`"default":{},"other":{}`), "", extra("bridge")},
+		{"namedNoEndpoints", "mynet", "", ec(`"mynet":{}`), ""},
+		{"namedDefaultRekeyed", "mynet", ec(`"default":` + aliases), ec(`"mynet":` + aliases), ""},
+		{"namedOwnKept", "mynet", ec(`"mynet":` + aliases), ec(`"mynet":` + aliases), ""},
+		{"namedExtraDenied", "mynet", ec(`"default":{},"other":{}`), "", extra("mynet")},
+		{"namedOwnOverDefault", "mynet", ec(`"default":` + aliases + `,"mynet":{}`), ec(`"mynet":{}`), ""},
+		// #87: a null NetworkingConfig or EndpointsConfig counts as absent.
+		{"#87 null NetworkingConfig", "host", "null", ec(""), ""},
+		{"#87 null EndpointsConfig", "bridge", `{"EndpointsConfig":null}`, ec(`"bridge":{}`), ""},
+		// #87: a NetworkingConfig or EndpointsConfig that is not an object is denied.
+		{"#87 EndpointsConfig array", "host", `{"EndpointsConfig":[]}`, "", malformed},
+		{"#87 NetworkingConfig string", "host", `"default"`, "", malformed},
+		// #87 control: without a forced network_mode, NetworkingConfig is untouched.
+		{"#87 no forced mode", "", ec(`"default":{},"other":{}`), ec(`"default":{},"other":{}`), ""},
+	}
+	var mismatches []string
+	for _, tc := range cases {
+		p := testPolicy(nil)
+		p.ContainerConfig.NetworkMode = tc.mode
+		body := map[string]interface{}{"Image": "chainsafe/lodestar:next"}
+		if tc.req != "" {
+			var nc interface{}
+			if err := json.Unmarshal([]byte(tc.req), &nc); err != nil {
+				t.Fatalf("%s: bad request JSON: %v", tc.row, err)
+			}
+			body["NetworkingConfig"] = nc
+		}
+		result := NewChain().Execute(testRequest("POST", "/containers/create"), p, body)
+		if tc.deny != "" {
+			if result.Allowed || !strings.Contains(result.Reason, tc.deny) {
+				mismatches = append(mismatches, fmt.Sprintf("%s: got allowed=%v %q, want deny %q", tc.row, result.Allowed, result.Reason, tc.deny))
+			}
+			continue
+		}
+		if !result.Allowed {
+			mismatches = append(mismatches, fmt.Sprintf("%s: got deny %q, want %s", tc.row, result.Reason, tc.want))
+			continue
+		}
+		var out map[string]interface{}
+		if err := json.Unmarshal(result.ModifiedBody, &out); err != nil {
+			t.Fatalf("%s: bad modified body: %v", tc.row, err)
+		}
+		var want interface{}
+		if err := json.Unmarshal([]byte(tc.want), &want); err != nil {
+			t.Fatalf("%s: bad want JSON: %v", tc.row, err)
+		}
+		if got := out["NetworkingConfig"]; !reflect.DeepEqual(got, want) {
+			gotJSON, _ := json.Marshal(got)
+			mismatches = append(mismatches, fmt.Sprintf("%s: got %s, want %s", tc.row, gotJSON, tc.want))
+		}
+	}
+	if len(mismatches) > 0 {
+		t.Fatalf("%d mismatches:\n%s", len(mismatches), strings.Join(mismatches, "\n"))
 	}
 }
