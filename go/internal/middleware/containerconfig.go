@@ -22,6 +22,7 @@ func (m *ContainerConfigMutator) Mutate(r *http.Request, p *policy.Policy, body 
 
 	if cc.NetworkMode != "" {
 		hostConfig["NetworkMode"] = cc.NetworkMode
+		forceEndpoints(cc.NetworkMode, body)
 	}
 
 	if cc.RestartPolicy != "" {

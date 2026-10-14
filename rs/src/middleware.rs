@@ -38,6 +38,7 @@ impl Chain {
         gates.push(Box::new(MountSourceGate));
         gates.push(Box::new(EnvFileGate));
         gates.push(Box::new(CmdGate));
+        gates.push(Box::new(NetworkEndpointsGate));
 
         let mutators: Vec<Box<dyn Mutator>> = vec![Box::new(ContainerConfigMutator)];
 
@@ -294,6 +295,108 @@ impl Gate for CmdGate {
     }
 }
 
+/// The network mode the policy forces, if any (#87).
+fn forced_network_mode(policy: &Policy) -> Option<&str> {
+    policy
+        .container_config
+        .as_ref()
+        .and_then(|cc| cc.network_mode.as_deref())
+        .filter(|m| !m.is_empty())
+}
+
+/// NetworkingConfig.EndpointsConfig of a create body: Ok(None) when absent
+/// or null, Err when NetworkingConfig or EndpointsConfig is not an object.
+fn endpoints_config(
+    body: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<Option<&serde_json::Map<String, serde_json::Value>>, ()> {
+    match body.get("NetworkingConfig") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Object(nc)) => match nc.get("EndpointsConfig") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Object(eps)) => Ok(Some(eps)),
+            Some(_) => Err(()),
+        },
+        Some(_) => Err(()),
+    }
+}
+
+/// A network mode in which the container joins no network of its own.
+fn detached_network_mode(mode: &str) -> bool {
+    mode == "host" || mode == "none" || mode.starts_with("container:")
+}
+
+/// When the policy forces network_mode M, every key in
+/// NetworkingConfig.EndpointsConfig must be "default" or M (#87). Any other
+/// key would attach the container to a network the policy does not allow.
+/// ContainerConfigMutator leaves such a request unchanged, so this gate
+/// sees what the caller sent.
+pub struct NetworkEndpointsGate;
+impl Gate for NetworkEndpointsGate {
+    fn check(
+        &self,
+        _method: &str,
+        _path: &str,
+        policy: &Policy,
+        body: &HashMap<String, serde_json::Value>,
+    ) -> std::result::Result<(), String> {
+        let mode = match forced_network_mode(policy) {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+        let eps = match endpoints_config(body) {
+            Ok(Some(eps)) => eps,
+            Ok(None) => return Ok(()),
+            Err(()) => {
+                return Err(format!(
+                    "NetworkingConfig.EndpointsConfig must be a JSON object; policy forces network_mode {}",
+                    mode
+                ))
+            }
+        };
+        if let Some(k) = eps.keys().find(|k| k.as_str() != "default" && k.as_str() != mode) {
+            return Err(format!(
+                "network {:?} is not allowed for service {}; policy forces network_mode {}",
+                k, policy.service_name, mode
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Make NetworkingConfig.EndpointsConfig consistent with the forced network
+/// mode (#87): no entries for host, none and container:<id>; otherwise
+/// exactly one entry keyed by the mode, with the settings of the caller's
+/// entry for the mode, else of its "default" entry, else {}. A request that
+/// NetworkEndpointsGate denies is left unchanged.
+fn force_endpoints(mode: &str, body: &mut HashMap<String, serde_json::Value>) {
+    let eps = match endpoints_config(body) {
+        Ok(Some(eps)) => eps.clone(),
+        Ok(None) => serde_json::Map::new(),
+        Err(()) => return,
+    };
+    if eps.keys().any(|k| k.as_str() != "default" && k.as_str() != mode) {
+        return;
+    }
+    let mut forced = serde_json::Map::new();
+    if !detached_network_mode(mode) {
+        let entry = eps
+            .get(mode)
+            .or_else(|| eps.get("default"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        forced.insert(mode.to_string(), entry);
+    }
+    let nc = body
+        .entry("NetworkingConfig".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !nc.is_object() {
+        *nc = serde_json::json!({});
+    }
+    if let Some(nc) = nc.as_object_mut() {
+        nc.insert("EndpointsConfig".to_string(), serde_json::Value::Object(forced));
+    }
+}
+
 pub struct ContainerConfigMutator;
 impl Mutator for ContainerConfigMutator {
     fn mutate(&self, policy: &Policy, body: &mut HashMap<String, serde_json::Value>) {
@@ -323,6 +426,9 @@ impl Mutator for ContainerConfigMutator {
         hc.insert("Privileged".to_string(), serde_json::Value::Bool(false));
         if let Some(u) = &cc.user {
             body.insert("User".to_string(), serde_json::Value::String(u.clone()));
+        }
+        if let Some(mode) = forced_network_mode(policy) {
+            force_endpoints(mode, body);
         }
     }
 }

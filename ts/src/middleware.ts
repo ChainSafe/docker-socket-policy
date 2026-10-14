@@ -20,6 +20,7 @@ export class Chain {
     this.gates.push(new MountSourceGate());
     this.gates.push(new EnvFileGate());
     this.gates.push(new CmdGate());
+    this.gates.push(new NetworkEndpointsGate());
   }
 
   execute(
@@ -181,6 +182,72 @@ export class CmdGate implements Gate {
   }
 }
 
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** NetworkingConfig.EndpointsConfig of a create body: null when absent or null, "malformed" when not an object. */
+function endpointsConfig(body: Record<string, unknown>): Record<string, unknown> | null | "malformed" {
+  const nc = body["NetworkingConfig"];
+  if (nc === undefined || nc === null) return null;
+  if (!isObject(nc)) return "malformed";
+  const eps = nc["EndpointsConfig"];
+  if (eps === undefined || eps === null) return null;
+  return isObject(eps) ? eps : "malformed";
+}
+
+/** A network mode in which the container joins no network of its own. */
+function detachedNetworkMode(mode: string): boolean {
+  return mode === "host" || mode === "none" || mode.startsWith("container:");
+}
+
+/**
+ * When the policy forces network_mode M, every key in
+ * NetworkingConfig.EndpointsConfig must be "default" or M (#87). Any other key
+ * would attach the container to a network the policy does not allow.
+ * ContainerConfigMutator leaves such a request unchanged, so this gate sees
+ * what the caller sent.
+ */
+export class NetworkEndpointsGate implements Gate {
+  check(_method: string, _path: string, policy: Policy, body: Record<string, unknown>): string | null {
+    const mode = policy.container_config?.network_mode;
+    if (!mode) return null;
+    const eps = endpointsConfig(body);
+    if (eps === null) return null;
+    if (eps === "malformed") {
+      return `NetworkingConfig.EndpointsConfig must be a JSON object; policy forces network_mode ${mode}`;
+    }
+    const extra = Object.keys(eps)
+      .sort()
+      .find((k) => k !== "default" && k !== mode);
+    if (extra !== undefined) {
+      return `network "${extra}" is not allowed for service ${policy.service_name}; policy forces network_mode ${mode}`;
+    }
+    return null;
+  }
+}
+
+/**
+ * Make NetworkingConfig.EndpointsConfig consistent with the forced network
+ * mode (#87): no entries for host, none and container:<id>; otherwise exactly
+ * one entry keyed by the mode, with the settings of the caller's entry for the
+ * mode, else of its "default" entry, else {}. A request that
+ * NetworkEndpointsGate denies is left unchanged.
+ */
+function forceEndpoints(mode: string, body: Record<string, unknown>): void {
+  const sent = endpointsConfig(body);
+  if (sent === "malformed") return;
+  const eps = sent ?? {};
+  if (Object.keys(eps).some((k) => k !== "default" && k !== mode)) return;
+  const forced: Record<string, unknown> = {};
+  if (!detachedNetworkMode(mode)) {
+    forced[mode] = Object.hasOwn(eps, mode) ? eps[mode] : Object.hasOwn(eps, "default") ? eps["default"] : {};
+  }
+  const nc = isObject(body["NetworkingConfig"]) ? body["NetworkingConfig"] : {};
+  nc["EndpointsConfig"] = forced;
+  body["NetworkingConfig"] = nc;
+}
+
 export class ContainerConfigMutator implements Mutator {
   mutate(policy: Policy, body: Record<string, unknown>): void {
     const cc = policy.container_config;
@@ -197,5 +264,6 @@ export class ContainerConfigMutator implements Mutator {
     if (cc.log_driver) {
       hostConfig["LogConfig"] = { Type: cc.log_driver, Config: cc.log_options ?? {} };
     }
+    if (cc.network_mode) forceEndpoints(cc.network_mode, body);
   }
 }
