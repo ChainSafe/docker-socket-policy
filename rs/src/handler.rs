@@ -1,6 +1,6 @@
 use crate::audit::AuditLogger;
 use crate::middleware::Chain;
-use crate::proxy::{Action, Router};
+use crate::proxy::{Action, RouteResult, Router};
 use crate::transport::Transport;
 use crate::transport::TransportError;
 use bytes::Bytes;
@@ -89,14 +89,26 @@ impl Handler {
 
         // Route on the raw target: the path still percent-encoded (#53), and the
         // query, which the image pull reads (#83).
-        let route = self
+        let mut route = self
             .router
             .route_request(&method, &target, !body_bytes.is_empty(), body_json.as_ref());
+
+        // A lifecycle action or DELETE on a name that no policy covers
+        // directly: ask the daemon which container it is (#86).
+        if route.action == Action::ResolveContainer {
+            let id = route.container.clone().unwrap_or_default();
+            route = self.resolve_container(&id).await;
+        }
 
         if route.action == Action::Deny {
             let msg = route.deny_msg.unwrap_or_default();
             warn!("denied {} {}: {}", method, path, msg);
-            self.audit.deny(&method, &target, &msg);
+            match &route.resolved_name {
+                Some(name) => self
+                    .audit
+                    .deny(&method, &target, &format!("{} (resolved to {})", msg, name)),
+                None => self.audit.deny(&method, &target, &msg),
+            }
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Full::new(Bytes::from(msg)))
@@ -121,7 +133,18 @@ impl Handler {
         }
 
         info!("allowed {} {}", method, path);
-        self.audit.allow(&method, &target);
+        match &route.resolved_name {
+            Some(name) => self.audit.allow_reason(
+                &method,
+                &target,
+                &format!(
+                    "container {} resolved to {}",
+                    route.container.as_deref().unwrap_or(""),
+                    name
+                ),
+            ),
+            None => self.audit.allow(&method, &target),
+        }
 
         let mut forwarded = Request::builder()
             .method(method.as_str())
@@ -152,6 +175,97 @@ impl Handler {
             }
         }
     }
+}
+
+impl Handler {
+    /// Asks the daemon for GET /containers/{id}/json and allows the request
+    /// only if the container's name is covered by a policy. A 404, an
+    /// uncovered name or any other failure denies: it fails closed (#86).
+    async fn resolve_container(&self, id: &str) -> RouteResult {
+        let not_managed = |resolved: Option<String>| RouteResult {
+            resolved_name: resolved,
+            ..deny_result(format!("container {} is not managed by any policy", id))
+        };
+        let cannot_resolve = |reason: String| deny_result(format!("cannot resolve container {}: {}", id, reason));
+
+        let req = match Request::builder()
+            .method("GET")
+            .uri(format!("/containers/{}/json", path_escape(id)))
+            .header(header::HOST, "docker")
+            .body(Full::new(Bytes::new()))
+        {
+            Ok(r) => r,
+            Err(e) => return cannot_resolve(e.to_string()),
+        };
+        let resp = match self.transport.forward(req).await {
+            Ok(r) => r,
+            Err(e) => return cannot_resolve(e.to_string()),
+        };
+        match resp.status() {
+            StatusCode::OK => {}
+            StatusCode::NOT_FOUND => return not_managed(None),
+            other => return cannot_resolve(format!("daemon returned {}", other.as_u16())),
+        }
+        let body = match resp.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return cannot_resolve("unreadable inspect response".into()),
+        };
+        let name = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("Name").and_then(|n| n.as_str()).map(str::to_string))
+            .filter(|n| !n.is_empty());
+        let Some(name) = name else {
+            return cannot_resolve("unreadable inspect response".into());
+        };
+        let name = name.strip_prefix('/').unwrap_or(&name).to_string();
+
+        let covering = self.router.manager().covering(&name);
+        if covering.is_empty() {
+            return not_managed(Some(name));
+        }
+        let policy = if covering.len() == 1 {
+            Some(covering[0].clone())
+        } else {
+            None
+        };
+        RouteResult {
+            action: Action::Allow,
+            service: policy.as_ref().map(|p| p.service_name.clone()),
+            policy,
+            body: None,
+            container: Some(id.to_string()),
+            resolved_name: Some(name),
+            image: None,
+            deny_msg: None,
+        }
+    }
+}
+
+fn deny_result(msg: String) -> RouteResult {
+    RouteResult {
+        action: Action::Deny,
+        service: None,
+        policy: None,
+        body: None,
+        container: None,
+        resolved_name: None,
+        image: None,
+        deny_msg: Some(msg),
+    }
+}
+
+/// Percent-encodes everything but RFC 3986 unreserved characters, so the id
+/// stays one path segment.
+fn path_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 /// An Upgrade header, or a Connection header that lists the upgrade token.

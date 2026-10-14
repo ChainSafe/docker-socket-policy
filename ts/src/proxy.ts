@@ -1,10 +1,14 @@
 import type { ImageRef, Policy } from "./policy.js";
-import { Manager, checkImageTag, parseImageRef } from "./policy.js";
+import { Manager, checkImageTag, parseImageRef, validContainerName } from "./policy.js";
 
 export enum Action {
   Deny,
   Allow,
   CreateContainer,
+  // A lifecycle action or DELETE on a container that is not directly a
+  // covered name. The handler asks the daemon which container it is and
+  // allows the request only if its name is covered (#86).
+  ResolveContainer,
 }
 
 export interface RouteResult {
@@ -13,6 +17,8 @@ export interface RouteResult {
   policy?: Policy;
   body?: Record<string, unknown>;
   container?: string;
+  // The daemon's name for `container`, set when the handler resolved it (#86).
+  resolvedName?: string;
   image?: string;
   denyMsg?: string;
 }
@@ -20,7 +26,7 @@ export interface RouteResult {
 export class Router {
   private readonlyMode = false;
 
-  constructor(private manager: Manager) {}
+  constructor(readonly manager: Manager) {}
 
   // Sets read-only mode (--readonly) and returns the router.
   withReadonly(readonly: boolean): this {
@@ -57,7 +63,7 @@ export class Router {
 
     // Container create
     if (method === "POST" && path === "/containers/create") {
-      return this.routeCreate(body);
+      return this.routeCreate(body, query);
     }
 
     // Container lifecycle
@@ -91,7 +97,7 @@ export class Router {
     return { action: Action.Deny, denyMsg: `endpoint ${method} ${path} is not allowed` };
   }
 
-  private routeCreate(body?: Record<string, unknown>): RouteResult {
+  private routeCreate(body: Record<string, unknown> | undefined, query: string): RouteResult {
     if (!body || !Object.keys(body).length) {
       return { action: Action.Deny, denyMsg: "empty request body" };
     }
@@ -106,20 +112,36 @@ export class Router {
       return { action: Action.Deny, denyMsg: (err as Error).message };
     }
 
-    const policy = this.manager.getByImage(image);
-    if (!policy) {
-      return { action: Action.Deny, denyMsg: `image ${image} not allowed by any policy` };
+    const parsed = createName(query);
+    if ("error" in parsed) {
+      return { action: Action.Deny, denyMsg: parsed.error };
     }
+    const name = parsed.name;
 
-    return { action: Action.CreateContainer, service: policy.service_name, policy, body, image };
+    const selected = this.manager.selectForCreate(image, name);
+    if ("error" in selected) {
+      return { action: Action.Deny, denyMsg: selected.error };
+    }
+    const policy = selected.policy;
+    return {
+      action: Action.CreateContainer,
+      service: policy.service_name,
+      policy,
+      body,
+      image,
+      ...(name ? { container: name } : {}),
+    };
   }
 
+  // Allows a lifecycle action or DELETE on a name that exactly one policy
+  // covers. Anything else, including a name that could also be an ID prefix,
+  // needs the daemon to say which container it is (#86).
   private routeByName(name: string): RouteResult {
-    const policy = this.manager.get(name);
-    if (policy) {
-      return { action: Action.Allow, service: policy.service_name, policy };
+    const covering = this.manager.covering(name);
+    if (covering.length === 1 && !couldBeId(name)) {
+      return { action: Action.Allow, service: covering[0].service_name, policy: covering[0], container: name };
     }
-    return { action: Action.Allow, container: name };
+    return { action: Action.ResolveContainer, container: name };
   }
 
   // Image pull (#83). The Docker CLI sends fromImage and tag in the query
@@ -156,11 +178,18 @@ export class Router {
     }
     // With neither, the daemon pulls every tag of the repository.
     if (!ref.tag && !ref.digest) return deny("image pull without a tag or digest pulls every tag and is not allowed");
-    const policy = this.manager.getByImage(ref.name);
-    if (!policy) return deny(`image ${fromImage} not allowed by any policy`);
-    const reason = checkImageTag(policy, ref);
-    if (reason !== null) return deny(reason);
-    return { action: Action.Allow, service: policy.service_name, image: fromImage };
+    // Several policies may allow the image once container_names tells their
+    // creates apart (#85). A pull creates no container, so any of them may
+    // accept the tag or digest; with none, the first one's reason is given.
+    const matching = this.manager.matchingImage(ref.name);
+    if (matching.length === 0) return deny(`image ${fromImage} not allowed by any policy`);
+    let firstReason: string | undefined;
+    for (const policy of matching) {
+      const reason = checkImageTag(policy, ref);
+      if (reason === null) return { action: Action.Allow, service: policy.service_name, image: fromImage };
+      firstReason ??= reason;
+    }
+    return deny(firstReason!);
   }
 }
 
@@ -201,6 +230,26 @@ function queryUnescape(s: string): string | undefined {
     }
   }
   return Buffer.from(bytes).toString("utf-8");
+}
+
+// The ?name= of a create, without the one leading slash the daemon also
+// strips, or "" when there is none. The query is parsed as the daemon parses
+// it, as the image pull does (#83). error is the deny message for a query the
+// daemon would reject or an invalid name (#85).
+function createName(query: string): { name: string } | { error: string } {
+  const params = parseQuery(query);
+  if (!params) return { error: "invalid query string" };
+  let name = params.find(([k]) => k === "name")?.[1] ?? "";
+  if (name.startsWith("/")) name = name.slice(1);
+  if (name !== "" && !validContainerName(name)) return { error: "invalid container name" };
+  return { name };
+}
+
+// A name of lowercase hex digits only. The daemon looks up an ID, then a name,
+// then an ID prefix, so if no container has this name it would act on the
+// container whose ID starts with it (#86).
+function couldBeId(name: string): boolean {
+  return /^[0-9a-f]+$/.test(name);
 }
 
 function stripAPIVersion(path: string): string {

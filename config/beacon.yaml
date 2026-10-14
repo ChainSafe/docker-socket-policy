@@ -1,6 +1,13 @@
 # Per-service policy for the Lodestar beacon node.
 # Test with: docker-socket-policy --config-dir=./config
 service_name: beacon
+# Optional (#85, #86). Creates use this policy only for these names, and
+# lifecycle actions (start, stop, rm, ...) reach only containers it covers:
+# these names, or service_name when container_names is unset. A second policy
+# for chainsafe/lodestar (a validator client, say) must set its own,
+# disjoint container_names, or the proxy refuses to start.
+container_names:
+  - beacon
 user_id: '2001'
 group_id: '2001'
 

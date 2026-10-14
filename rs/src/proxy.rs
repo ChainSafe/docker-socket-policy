@@ -1,4 +1,4 @@
-use crate::policy::{check_image_tag, parse_image_ref, Manager, Policy};
+use crate::policy::{check_image_tag, parse_image_ref, valid_container_name, Manager, Policy};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6,6 +6,10 @@ pub enum Action {
     Deny,
     Allow,
     CreateContainer,
+    /// A lifecycle action or DELETE on a container that is not directly a
+    /// covered name. The handler asks the daemon which container it is and
+    /// allows the request only if its name is covered (#86).
+    ResolveContainer,
 }
 
 #[derive(Debug, Clone)]
@@ -15,6 +19,9 @@ pub struct RouteResult {
     pub policy: Option<Policy>,
     pub body: Option<HashMap<String, serde_json::Value>>,
     pub container: Option<String>,
+    /// The daemon's name for `container`, set when the handler resolved it
+    /// (#86).
+    pub resolved_name: Option<String>,
     pub image: Option<String>,
     pub deny_msg: Option<String>,
 }
@@ -30,6 +37,10 @@ impl Router {
             manager,
             readonly: false,
         }
+    }
+
+    pub fn manager(&self) -> &Manager {
+        &self.manager
     }
 
     /// Sets read-only mode (--readonly) and returns the router.
@@ -99,7 +110,7 @@ impl Router {
 
         // Container create
         if method == "POST" && path == "/containers/create" {
-            return self.route_create(body);
+            return self.route_create(body, query);
         }
 
         // Container lifecycle
@@ -133,7 +144,7 @@ impl Router {
         deny(&format!("endpoint {} {} is not allowed", method, path))
     }
 
-    fn route_create(&self, body: Option<&HashMap<String, serde_json::Value>>) -> RouteResult {
+    fn route_create(&self, body: Option<&HashMap<String, serde_json::Value>>, query: &str) -> RouteResult {
         let body = match body {
             Some(b) if !b.is_empty() => b,
             _ => return deny("empty request body"),
@@ -147,37 +158,49 @@ impl Router {
             return deny(&msg);
         }
 
-        match self.manager.get_by_image(image) {
-            Some(policy) => RouteResult {
+        let name = match create_name(query) {
+            Ok(n) => n,
+            Err(msg) => return deny(msg),
+        };
+
+        match self.manager.select_for_create(image, &name) {
+            Ok(policy) => RouteResult {
                 action: Action::CreateContainer,
                 service: Some(policy.service_name.clone()),
                 policy: Some(policy.clone()),
                 body: Some(body.clone()),
-                container: None,
+                container: if name.is_empty() { None } else { Some(name) },
+                resolved_name: None,
                 image: Some(image.to_string()),
                 deny_msg: None,
             },
-            None => deny(&format!("image {} not allowed by any policy", image)),
+            Err(msg) => deny(&msg),
         }
     }
 
+    /// Allows a lifecycle action or DELETE on a name that exactly one policy
+    /// covers. Anything else, including a name that could also be an ID
+    /// prefix, needs the daemon to say which container it is (#86).
     fn route_by_name(&self, name: &str) -> RouteResult {
-        match self.manager.get(name) {
-            Some(policy) => RouteResult {
+        let covering = self.manager.covering(name);
+        match covering.as_slice() {
+            [policy] if !could_be_id(name) => RouteResult {
                 action: Action::Allow,
                 service: Some(policy.service_name.clone()),
-                policy: Some(policy.clone()),
+                policy: Some((*policy).clone()),
                 body: None,
-                container: None,
+                container: Some(name.to_string()),
+                resolved_name: None,
                 image: None,
                 deny_msg: None,
             },
-            None => RouteResult {
-                action: Action::Allow,
+            _ => RouteResult {
+                action: Action::ResolveContainer,
                 service: None,
                 policy: None,
                 body: None,
                 container: Some(name.to_string()),
+                resolved_name: None,
                 image: None,
                 deny_msg: None,
             },
@@ -235,22 +258,35 @@ impl Router {
         if image_ref.tag.is_empty() && image_ref.digest.is_empty() {
             return deny("image pull without a tag or digest pulls every tag and is not allowed");
         }
-        let policy = match self.manager.get_by_image(&image_ref.name) {
-            Some(p) => p,
-            None => return deny(&format!("image {} not allowed by any policy", from_image)),
-        };
-        if let Err(msg) = check_image_tag(policy, &image_ref) {
-            return deny(&msg);
+        // Several policies may allow the image once container_names tells
+        // their creates apart (#85). A pull creates no container, so any of
+        // them may accept the tag or digest; with none, the first one's
+        // reason is given.
+        let matching = self.manager.matching_image(&image_ref.name);
+        if matching.is_empty() {
+            return deny(&format!("image {} not allowed by any policy", from_image));
         }
-        RouteResult {
-            action: Action::Allow,
-            service: Some(policy.service_name.clone()),
-            policy: None,
-            body: None,
-            container: None,
-            image: Some(from_image.to_string()),
-            deny_msg: None,
+        let mut first_err = None;
+        for policy in matching {
+            match check_image_tag(policy, &image_ref) {
+                Ok(()) => {
+                    return RouteResult {
+                        action: Action::Allow,
+                        service: Some(policy.service_name.clone()),
+                        policy: None,
+                        body: None,
+                        container: None,
+                        resolved_name: None,
+                        image: Some(from_image.to_string()),
+                        deny_msg: None,
+                    }
+                }
+                Err(msg) => {
+                    first_err.get_or_insert(msg);
+                }
+            }
         }
+        deny(&first_err.unwrap_or_default())
     }
 }
 
@@ -305,6 +341,7 @@ fn allow() -> RouteResult {
         policy: None,
         body: None,
         container: None,
+        resolved_name: None,
         image: None,
         deny_msg: None,
     }
@@ -317,9 +354,35 @@ fn deny(msg: &str) -> RouteResult {
         policy: None,
         body: None,
         container: None,
+        resolved_name: None,
         image: None,
         deny_msg: Some(msg.to_string()),
     }
+}
+
+/// The ?name= of a create, without the one leading slash the daemon also
+/// strips, or "" when there is none. The query is parsed as the daemon parses
+/// it, as the image pull does (#83). The error is the deny message for a query
+/// the daemon would reject or an invalid name (#85).
+fn create_name(query: &str) -> Result<String, &'static str> {
+    let params = parse_query(query).ok_or("invalid query string")?;
+    let name = params
+        .iter()
+        .find(|(k, _)| k == "name")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let name = name.strip_prefix('/').unwrap_or(name);
+    if !name.is_empty() && !valid_container_name(name) {
+        return Err("invalid container name");
+    }
+    Ok(name.to_string())
+}
+
+/// A name of lowercase hex digits only. The daemon looks up an ID, then a
+/// name, then an ID prefix, so if no container has this name it would act on
+/// the container whose ID starts with it (#86).
+fn could_be_id(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 // Strips one leading /v<N>/ or /v<N>.<M>/ (ASCII digits only); anything else is left as is (#57).

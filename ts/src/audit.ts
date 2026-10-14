@@ -8,6 +8,10 @@ export class AuditLogger {
     this.log("ALLOW", method, uri, "");
   }
 
+  allowReason(method: string, uri: string, reason: string) {
+    this.log("ALLOW", method, uri, reason);
+  }
+
   deny(method: string, uri: string, reason: string) {
     this.log("DENY", method, uri, reason);
   }

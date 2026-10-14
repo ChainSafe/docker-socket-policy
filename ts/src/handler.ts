@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import { AuditLogger } from "./audit.js";
 import { Chain } from "./middleware.js";
-import { Action, Router } from "./proxy.js";
+import { Action, type RouteResult, Router } from "./proxy.js";
 import { Transport } from "./transport.js";
 
 export class Handler {
@@ -53,12 +53,18 @@ export class Handler {
       }
     }
 
-    const route = this.router.route(method, path, bodyJSON, bodyBytes.length > 0);
+    let route = this.router.route(method, path, bodyJSON, bodyBytes.length > 0);
+
+    // A lifecycle action or DELETE on a name that no policy covers directly:
+    // ask the daemon which container it is (#86).
+    if (route.action === Action.ResolveContainer) {
+      route = await this.resolveContainer(route.container ?? "");
+    }
 
     if (route.action === Action.Deny) {
       const msg = route.denyMsg ?? "denied";
       console.warn(`[${requestId}] DENIED ${method} ${path}: ${msg}`);
-      this.audit.deny(method, path, msg);
+      this.audit.deny(method, path, route.resolvedName ? `${msg} (resolved to ${route.resolvedName})` : msg);
       res.writeHead(403);
       res.end(msg);
       return;
@@ -81,8 +87,57 @@ export class Handler {
     }
 
     console.log(`[${requestId}] ALLOWED ${method} ${path}`);
-    this.audit.allow(method, path);
+    if (route.resolvedName) {
+      this.audit.allowReason(method, path, `container ${route.container} resolved to ${route.resolvedName}`);
+    } else {
+      this.audit.allow(method, path);
+    }
     await this.transport.forward(req, res, bodyBytes.length > 0 ? bodyBytes : undefined);
+  }
+
+  // Asks the daemon for GET /containers/{id}/json and allows the request only
+  // if the container's name is covered by a policy. A 404, an uncovered name
+  // or any other failure denies: it fails closed (#86).
+  private async resolveContainer(id: string): Promise<RouteResult> {
+    const notManaged = (resolvedName?: string): RouteResult => ({
+      action: Action.Deny,
+      container: id,
+      denyMsg: `container ${id} is not managed by any policy`,
+      ...(resolvedName ? { resolvedName } : {}),
+    });
+    const cannotResolve = (reason: string): RouteResult => ({
+      action: Action.Deny,
+      container: id,
+      denyMsg: `cannot resolve container ${id}: ${reason}`,
+    });
+
+    let resp;
+    try {
+      resp = await this.transport.get(`/containers/${encodeURIComponent(id)}/json`);
+    } catch (err) {
+      return cannotResolve(err instanceof Error ? err.message : String(err));
+    }
+    if (resp.statusCode === 404) return notManaged();
+    if (resp.statusCode !== 200) return cannotResolve(`daemon returned ${resp.statusCode}`);
+
+    let name: unknown;
+    try {
+      name = JSON.parse(resp.body.toString("utf-8"))?.Name;
+    } catch {
+      name = undefined;
+    }
+    if (typeof name !== "string" || name === "") return cannotResolve("unreadable inspect response");
+    if (name.startsWith("/")) name = name.slice(1);
+    const resolvedName = name as string;
+
+    const covering = this.router.manager.covering(resolvedName);
+    if (covering.length === 0) return notManaged(resolvedName);
+    return {
+      action: Action.Allow,
+      container: id,
+      resolvedName,
+      ...(covering.length === 1 ? { service: covering[0].service_name, policy: covering[0] } : {}),
+    };
   }
 
   // Answers a CONNECT request with 403 on the raw socket (#78). Node emits

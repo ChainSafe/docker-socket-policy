@@ -15,6 +15,10 @@ const (
 	ActionDeny Action = iota
 	ActionAllow
 	ActionCreateContainer
+	// ActionResolveContainer: a lifecycle action or DELETE on a container
+	// that is not directly a covered name. The handler asks the daemon which
+	// container it is and allows the request only if its name is covered (#86).
+	ActionResolveContainer
 )
 
 type RouteResult struct {
@@ -23,8 +27,11 @@ type RouteResult struct {
 	Policy    *policy.Policy
 	Body      map[string]interface{}
 	Container string
-	Image     string
-	DenyMsg   string
+	// ResolvedName is the daemon's name for Container, set when the handler
+	// resolved it (#86).
+	ResolvedName string
+	Image        string
+	DenyMsg      string
 }
 
 type Router struct {
@@ -99,31 +106,31 @@ func (r *Router) RouteRequest(method, target string, hasBody bool, body map[stri
 	}
 
 	if path == "/containers/create" && method == "POST" {
-		return r.routeCreate(body)
+		return r.routeCreate(body, rawQuery)
 	}
 
 	if containerName := extractContainerName(path); containerName != "" {
 		switch {
 		case strings.HasSuffix(path, "/start") && method == "POST":
-			return r.routeByContainerName(containerName, "start")
+			return r.routeByContainerName(containerName)
 		case strings.HasSuffix(path, "/stop") && method == "POST":
-			return r.routeByContainerName(containerName, "stop")
+			return r.routeByContainerName(containerName)
 		case strings.HasSuffix(path, "/restart") && method == "POST":
-			return r.routeByContainerName(containerName, "restart")
+			return r.routeByContainerName(containerName)
 		case strings.HasSuffix(path, "/kill") && method == "POST":
-			return r.routeByContainerName(containerName, "kill")
+			return r.routeByContainerName(containerName)
 		case strings.HasSuffix(path, "/wait") && method == "POST":
-			return r.routeByContainerName(containerName, "wait")
+			return r.routeByContainerName(containerName)
 		case strings.HasSuffix(path, "/pause") && method == "POST":
-			return r.routeByContainerName(containerName, "pause")
+			return r.routeByContainerName(containerName)
 		case strings.HasSuffix(path, "/unpause") && method == "POST":
-			return r.routeByContainerName(containerName, "unpause")
+			return r.routeByContainerName(containerName)
 		case strings.HasSuffix(path, "/rename") && method == "POST":
 			return &RouteResult{Action: ActionDeny, DenyMsg: "rename is not allowed"}
 		case strings.HasSuffix(path, "/update") && method == "POST":
 			return &RouteResult{Action: ActionDeny, DenyMsg: "update is not allowed"}
 		case method == "DELETE":
-			return r.routeByContainerName(containerName, "rm")
+			return r.routeByContainerName(containerName)
 		default:
 			if method == "GET" {
 				return &RouteResult{Action: ActionAllow}
@@ -145,7 +152,7 @@ func (r *Router) RouteRequest(method, target string, hasBody bool, body map[stri
 	}
 }
 
-func (r *Router) routeCreate(body map[string]interface{}) *RouteResult {
+func (r *Router) routeCreate(body map[string]interface{}, rawQuery string) *RouteResult {
 	if len(body) == 0 {
 		return &RouteResult{Action: ActionDeny, DenyMsg: "empty request body"}
 	}
@@ -158,32 +165,71 @@ func (r *Router) routeCreate(body map[string]interface{}) *RouteResult {
 		return &RouteResult{Action: ActionDeny, DenyMsg: err.Error()}
 	}
 
-	p, err := r.manager.GetByImage(image)
+	name, msg := createName(rawQuery)
+	if msg != "" {
+		return &RouteResult{Action: ActionDeny, DenyMsg: msg}
+	}
+
+	p, err := r.manager.SelectForCreate(image, name)
 	if err != nil {
-		return &RouteResult{Action: ActionDeny, DenyMsg: fmt.Sprintf("image %s not allowed by any policy", image)}
+		return &RouteResult{Action: ActionDeny, DenyMsg: err.Error()}
 	}
 
 	return &RouteResult{
-		Action:  ActionCreateContainer,
-		Service: p.ServiceName,
-		Policy:  p,
-		Body:    body,
-		Image:   image,
+		Action:    ActionCreateContainer,
+		Service:   p.ServiceName,
+		Policy:    p,
+		Body:      body,
+		Container: name,
+		Image:     image,
 	}
 }
 
-func (r *Router) routeByContainerName(containerName, action string) *RouteResult {
-	if p, err := r.manager.Get(containerName); err == nil {
+// createName returns the ?name= of a create, without the one leading slash
+// the daemon also strips, or "" when there is none. The query is parsed as the
+// daemon parses it, with url.ParseQuery, as the image pull does (#83). msg is
+// the deny message for a query the daemon would reject or an invalid name
+// (#85).
+func createName(rawQuery string) (name, msg string) {
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", "invalid query string"
+	}
+	name = strings.TrimPrefix(q.Get("name"), "/")
+	if name != "" && !policy.ValidContainerName(name) {
+		return "", "invalid container name"
+	}
+	return name, ""
+}
+
+// routeByContainerName allows a lifecycle action or DELETE on a name that
+// exactly one policy covers. Anything else, including a name that could also
+// be an ID prefix, needs the daemon to say which container it is (#86).
+func (r *Router) routeByContainerName(containerName string) *RouteResult {
+	if ps := r.manager.Covering(containerName); len(ps) == 1 && !couldBeID(containerName) {
 		return &RouteResult{
-			Action:  ActionAllow,
-			Service: p.ServiceName,
-			Policy:  p,
+			Action:    ActionAllow,
+			Service:   ps[0].ServiceName,
+			Policy:    ps[0],
+			Container: containerName,
 		}
 	}
 	return &RouteResult{
-		Action:    ActionAllow,
+		Action:    ActionResolveContainer,
 		Container: containerName,
 	}
+}
+
+// couldBeID reports a name of lowercase hex digits only. The daemon looks up
+// an ID, then a name, then an ID prefix, so if no container has this name it
+// would act on the container whose ID starts with it (#86).
+func couldBeID(name string) bool {
+	for _, c := range name {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return name != ""
 }
 
 // routeImagePull routes an image pull (#83). The Docker CLI sends fromImage
@@ -237,15 +283,24 @@ func (r *Router) routeImagePull(rawQuery string, hasBody bool) *RouteResult {
 		return deny("image pull without a tag or digest pulls every tag and is not allowed")
 	}
 
-	p, err := r.manager.GetByImage(ref.Name)
-	if err != nil {
+	// Several policies may allow the image once container_names tells their
+	// creates apart (#85). A pull creates no container, so any of them may
+	// accept the tag or digest; with none, the first one's reason is given.
+	matching := r.manager.MatchingImage(ref.Name)
+	if len(matching) == 0 {
 		return deny(fmt.Sprintf("image %s not allowed by any policy", fromImage))
 	}
-	if err := policy.CheckImageTag(p, ref); err != nil {
-		return deny(err.Error())
+	var firstErr error
+	for _, p := range matching {
+		err := policy.CheckImageTag(p, ref)
+		if err == nil {
+			return &RouteResult{Action: ActionAllow, Service: p.ServiceName, Image: fromImage}
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
-
-	return &RouteResult{Action: ActionAllow, Service: p.ServiceName, Image: fromImage}
+	return deny(firstErr.Error())
 }
 
 // stripAPIVersion strips one leading /v<N>/ or /v<N>.<M>/ (ASCII digits only), else returns path unchanged (#57).
@@ -303,9 +358,9 @@ func isAttachPath(path string) bool {
 
 // reservedContainerSegments are Docker endpoints that sit where a container
 // name would: /containers/json lists, /containers/create creates. Treating one
-// as a container name routes the request down the lifecycle path, where an
-// unknown container is allowed through — so DELETE /containers/json would be
-// allowed rather than denied. Rust (rs/src/proxy.rs) and TypeScript
+// as a container name routes the request down the lifecycle path, where
+// DELETE /containers/json would be treated as a container removal rather than
+// denied. Rust (rs/src/proxy.rs) and TypeScript
 // (ts/src/proxy.ts) exclude the same set.
 var reservedContainerSegments = map[string]bool{
 	"create": true,

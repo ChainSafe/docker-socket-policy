@@ -1,10 +1,11 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Policy {
     pub service_name: String,
+    pub container_names: Option<Vec<String>>,
     pub user_id: Option<String>,
     pub group_id: Option<String>,
     pub allowed_image_prefixes: Vec<String>,
@@ -18,6 +19,38 @@ pub struct Policy {
     pub allowed_cli_flags: Option<Vec<String>>,
     pub flag_rules: Option<Vec<FlagRule>>,
     pub denied_flags: Option<Vec<String>>,
+}
+
+impl Policy {
+    /// The container names the policy manages: its container_names, or its
+    /// service_name when container_names is unset (#85, #86). Lifecycle
+    /// actions and DELETE are forwarded only for covered names.
+    pub fn covered_names(&self) -> Vec<&str> {
+        match &self.container_names {
+            Some(names) => names.iter().map(|s| s.as_str()).collect(),
+            None => vec![self.service_name.as_str()],
+        }
+    }
+
+    /// Whether a create named `name` may use the policy: a policy without
+    /// container_names accepts any name, including none (#85).
+    pub fn accepts_name(&self, name: &str) -> bool {
+        match &self.container_names {
+            Some(names) => names.iter().any(|n| n == name),
+            None => true,
+        }
+    }
+}
+
+/// A Docker container name without the optional leading slash (#85):
+/// `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
+pub fn valid_container_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,18 +77,23 @@ pub struct FlagRule {
 }
 
 pub struct Manager {
-    policies_by_name: HashMap<String, Policy>,
+    // Sorted by service_name, so selection never depends on map iteration
+    // order (#85).
+    policies_by_name: BTreeMap<String, Policy>,
 }
 
 impl Manager {
+    /// Builds a manager without load-time validation, as Go's
+    /// NewManagerFromPolicies and TypeScript's Manager.fromPolicies do. Tests
+    /// use it to reach states that `new` refuses, such as ambiguity.
     pub fn from_map(policies: HashMap<String, Policy>) -> Self {
         Manager {
-            policies_by_name: policies,
+            policies_by_name: policies.into_iter().collect(),
         }
     }
 
     pub fn new(config_dir: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut policies_by_name = HashMap::new();
+        let mut policies_by_name = BTreeMap::new();
         let entries = match std::fs::read_dir(config_dir) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -68,12 +106,22 @@ impl Manager {
             Err(e) => return Err(e.into()),
         };
 
+        let mut paths = Vec::new();
         for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
+            let path = entry?.path();
             if path.extension().map_or(true, |e| e != "yaml" && e != "yml") {
                 continue;
             }
+            paths.push(path);
+        }
+        paths.sort();
+
+        let mut file_of: HashMap<String, String> = HashMap::new();
+        for path in paths {
+            let file = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let data = std::fs::read_to_string(&path)?;
             let policy: Policy = serde_yaml::from_str(&data)?;
             if policy.service_name.is_empty() {
@@ -82,6 +130,28 @@ impl Manager {
             if policy.allowed_image_prefixes.is_empty() {
                 return Err("missing allowed_image_prefixes".into());
             }
+            if let Some(names) = &policy.container_names {
+                if names.is_empty() {
+                    return Err(format!("policy file {}: container_names must not be empty", file).into());
+                }
+                if let Some(bad) = names.iter().find(|n| !valid_container_name(n)) {
+                    return Err(format!(
+                        "policy file {}: invalid container name {:?} in container_names",
+                        file, bad
+                    )
+                    .into());
+                }
+            }
+            // A second file with the same service_name used to replace the
+            // first silently (#85).
+            if let Some(prev) = file_of.get(&policy.service_name) {
+                return Err(format!(
+                    "policies in {} and {} both use service_name {:?}",
+                    prev, file, policy.service_name
+                )
+                .into());
+            }
+            file_of.insert(policy.service_name.clone(), file);
             // Prefixes are compared in normalised form (#84).
             let mut policy = policy;
             let mut prefixes = Vec::with_capacity(policy.allowed_image_prefixes.len());
@@ -99,7 +169,42 @@ impl Manager {
             policies_by_name.insert(policy.service_name.clone(), policy);
         }
 
-        Ok(Manager { policies_by_name })
+        let m = Manager { policies_by_name };
+        m.check_conflicts(&file_of)?;
+        Ok(m)
+    }
+
+    /// Fails when two policies could both be selected for one create: their
+    /// image prefixes share a namespace, and one of them accepts any name or
+    /// their container_names intersect (#85).
+    fn check_conflicts(&self, file_of: &HashMap<String, String>) -> Result<(), String> {
+        let ordered: Vec<&Policy> = self.policies_by_name.values().collect();
+        for (i, a) in ordered.iter().enumerate() {
+            for b in &ordered[i + 1..] {
+                let Some((pa, pb)) = overlapping_prefixes(&a.allowed_image_prefixes, &b.allowed_image_prefixes) else {
+                    continue;
+                };
+                let reason = match (&a.container_names, &b.container_names) {
+                    (None, _) => format!("{:?} has no container_names", a.service_name),
+                    (_, None) => format!("{:?} has no container_names", b.service_name),
+                    (Some(an), Some(bn)) => match an.iter().filter(|n| bn.contains(n)).min() {
+                        Some(shared) => format!("both accept container name {:?}", shared),
+                        None => continue,
+                    },
+                };
+                return Err(format!(
+                    "conflicting policies {:?} ({}) and {:?} ({}): image prefixes {:?} and {:?} overlap and {}",
+                    a.service_name,
+                    file_of.get(&a.service_name).map(String::as_str).unwrap_or(""),
+                    b.service_name,
+                    file_of.get(&b.service_name).map(String::as_str).unwrap_or(""),
+                    pa,
+                    pb,
+                    reason
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&Policy> {
@@ -110,14 +215,71 @@ impl Manager {
     /// (#84). An invalid reference matches nothing.
     pub fn get_by_image(&self, image_ref: &str) -> Option<&Policy> {
         let name = parse_image_ref(image_ref).ok()?.name;
+        self.matching_image(&name).into_iter().next()
+    }
+
+    /// The policies, sorted by service_name, whose prefixes match a
+    /// normalised repository name (#85).
+    pub fn matching_image(&self, name: &str) -> Vec<&Policy> {
         self.policies_by_name
             .values()
-            .find(|p| matches_image_prefix(&name, &p.allowed_image_prefixes))
+            .filter(|p| matches_image_prefix(name, &p.allowed_image_prefixes))
+            .collect()
+    }
+
+    /// The one policy whose image prefixes match the normalised repository
+    /// of `image_ref` and which accepts the container name (empty for a
+    /// create without ?name=). No match, or more than one, is an error whose
+    /// text is the deny message (#85).
+    pub fn select_for_create(&self, image_ref: &str, name: &str) -> Result<&Policy, String> {
+        let image_name = parse_image_ref(image_ref)?.name;
+        let matching = self.matching_image(&image_name);
+        let candidates: Vec<&Policy> = matching.iter().copied().filter(|p| p.accepts_name(name)).collect();
+        match candidates.as_slice() {
+            [p] => Ok(p),
+            _ if matching.is_empty() => Err(format!("image {} not allowed by any policy", image_ref)),
+            [] if name.is_empty() => Err(format!("image {} requires a container name", image_ref)),
+            [] => Err(format!(
+                "container name {} not allowed for image {} by any policy",
+                name, image_ref
+            )),
+            many => Err(format!(
+                "ambiguous policy for image {} and name {}: {}",
+                image_ref,
+                name,
+                many.iter()
+                    .map(|p| p.service_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// The policies, sorted by service_name, whose covered names include
+    /// `name` (#86).
+    pub fn covering(&self, name: &str) -> Vec<&Policy> {
+        self.policies_by_name
+            .values()
+            .filter(|p| p.covered_names().contains(&name))
+            .collect()
     }
 
     pub fn list(&self) -> Vec<&str> {
         self.policies_by_name.keys().map(|s| s.as_str()).collect()
     }
+}
+
+// The first pair of prefixes where one equals the other or is a namespace (/)
+// prefix of it.
+fn overlapping_prefixes<'a>(a: &'a [String], b: &'a [String]) -> Option<(&'a str, &'a str)> {
+    for pa in a {
+        for pb in b {
+            if pa == pb || pa.starts_with(&format!("{}/", pb)) || pb.starts_with(&format!("{}/", pa)) {
+                return Some((pa, pb));
+            }
+        }
+    }
+    None
 }
 
 /// A parsed image reference (#84). `name` is the normalised repository: the
