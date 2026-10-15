@@ -61,6 +61,85 @@ pub struct ContainerConfig {
     pub user: Option<String>,
     pub log_driver: Option<String>,
     pub log_options: Option<HashMap<String, String>>,
+    /// Forced as `HostConfig.GroupAdd` (#93). An empty list is unset.
+    #[serde(default, deserialize_with = "group_list")]
+    pub group_add: Option<Vec<String>>,
+}
+
+/// Reads `group_add` as a list of YAML strings. serde_yaml would turn an
+/// unquoted 64190 into "64190", and 0x10 into "0x10" where TypeScript reads
+/// 16, so only string entries are taken, in all three (#93).
+fn group_list<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values: Option<Vec<serde_yaml::Value>> = Option::deserialize(d)?;
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    values
+        .into_iter()
+        .map(|v| match v {
+            serde_yaml::Value::String(s) => Ok(s),
+            _ => Err(serde::de::Error::custom(
+                "group_add entries must be strings (quote GIDs: '64190')",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// A group name as useradd accepts it: `[a-z_][a-z0-9_-]*[$]?`, at most 32
+/// characters (#93).
+fn valid_group_name(name: &str) -> bool {
+    let body = name.strip_suffix('$').unwrap_or(name);
+    let mut bytes = body.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_lowercase() || b == b'_' => {}
+        _ => return false,
+    }
+    name.len() <= 32 && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Validates `container_config.group_add` (#93): each entry is a decimal GID
+/// that fits in 32 bits or a group name; the root group (0 in any decimal
+/// form, or root) and duplicates (by GID value for numbers) are refused.
+fn check_group_add(file: &str, groups: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for g in groups {
+        let key = if !g.is_empty() && g.bytes().all(|b| b.is_ascii_digit()) {
+            let gid: u32 = g.parse().map_err(|_| {
+                format!(
+                    "policy file {}: invalid group_add entry {:?} (want a decimal GID or a group name)",
+                    file, g
+                )
+            })?;
+            if gid == 0 {
+                return Err(format!(
+                    "policy file {}: group_add entry {:?} is the root group, which is not allowed",
+                    file, g
+                ));
+            }
+            format!("gid:{}", gid)
+        } else if valid_group_name(g) {
+            if g == "root" {
+                return Err(format!(
+                    "policy file {}: group_add entry {:?} is the root group, which is not allowed",
+                    file, g
+                ));
+            }
+            format!("name:{}", g)
+        } else {
+            return Err(format!(
+                "policy file {}: invalid group_add entry {:?} (want a decimal GID or a group name)",
+                file, g
+            ));
+        };
+        if !seen.insert(key) {
+            return Err(format!("policy file {}: duplicate group_add entry {:?}", file, g));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,7 +202,7 @@ impl Manager {
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let data = std::fs::read_to_string(&path)?;
-            let policy: Policy = serde_yaml::from_str(&data)?;
+            let mut policy: Policy = serde_yaml::from_str(&data).map_err(|e| format!("policy file {}: {}", file, e))?;
             if policy.service_name.is_empty() {
                 return Err("missing service_name".into());
             }
@@ -142,6 +221,13 @@ impl Manager {
                     .into());
                 }
             }
+            if let Some(cc) = policy.container_config.as_mut() {
+                check_group_add(&file, cc.group_add.as_deref().unwrap_or_default())?;
+                // An empty group_add is the same as an unset one.
+                if cc.group_add.as_ref().is_some_and(|g| g.is_empty()) {
+                    cc.group_add = None;
+                }
+            }
             // A second file with the same service_name used to replace the
             // first silently (#85).
             if let Some(prev) = file_of.get(&policy.service_name) {
@@ -153,7 +239,6 @@ impl Manager {
             }
             file_of.insert(policy.service_name.clone(), file);
             // Prefixes are compared in normalised form (#84).
-            let mut policy = policy;
             let mut prefixes = Vec::with_capacity(policy.allowed_image_prefixes.len());
             for prefix in &policy.allowed_image_prefixes {
                 let normalized = normalize_image_prefix(prefix).map_err(|_| {

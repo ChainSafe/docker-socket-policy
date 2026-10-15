@@ -587,6 +587,18 @@ fn is_zero_value(v: &serde_json::Value) -> bool {
     }
 }
 
+/// Whether `value` is a JSON list of strings equal, in order, to the
+/// policy's non-empty `group_add` (#93).
+fn equals_forced_groups(value: &serde_json::Value, policy: &Policy) -> bool {
+    let forced = match policy.container_config.as_ref().and_then(|c| c.group_add.as_ref()) {
+        Some(g) if !g.is_empty() => g,
+        _ => return false,
+    };
+    value.as_array().is_some_and(|list| {
+        list.len() == forced.len() && list.iter().zip(forced).all(|(v, f)| v.as_str() == Some(f.as_str()))
+    })
+}
+
 fn check_security_opt(value: &serde_json::Value, policy: &Policy) -> std::result::Result<(), String> {
     if value.is_null() {
         return Ok(());
@@ -685,6 +697,17 @@ impl Gate for HostConfigGate {
                     }
                 }
                 "SecurityOpt" => check_security_opt(value, policy)?,
+                // Zero, or exactly the policy's group_add, which the mutator
+                // forces (#93). Checked here too so that the gate does not
+                // open up if the mutator ever stops forcing it.
+                "GroupAdd" => {
+                    if !is_zero_value(value) && !equals_forced_groups(value, policy) {
+                        return Err(format!(
+                            "HostConfig.GroupAdd is not allowed for service {}",
+                            policy.service_name
+                        ));
+                    }
+                }
                 "OomScoreAdj" => {
                     if !value.is_null() && !value.as_f64().is_some_and(|n| n >= 0.0) {
                         return Err(format!(
@@ -929,7 +952,9 @@ fn force_endpoints(mode: &str, body: &mut HashMap<String, serde_json::Value>) {
 
 /// ContainerConfigMutator overwrites the fields the policy's
 /// `container_config` sets. It forces `HostConfig.Privileged` to false on
-/// every create, even without a `container_config` (#88). A `HostConfig` that
+/// every create, even without a `container_config` (#88), and
+/// `HostConfig.GroupAdd` to the policy's `group_add` when set (#93). A
+/// `HostConfig` that
 /// is not an object is left alone for HostConfigGate to deny.
 pub struct ContainerConfigMutator;
 impl Mutator for ContainerConfigMutator {
@@ -968,6 +993,13 @@ impl Mutator for ContainerConfigMutator {
             hc.insert(
                 "LogConfig".to_string(),
                 serde_json::json!({"Type": driver, "Config": cc.log_options.clone().unwrap_or_default()}),
+            );
+        }
+        // Overwritten like User (#93); HostConfigGate allows exactly this list.
+        if let Some(groups) = cc.group_add.as_ref().filter(|g| !g.is_empty()) {
+            hc.insert(
+                "GroupAdd".to_string(),
+                serde_json::Value::Array(groups.iter().map(|g| serde_json::Value::String(g.clone())).collect()),
             );
         }
         if let Some(u) = &cc.user {

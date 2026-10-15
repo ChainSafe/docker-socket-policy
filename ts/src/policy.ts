@@ -26,6 +26,8 @@ export interface ContainerConfig {
   user?: string;
   log_driver?: string;
   log_options?: Record<string, string>;
+  // Forced as HostConfig.GroupAdd (#93). An empty list is unset.
+  group_add?: string[];
 }
 
 export interface Volume {
@@ -37,6 +39,45 @@ export interface Volume {
 export interface FlagRule {
   flag: string;
   value_pattern: string;
+}
+
+const GROUP_GID = /^[0-9]+$/;
+const GROUP_NAME = /^[a-z_][a-z0-9_-]*\$?$/;
+
+// Validates container_config.group_add (#93): each entry is a YAML string
+// holding a decimal GID that fits in 32 bits or a group name of at most 32
+// characters; the root group (0 in any decimal form, or root) and duplicates
+// (by GID value for numbers) are refused. Only strings are taken: the YAML
+// parser reads an unquoted 0x10 as 16, where Go and Rust would read "0x10".
+function checkGroupAdd(file: string, groups: unknown): void {
+  if (!Array.isArray(groups)) throw new Error(`policy file ${file}: group_add must be a list`);
+  const q = JSON.stringify;
+  const seen = new Set<string>();
+  for (const g of groups) {
+    if (typeof g !== "string") {
+      throw new Error(`policy file ${file}: group_add entries must be strings (quote GIDs: '64190')`);
+    }
+    let key: string;
+    if (GROUP_GID.test(g)) {
+      const gid = BigInt(g);
+      if (gid > 0xffffffffn) {
+        throw new Error(`policy file ${file}: invalid group_add entry ${q(g)} (want a decimal GID or a group name)`);
+      }
+      if (gid === 0n) {
+        throw new Error(`policy file ${file}: group_add entry ${q(g)} is the root group, which is not allowed`);
+      }
+      key = `gid:${gid}`;
+    } else if (g.length <= 32 && GROUP_NAME.test(g)) {
+      if (g === "root") {
+        throw new Error(`policy file ${file}: group_add entry ${q(g)} is the root group, which is not allowed`);
+      }
+      key = `name:${g}`;
+    } else {
+      throw new Error(`policy file ${file}: invalid group_add entry ${q(g)} (want a decimal GID or a group name)`);
+    }
+    if (seen.has(key)) throw new Error(`policy file ${file}: duplicate group_add entry ${q(g)}`);
+    seen.add(key);
+  }
 }
 
 // A Docker container name without the optional leading slash (#85).
@@ -111,6 +152,14 @@ export class Manager {
         if (bad !== undefined) {
           throw new Error(`policy file ${entry}: invalid container name ${JSON.stringify(bad)} in container_names`);
         }
+      }
+      const cc = policy.container_config;
+      if (cc && cc.group_add !== undefined && cc.group_add !== null) {
+        checkGroupAdd(entry, cc.group_add);
+        // An empty group_add is the same as an unset one.
+        if (cc.group_add.length === 0) delete cc.group_add;
+      } else if (cc) {
+        delete cc.group_add;
       }
       // A second file with the same service_name used to replace the first
       // silently (#85).

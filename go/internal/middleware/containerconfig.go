@@ -8,7 +8,8 @@ import (
 
 // ContainerConfigMutator overwrites the fields the policy's container_config
 // sets. It forces HostConfig.Privileged to false on every create, even when
-// container_config is empty (#88). A HostConfig that is not an object is left
+// container_config is empty (#88), and HostConfig.GroupAdd to the policy's
+// group_add when set (#93). A HostConfig that is not an object is left
 // alone for HostConfigGate to deny.
 type ContainerConfigMutator struct{}
 
@@ -48,6 +49,15 @@ func (m *ContainerConfigMutator) Mutate(r *http.Request, p *policy.Policy, body 
 	}
 
 	hostConfig["Privileged"] = false
+
+	if len(cc.GroupAdd) > 0 {
+		// Overwritten like User (#93); HostConfigGate allows exactly this list.
+		groups := make([]interface{}, len(cc.GroupAdd))
+		for i, g := range cc.GroupAdd {
+			groups[i] = g
+		}
+		hostConfig["GroupAdd"] = groups
+	}
 
 	if cc.User != "" {
 		body["User"] = cc.User
