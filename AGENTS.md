@@ -42,14 +42,14 @@ deploy/ — Docker Compose + integration tests
 - Go: 133 unit tests (main/listener: 24, policy: 15, middleware: 29, proxy: 61, audit: 4); the middleware count includes `TestHostConfigRows`, whose 139 #88 and #93 rows run as subtests, and `TestGroupAddGateRows` (9 #93 rows)
 - Rust: 160 unit tests (main/listener: 23, policy: 17, middleware: 45, proxy: 52, handler: 17, audit: 4, transport: 2); `test_host_config_rows` runs the 139 #88 and #93 rows, `test_group_add_gate_rows` the 9 #93 gate rows
 - TypeScript: 330 unit tests, 1 skipped (flags: 44, listen: 13 incl. 1 skipped concurrency test (#46), middleware: 182 incl. the 139 #88 and #93 rows and the 9 #93 gate rows, proxy: 40, policy: 16, handler: 21, shutdown: 5, transport: 5, audit: 4)
-- Integration, per implementation: 118 tests via deploy/test.sh and 15 socket tests via deploy/test-sock.sh (docker-compose)
+- Integration, per implementation: 116 tests via deploy/test.sh and 15 socket tests via deploy/test-sock.sh (docker-compose)
 - Quint: `make test-spec` runs the `spec/listener.qnt` `run` tests (instances `listener_locked`, `listener_unlocked`) and the `spec/router.qnt` `run` tests (instances `router`, `router_pre48`, `router_pre53`, `router_pre55`, `router_readonly`, whose `readonly*` tests run with `--match`, `router_pre76`, `router_pre78`, `router_pre70` and `router_pre86`; and, for the image pull, `pull`, `pull_pre83`, `pull_body_ignored` and `pull_pre84`), and the `spec/docker_socket_policy.qnt` `run` tests (instances `network_endpoints`, `network_endpoints_pre87`, `create` and `create_pre88`, and the policy-selection tests of the main module `docker_socket_policy`, #85)
 
 ## Test Conventions
 - Go: stdlib `testing` package, `go test ./...`
 - Rust: `#[cfg(test)]` inline modules, `cargo test`
 - TypeScript: `node:test` framework, `npm run build && node --test dist/*.test.js`
-- Integration: `make test-integration` (118 test cases) and `make test-integration-sock` (15 socket cases) via Docker Compose
+- Integration: `make test-integration` (116 test cases) and `make test-integration-sock` (15 socket cases) via Docker Compose
 
 ## Contribution Workflow
 
