@@ -24,6 +24,11 @@ container_config:
   security_options:
     - no-new-privileges:true
   user: '2001:2001'
+  # Optional (#93). Forced as HostConfig.GroupAdd: supplementary groups for
+  # reading host files, here the JWT secret (root:jwt 0640). Quote GIDs; 0
+  # and root are refused. A caller's own list is replaced.
+  group_add:
+    - '64190'
   log_driver: json-file
   log_options:
     max-file: '5'

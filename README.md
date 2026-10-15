@@ -100,9 +100,9 @@ All three implementations expose the same API surface, share the same [Quint spe
 
 | Language | Directory | Tests | Stack |
 |----------|-----------|-------|-------|
-| Go | [go/](go/) | 131 unit + 108 integration + 15 socket | stdlib net/http + yaml.v3 |
-| Rust | [rs/](rs/) | 158 unit + 108 integration + 15 socket | tokio, hyper, serde, clap |
-| TypeScript | [ts/](ts/) | 312 unit (1 skipped) + 108 integration + 15 socket | Node 22 ESM, built-in http |
+| Go | [go/](go/) | 133 unit + 118 integration + 15 socket | stdlib net/http + yaml.v3 |
+| Rust | [rs/](rs/) | 160 unit + 118 integration + 15 socket | tokio, hyper, serde, clap |
+| TypeScript | [ts/](ts/) | 330 unit (1 skipped) + 118 integration + 15 socket | Node 22 ESM, built-in http |
 
 ### Build All
 
@@ -157,6 +157,8 @@ container_config:
   security_options:
     - no-new-privileges:true
   user: '2001:2001'
+  group_add:              # optional; forced as HostConfig.GroupAdd
+    - '64190'             # host GID of the jwt group (quote GIDs)
 volumes:
   - host_path: /home/beacon
     container_path: /data
@@ -181,6 +183,22 @@ the key is left out in Go and TypeScript; Rust requires the key) is enforced:
 the bind must carry `:ro`, or the mount `ReadOnly: true`, and a bind without a
 mode is read-write in Docker, so it is denied. See
 [Container create: HostConfig rules](#container-create-hostconfig-rules).
+
+`container_config.group_add` is optional
+([#93](https://github.com/ChainSafe/docker-socket-policy/issues/93)). `user`
+sets only the primary UID and GID, and the daemon checks a host-mounted file
+against the GIDs the process has, so a service that reads a file such as a
+`root:jwt 0640` JWT secret needs the host group as a supplementary group. The
+mutator overwrites `HostConfig.GroupAdd` with the list, as `user` overwrites
+`User`: a caller's own list (`community.docker.docker_container`'s `groups:`,
+`docker run --group-add`) is replaced, not denied, and a caller that sends the
+same list sees no change. Each entry must be a quoted YAML string holding a
+decimal GID that fits in 32 bits or a group name
+(`[a-z_][a-z0-9_-]*$?`, at most 32 characters); `0` (in any decimal form) and
+`root`, duplicates and anything else fail startup with an error that names the
+file. An empty list is the same as leaving the key out. A group name is
+resolved by the daemon against the container's `/etc/group` when it starts;
+a GID needs no entry there.
 
 `container_names` is optional. It lists the container names the policy
 manages, each a valid Docker name (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`; anything else
@@ -246,7 +264,7 @@ docker run --mount type=bind,src=/,dst=/host chainsafe/lodestar:next  # denied: 
 
 | Middleware | Type | What it checks |
 |------------|------|----------------|
-| ContainerConfigMutator | Mutator | Forces `network_mode`, `user`, `security_options`, `restart_policy`, `log_driver` from policy, `HostConfig.Privileged: false` on every create, and makes `NetworkingConfig.EndpointsConfig` match a forced `network_mode` |
+| ContainerConfigMutator | Mutator | Forces `network_mode`, `user`, `group_add`, `security_options`, `restart_policy`, `log_driver` from policy, `HostConfig.Privileged: false` on every create, and makes `NetworkingConfig.EndpointsConfig` match a forced `network_mode` |
 | RegistryGate | Gate | Validates the normalised image ref against `allowed_image_prefixes`, then `image_tag_pattern` and `image_digest_allowed` |
 | MountSourceGate | Gate | Validates `HostConfig.Binds`, `HostConfig.Mounts` and top-level `Volumes` against `volumes`, including bind options and `read_write: false` |
 | EnvFileGate | Gate | Strips `Env` field from create body; env must come from locked `env_file` |
@@ -268,6 +286,7 @@ The chain runs only on container create. The mutator runs first, so the gates ch
 | `Mounts` | `Type: bind`: `Source` must be a policy `volumes` entry; `ReadOnly: true` for a `read_write: false` volume; `BindOptions.Propagation` empty, `private` or `rprivate`; `BindOptions.ReadOnlyNonRecursive` must be zero. `Type: tmpfs`: allowed, without a `Source`. Every other type (`volume`, `image`, `npipe`, `cluster`) is denied. Other entry keys besides `Target`, `Consistency` and `TmpfsOptions` must be zero. |
 | `NetworkMode`, `RestartPolicy`, `LogConfig` | Any value; overwritten when the policy sets `network_mode`, `restart_policy` or `log_driver`. |
 | `SecurityOpt` | Each entry must be in the policy's `security_options` or be `no-new-privileges` / `no-new-privileges:true`. Overwritten when the policy sets `security_options`. |
+| `GroupAdd` | Absent or zero, unless the policy sets `group_add`: the mutator then overwrites it with that list, and the gate allows exactly that list, in order ([#93](https://github.com/ChainSafe/docker-socket-policy/issues/93)). |
 | `Privileged` | Forced to `false` by the mutator on every create, so `true` is neutralised, not denied. |
 | `PidMode`, `UTSMode`, `UsernsMode`, `Cgroup` | `""` only. |
 | `IpcMode` | `""`, `private`, `shareable` or `none`. |
@@ -276,7 +295,7 @@ The chain runs only on container create. The mutator runs first, so the gates ch
 | `OomScoreAdj` | `0` or more. |
 | `MaskedPaths`, `ReadonlyPaths` | Absent or `null` only: an empty list unmasks `/proc` (`--security-opt systempaths=unconfined`). |
 | `CapDrop`, `ReadonlyRootfs`, `Init`, `AutoRemove`, `ConsoleSize`, `ShmSize`, `PortBindings`, `PublishAllPorts`, `Dns`, `DnsOptions`, `DnsSearch`, `ExtraHosts`, `Tmpfs`, `Ulimits`, `Memory`, `MemoryReservation`, `MemorySwap`, `MemorySwappiness`, `NanoCpus`, `CpuShares`, `CpuPeriod`, `CpuQuota`, `CpusetCpus`, `CpusetMems`, `PidsLimit`, `BlkioWeight`, `ContainerIDFile` | Any value. |
-| Everything else: `CapAdd`, `Devices`, `DeviceRequests`, `DeviceCgroupRules`, `GroupAdd`, `VolumesFrom`, `Links`, `Sysctls`, `CgroupParent`, `Runtime`, `VolumeDriver`, `OomKillDisable`, `Annotations`, `StorageOpt`, the other resource fields, and unknown keys | Absent or zero. |
+| Everything else: `CapAdd`, `Devices`, `DeviceRequests`, `DeviceCgroupRules`, `VolumesFrom`, `Links`, `Sysctls`, `CgroupParent`, `Runtime`, `VolumeDriver`, `OomKillDisable`, `Annotations`, `StorageOpt`, the other resource fields, and unknown keys | Absent or zero. |
 
 The daemon matches JSON field names without regard to case, and the last match wins, so `"privileged": true` would set `Privileged` after the mutator's `"Privileged": false`, and `"securityopt": null` would clear a forced `SecurityOpt`. A key that the daemon would read as a known field but that is not spelled exactly like it (`privileged`, `hostConfig`, `user`, `image`, …) is denied, at the top level of the body, in `HostConfig`, in `Mounts` entries and their `BindOptions`, and in `NetworkingConfig`, whether or not the policy forces `network_mode`: `NetworkEndpointsGate` reads `EndpointsConfig` only, and the daemon would attach the networks under `endpointsconfig` too. Inside `RestartPolicy` and `LogConfig` the spelling does not matter: the mutator replaces the whole object when the policy sets it, and otherwise any value is allowed; no gate reads `Healthcheck` or the settings inside an endpoint entry. The policy's `ports` field is parsed but not enforced; `PortBindings` is not restricted by it.
 
