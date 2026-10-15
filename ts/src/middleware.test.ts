@@ -1,6 +1,14 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { Chain, RegistryGate, MountSourceGate, EnvFileGate, CmdGate, ContainerConfigMutator } from "./middleware.js";
+import {
+  Chain,
+  RegistryGate,
+  MountSourceGate,
+  EnvFileGate,
+  CmdGate,
+  ContainerConfigMutator,
+  HostConfigGate,
+} from "./middleware.js";
 import type { Policy } from "./policy.js";
 
 function makePolicy(overrides: Partial<Policy> = {}): Policy {
@@ -377,7 +385,8 @@ describe("RegistryGate reference parsing (#84)", () => {
 //
 // Policies: "std" has volumes /data (read_write) and /ro (read-only) and
 // forces network_mode host; "secopt" is "std" plus security_options
-// [no-new-privileges:true]; "bare" has no volumes and no container_config.
+// [no-new-privileges:true]; "bare" has no volumes and no container_config;
+// "groups" is "std" plus group_add ["64190", "jwt"] (#93).
 // want is "" for an allowed create, or a substring of the deny reason. fwd,
 // when set, lists HostConfig fields the forwarded body must hold.
 interface HostConfigRow {
@@ -397,6 +406,7 @@ function hostConfigRowPolicy(name: string): Policy {
   ];
   p.container_config = { network_mode: "host" };
   if (name === "secopt") p.container_config.security_options = ["no-new-privileges:true"];
+  if (name === "groups") p.container_config.group_add = ["64190", "jwt"];
   return p;
 }
 
@@ -436,6 +446,63 @@ const hostConfigRows: HostConfigRow[] = [
     want: "HostConfig.GroupAdd is not allowed for service svc",
     fwd: String.raw``,
   },
+  {
+    name: "groupAddPolicyListWithoutGroupAddDenied",
+    policy: "std",
+    body: String.raw`{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["64190","jwt"]}}`,
+    want: "HostConfig.GroupAdd is not allowed for service svc",
+    fwd: String.raw``,
+  },
+  {
+    name: "groupAddForced",
+    policy: "groups",
+    body: String.raw`{"Image":"chainsafe/lodestar:v1"}`,
+    want: "",
+    fwd: String.raw`{"GroupAdd":["64190","jwt"]}`,
+  },
+  {
+    name: "groupAddForcedNullHostConfig",
+    policy: "groups",
+    body: String.raw`{"Image":"chainsafe/lodestar:v1","HostConfig":null}`,
+    want: "",
+    fwd: String.raw`{"GroupAdd":["64190","jwt"]}`,
+  },
+  {
+    name: "groupAddCallerReplaced",
+    policy: "groups",
+    body: String.raw`{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["docker","0"]}}`,
+    want: "",
+    fwd: String.raw`{"GroupAdd":["64190","jwt"]}`,
+  },
+  {
+    name: "groupAddCallerNullReplaced",
+    policy: "groups",
+    body: String.raw`{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":null}}`,
+    want: "",
+    fwd: String.raw`{"GroupAdd":["64190","jwt"]}`,
+  },
+  {
+    name: "groupAddSameListUnchanged",
+    policy: "groups",
+    body: String.raw`{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["64190","jwt"]}}`,
+    want: "",
+    fwd: String.raw`{"GroupAdd":["64190","jwt"]}`,
+  },
+  {
+    name: "groupAddCaseVariantDenied",
+    policy: "groups",
+    body: String.raw`{"Image":"chainsafe/lodestar:v1","HostConfig":{"groupadd":["0"]}}`,
+    want: "HostConfig.groupadd is not allowed for service svc",
+    fwd: String.raw``,
+  },
+  {
+    name: "groupAddNonObjectHostConfigDenied",
+    policy: "groups",
+    body: String.raw`{"Image":"chainsafe/lodestar:v1","HostConfig":["GroupAdd"]}`,
+    want: "HostConfig must be an object for service svc",
+    fwd: String.raw``,
+  },
+
   {
     name: "volumesFromDenied",
     policy: "std",
@@ -1319,6 +1386,64 @@ const hostConfigRows: HostConfigRow[] = [
     fwd: String.raw``,
   },
 ];
+
+// HostConfigGate alone, on the "groups" policy (#93): as if the mutator
+// stopped forcing the list. Only the policy's list, exactly, or a zero value
+// passes. The same rows, by name, are in
+// go/internal/middleware/hostconfig_test.go and rs/src/middleware.rs.
+const groupAddGateRows: [string, string, string][] = [
+  ["groupAddGateForcedListAllowed", String.raw`{"HostConfig":{"GroupAdd":["64190","jwt"]}}`, ""],
+  ["groupAddGateEmptyAllowed", String.raw`{"HostConfig":{"GroupAdd":[]}}`, ""],
+  ["groupAddGateNullAllowed", String.raw`{"HostConfig":{"GroupAdd":null}}`, ""],
+  [
+    "groupAddGateOtherListDenied",
+    String.raw`{"HostConfig":{"GroupAdd":["docker"]}}`,
+    "HostConfig.GroupAdd is not allowed for service svc",
+  ],
+  [
+    "groupAddGateReorderedDenied",
+    String.raw`{"HostConfig":{"GroupAdd":["jwt","64190"]}}`,
+    "HostConfig.GroupAdd is not allowed for service svc",
+  ],
+  [
+    "groupAddGateSubsetDenied",
+    String.raw`{"HostConfig":{"GroupAdd":["64190"]}}`,
+    "HostConfig.GroupAdd is not allowed for service svc",
+  ],
+  [
+    "groupAddGateSupersetDenied",
+    String.raw`{"HostConfig":{"GroupAdd":["64190","jwt","0"]}}`,
+    "HostConfig.GroupAdd is not allowed for service svc",
+  ],
+  [
+    "groupAddGateNumberDenied",
+    String.raw`{"HostConfig":{"GroupAdd":[64190,"jwt"]}}`,
+    "HostConfig.GroupAdd is not allowed for service svc",
+  ],
+  [
+    "groupAddGateStringDenied",
+    String.raw`{"HostConfig":{"GroupAdd":"64190"}}`,
+    "HostConfig.GroupAdd is not allowed for service svc",
+  ],
+];
+
+describe("GroupAdd gate rows (#93)", () => {
+  for (const [name, body, want] of groupAddGateRows) {
+    it(name, () => {
+      const reason = new HostConfigGate().check(
+        "POST",
+        "/containers/create",
+        hostConfigRowPolicy("groups"),
+        JSON.parse(body) as Record<string, unknown>,
+      );
+      if (want === "") {
+        assert.equal(reason, null);
+      } else {
+        assert.ok(reason !== null && reason.includes(want), "expected deny with " + want + ", got: " + reason);
+      }
+    });
+  }
+});
 
 describe("HostConfig rows (#88)", () => {
   for (const row of hostConfigRows) {

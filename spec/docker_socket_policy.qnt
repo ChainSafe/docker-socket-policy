@@ -7,7 +7,10 @@ module policy {
     networkMode: str,
     restartPolicy: str,
     securityOptions: Set[str],
-    user: str
+    user: str,
+    // container_config.group_add (#93): "" when unset, otherwise an atom
+    // standing for the whole forced list.
+    groupAdd: str
   }
 
   // containerNames is the policy's container_names (#85). The empty set
@@ -224,6 +227,13 @@ module network_endpoints_pre87 {
 // `networking` entries are its NetworkingConfig keys, each with one network
 // name as value, and NetworkEndpointsGate (#87) reads the exact key only.
 //
+// container_config.group_add (#93) forces HostConfig.GroupAdd. The policy's
+// list is one atom (GROUP_LIST): the mutator writes it whole and
+// HostConfigGate compares it whole, so the model does not need its entries.
+// There is no flag for the behaviour before #93: without group_add the rule
+// is the #88 one (GroupAdd must be zero), and every policy then was one
+// without group_add, so `create` with BEACON already models it.
+//
 // LEGACY_CREATE = true models all three before #88: the only check was that
 // each Binds host path is a policy volume, skipped when the policy has no
 // volumes; Mounts, bind options and every other field went through; and the
@@ -254,6 +264,7 @@ module create_model {
     "securityopt" -> "SecurityOpt",
     "networkmode" -> "NetworkMode",
     "endpointsconfig" -> "EndpointsConfig",
+    "groupadd" -> "GroupAdd",
   )
   pure def canon(k: str): str = if (CASE_FOLD.keys().contains(k)) CASE_FOLD.get(k) else k
   pure def isVariant(k: str): bool = canon(k) != k
@@ -267,6 +278,9 @@ module create_model {
   pure val NO_NEW_PRIVILEGES = Set("no-new-privileges", "no-new-privileges:true")
   // The value the mutator writes for SecurityOpt: the policy's list.
   pure val POLICY_SECURITY_OPT = "policySecurityOptions"
+  // A forced group_add list (#93), as GROUPS sets it.
+  pure val GROUP_LIST = "jwtGroups"
+  pure def forcesGroups(p: Policy): bool = p.containerConfig.groupAdd != ""
 
   pure val BIND_OPTS = Set("ro", "rw", "Z", "rprivate")
   pure val PRIVATE_PROPAGATION = Set("", "private", "rprivate")
@@ -282,6 +296,8 @@ module create_model {
     else if (k == "OomScoreAdj") v != "-1000"
     else if (k == "SecurityOpt")
       NO_NEW_PRIVILEGES.contains(v) or p.containerConfig.securityOptions.contains(v) or v == POLICY_SECURITY_OPT
+    // #93: the policy's own list, exactly; any other non-zero list is denied.
+    else if (k == "GroupAdd") forcesGroups(p) and v == p.containerConfig.groupAdd
     else false
 
   pure def hasContainerConfig(p: Policy): bool = or {
@@ -289,6 +305,7 @@ module create_model {
     p.containerConfig.restartPolicy != "",
     p.containerConfig.securityOptions.size() > 0,
     p.containerConfig.user != "",
+    forcesGroups(p),
   }
 
   pure def forcesPrivileged(p: Policy): bool = not(LEGACY_CREATE) or hasContainerConfig(p)
@@ -301,11 +318,13 @@ module create_model {
       f.key == "Privileged" and forcesPrivileged(p),
       f.key == "NetworkMode" and nm != "",
       f.key == "SecurityOpt" and forcesSecOpt,
+      f.key == "GroupAdd" and forcesGroups(p),
     }))
     kept
       .union(if (forcesPrivileged(p)) Set({ key: "Privileged", value: "zero" }) else Set())
       .union(if (nm != "") Set({ key: "NetworkMode", value: nm }) else Set())
       .union(if (forcesSecOpt) Set({ key: "SecurityOpt", value: POLICY_SECURITY_OPT }) else Set())
+      .union(if (forcesGroups(p)) Set({ key: "GroupAdd", value: p.containerConfig.groupAdd }) else Set())
   }
 
   // HostConfigGate, on the mutated fields.
@@ -388,6 +407,7 @@ module create_model {
       restartPolicy: "unless-stopped",
       securityOptions: Set("no-new-privileges:true"),
       user: "2001:2001",
+      groupAdd: "",
     },
     volumes: Set("/home/beacon", "/etc/jwt_dir"),
     readOnlyVolumes: Set("/etc/jwt_dir"),
@@ -405,7 +425,7 @@ module create_model {
     allowedImagePrefixes: Set("example/tools"),
     imageTagPattern: "",
     imageDigestAllowed: false,
-    containerConfig: { networkMode: "", restartPolicy: "", securityOptions: Set(), user: "" },
+    containerConfig: { networkMode: "", restartPolicy: "", securityOptions: Set(), user: "", groupAdd: "" },
     volumes: Set(),
     readOnlyVolumes: Set(),
     envFile: "",
@@ -415,16 +435,19 @@ module create_model {
     deniedFlags: Set(),
   }
 
-  pure val MODEL_POLICIES = Set(BEACON, TOOLS)
+  // BEACON with a forced group_add (#93).
+  pure val GROUPS: Policy = { ...BEACON, containerConfig: { ...BEACON.containerConfig, groupAdd: GROUP_LIST } }
+
+  pure val MODEL_POLICIES = Set(BEACON, TOOLS, GROUPS)
 
   pure val KEYS = Set(
     "Privileged", "privileged", "SecurityOpt", "securityopt", "NetworkMode", "networkmode",
-    "CapAdd", "Devices", "GroupAdd", "FutureField", "MaskedPaths", "CapDrop",
+    "CapAdd", "Devices", "GroupAdd", "groupadd", "FutureField", "MaskedPaths", "CapDrop",
     "MemorySwappiness", "PidMode", "IpcMode", "OomScoreAdj",
   )
   pure val VALUES = Set(
     "null", "zero", "[]", "true", "host", "private", "container:x", "SYS_ADMIN",
-    "-1000", "500", "no-new-privileges", "seccomp=unconfined", "bridge",
+    "-1000", "500", "no-new-privileges", "seccomp=unconfined", "bridge", GROUP_LIST,
   )
   pure val SOURCES = Set("/home/beacon", "/etc/jwt_dir", "/")
 
@@ -477,7 +500,18 @@ module create_model {
           implies f.value == p.containerConfig.networkMode,
         (f.key == "SecurityOpt" and p.containerConfig.securityOptions.size() > 0)
           implies f.value == POLICY_SECURITY_OPT,
+        (f.key == "GroupAdd" and forcesGroups(p)) implies f.value == p.containerConfig.groupAdd,
       })
+    ))
+
+  // The security claim on supplementary groups (#93): the daemon reads
+  // GroupAdd, under any spelling, only as the selected policy's forced list
+  // or as an empty one. It mentions neither the mutator nor the gate.
+  pure val daemonGroupsOnlyForced: bool =
+    MODEL_POLICIES.forall(p => REQS.forall(r =>
+      createAllowed(p, r) implies daemonFields(p, r).forall(f =>
+        f.key == "GroupAdd" implies (isZero(f.value) or (forcesGroups(p) and f.value == p.containerConfig.groupAdd))
+      )
     ))
 
   // The security claim on mounts: every host path the daemon mounts is a
@@ -519,6 +553,36 @@ module create {
   run capAddDeniedTest = assert(not(createAllowed(BEACON, one("CapAdd", "SYS_ADMIN"))))
   run devicesDeniedTest = assert(not(createAllowed(BEACON, one("Devices", "/dev/sda"))))
   run groupAddDeniedTest = assert(not(createAllowed(BEACON, one("GroupAdd", "true"))))
+  // #93: a policy with group_add forces its list; the caller's is replaced.
+  run groupAddForcedTest =
+    assert(and {
+      createAllowed(GROUPS, NO_HOST_CONFIG),
+      daemonFields(GROUPS, NO_HOST_CONFIG).contains({ key: "GroupAdd", value: GROUP_LIST }),
+    })
+  run groupAddCallerReplacedTest =
+    assert(and {
+      createAllowed(GROUPS, one("GroupAdd", "true")),
+      daemonFields(GROUPS, one("GroupAdd", "true")).filter(f => f.key == "GroupAdd")
+        == Set({ key: "GroupAdd", value: GROUP_LIST }),
+    })
+  run groupAddSameListUnchangedTest =
+    assert(and {
+      createAllowed(GROUPS, one("GroupAdd", GROUP_LIST)),
+      daemonFields(GROUPS, one("GroupAdd", GROUP_LIST)).filter(f => f.key == "GroupAdd")
+        == Set({ key: "GroupAdd", value: GROUP_LIST }),
+    })
+  // A policy without group_add cannot take a caller's list as if forced.
+  run groupAddPolicyListWithoutGroupAddDeniedTest = assert(not(createAllowed(BEACON, one("GroupAdd", GROUP_LIST))))
+  run groupAddCaseVariantDeniedTest = assert(not(createAllowed(GROUPS, one("groupadd", "true"))))
+  // HostConfigGate alone (as if the mutator stopped forcing the list):
+  // the forced list and zero pass, any other list does not.
+  run groupAddGateExactOnlyTest =
+    assert(and {
+      fieldOk(GROUPS, { key: "GroupAdd", value: GROUP_LIST }),
+      fieldOk(GROUPS, { key: "GroupAdd", value: "[]" }),
+      not(fieldOk(GROUPS, { key: "GroupAdd", value: "true" })),
+      not(fieldOk(BEACON, { key: "GroupAdd", value: GROUP_LIST })),
+    })
   run unknownFieldDeniedTest = assert(not(createAllowed(BEACON, one("FutureField", "true"))))
   run maskedPathsEmptyDeniedTest = assert(not(createAllowed(BEACON, one("MaskedPaths", "[]"))))
   run pidModeHostDeniedTest = assert(not(createAllowed(BEACON, one("PidMode", "host"))))
@@ -585,6 +649,7 @@ module create {
       daemonSeesOnlyAllowlistedHostConfig,
       daemonMountsOnlyWhitelisted,
       daemonAttachesOnlyForcedNetwork,
+      daemonGroupsOnlyForced,
     })
 }
 
@@ -682,7 +747,9 @@ module docker_socket_policy {
         networkMode: "host",
         restartPolicy: "unless-stopped",
         securityOptions: Set("no-new-privileges:true"),
-        user: "2001:2001"
+        user: "2001:2001",
+        // The beacon reads the JWT secret through a forced group (#93).
+        groupAdd: GROUP_LIST
       },
       volumes: Set("/home/beacon", "/etc/jwt_dir"),
       readOnlyVolumes: Set("/etc/jwt_dir"),
@@ -709,7 +776,8 @@ module docker_socket_policy {
         networkMode: "host",
         restartPolicy: "unless-stopped",
         securityOptions: Set("no-new-privileges:true"),
-        user: "2002:2002"
+        user: "2002:2002",
+        groupAdd: ""
       },
       volumes: Set("/home/validator"),
       readOnlyVolumes: Set(),

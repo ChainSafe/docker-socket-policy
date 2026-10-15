@@ -442,6 +442,14 @@ const HOST_CONFIG_MODES = new Map<string, readonly string[]>([
 
 const NO_NEW_PRIVILEGES = new Set(["no-new-privileges", "no-new-privileges:true"]);
 
+// Whether value is a JSON list of strings equal, in order, to the policy's
+// non-empty group_add (#93).
+function equalsForcedGroups(value: unknown, policy: Policy): boolean {
+  const forced = policy.container_config?.group_add;
+  if (!forced?.length || !Array.isArray(value) || value.length !== forced.length) return false;
+  return value.every((v, i) => v === forced[i]);
+}
+
 function checkSecurityOpt(value: unknown, policy: Policy): string | null {
   if (value === null) return null;
   if (!Array.isArray(value)) return `HostConfig.SecurityOpt must be a list for service ${policy.service_name}`;
@@ -498,6 +506,15 @@ export class HostConfigGate implements Gate {
       if (key === "SecurityOpt") {
         const err = checkSecurityOpt(value, policy);
         if (err !== null) return err;
+        continue;
+      }
+      // Zero, or exactly the policy's group_add, which the mutator forces
+      // (#93). Checked here too so that the gate does not open up if the
+      // mutator ever stops forcing it.
+      if (key === "GroupAdd") {
+        if (!isZeroValue(value) && !equalsForcedGroups(value, policy)) {
+          return `HostConfig.GroupAdd is not allowed for service ${policy.service_name}`;
+        }
         continue;
       }
       if (key === "OomScoreAdj") {
@@ -665,6 +682,8 @@ export class ContainerConfigMutator implements Mutator {
     if (cc.network_mode) hostConfig["NetworkMode"] = cc.network_mode;
     if (cc.restart_policy) hostConfig["RestartPolicy"] = { Name: cc.restart_policy };
     if (cc.security_options?.length) hostConfig["SecurityOpt"] = cc.security_options;
+    // Overwritten like User (#93); HostConfigGate allows exactly this list.
+    if (cc.group_add?.length) hostConfig["GroupAdd"] = [...cc.group_add];
     if (cc.user) body["User"] = cc.user;
     if (cc.log_driver) {
       hostConfig["LogConfig"] = { Type: cc.log_driver, Config: cc.log_options ?? {} };

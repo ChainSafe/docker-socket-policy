@@ -1,6 +1,11 @@
 package policy
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+
+	"gopkg.in/yaml.v3"
+)
 
 type Policy struct {
 	ServiceName          string          `yaml:"service_name"`
@@ -50,6 +55,28 @@ type ContainerConfig struct {
 	User            string            `yaml:"user"`
 	LogDriver       string            `yaml:"log_driver"`
 	LogOptions      map[string]string `yaml:"log_options"`
+	// GroupAdd is forced as HostConfig.GroupAdd (#93). Empty means unset.
+	GroupAdd GroupList `yaml:"group_add"`
+}
+
+// GroupList is a YAML list of strings. Unlike a plain []string, it refuses
+// entries that are not YAML strings, such as an unquoted 64190 or 0x10, so
+// Go, Rust and TypeScript read the same text for every entry (#93).
+type GroupList []string
+
+func (g *GroupList) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.SequenceNode {
+		return fmt.Errorf("line %d: group_add must be a list", node.Line)
+	}
+	out := make(GroupList, 0, len(node.Content))
+	for _, item := range node.Content {
+		if item.Kind != yaml.ScalarNode || item.Tag != "!!str" {
+			return fmt.Errorf("line %d: group_add entries must be strings (quote GIDs: '64190')", item.Line)
+		}
+		out = append(out, item.Value)
+	}
+	*g = out
+	return nil
 }
 
 type Volume struct {

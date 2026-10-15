@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -15,6 +16,45 @@ import (
 // validContainerName is a Docker container name without the optional leading
 // slash (#85).
 var validContainerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
+var (
+	groupGIDRe  = regexp.MustCompile(`^[0-9]+$`)
+	groupNameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]*\$?$`)
+)
+
+// checkGroupAdd validates container_config.group_add (#93): each entry is a
+// decimal GID that fits in 32 bits or a group name of at most 32 characters;
+// the root group (0 in any decimal form, or root) and duplicates (by GID
+// value for numbers) are refused.
+func checkGroupAdd(file string, groups []string) error {
+	seen := make(map[string]bool)
+	for _, g := range groups {
+		var key string
+		switch {
+		case groupGIDRe.MatchString(g):
+			gid, err := strconv.ParseUint(g, 10, 32)
+			if err != nil {
+				return fmt.Errorf("policy file %s: invalid group_add entry %q (want a decimal GID or a group name)", file, g)
+			}
+			if gid == 0 {
+				return fmt.Errorf("policy file %s: group_add entry %q is the root group, which is not allowed", file, g)
+			}
+			key = "gid:" + strconv.FormatUint(gid, 10)
+		case len(g) <= 32 && groupNameRe.MatchString(g):
+			if g == "root" {
+				return fmt.Errorf("policy file %s: group_add entry %q is the root group, which is not allowed", file, g)
+			}
+			key = "name:" + g
+		default:
+			return fmt.Errorf("policy file %s: invalid group_add entry %q (want a decimal GID or a group name)", file, g)
+		}
+		if seen[key] {
+			return fmt.Errorf("policy file %s: duplicate group_add entry %q", file, g)
+		}
+		seen[key] = true
+	}
+	return nil
+}
 
 // ValidContainerName reports whether name is a valid Docker container name.
 func ValidContainerName(name string) bool {
@@ -119,6 +159,14 @@ func loadPolicy(filePath string) (*Policy, error) {
 		if !ValidContainerName(n) {
 			return nil, fmt.Errorf("policy file %s: invalid container name %q in container_names", filePath, n)
 		}
+	}
+
+	if err := checkGroupAdd(filepath.Base(filePath), p.ContainerConfig.GroupAdd); err != nil {
+		return nil, err
+	}
+	// An empty group_add is the same as an unset one.
+	if len(p.ContainerConfig.GroupAdd) == 0 {
+		p.ContainerConfig.GroupAdd = nil
 	}
 
 	// Prefixes are compared in normalised form (#84).

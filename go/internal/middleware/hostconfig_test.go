@@ -14,7 +14,8 @@ import (
 //
 // Policies: "std" has volumes /data (read_write) and /ro (read-only) and
 // forces network_mode host; "secopt" is "std" plus security_options
-// [no-new-privileges:true]; "bare" has no volumes and no container_config.
+// [no-new-privileges:true]; "bare" has no volumes and no container_config;
+// "groups" is "std" plus group_add ["64190", "jwt"] (#93).
 // want is "" for an allowed create, or a substring of the deny reason. fwd,
 // when set, lists HostConfig fields the forwarded body must hold.
 type hostConfigRow struct {
@@ -40,6 +41,9 @@ func hostConfigRowPolicy(name string) *policy.Policy {
 	p.ContainerConfig.NetworkMode = "host"
 	if name == "secopt" {
 		p.ContainerConfig.SecurityOptions = []string{"no-new-privileges:true"}
+	}
+	if name == "groups" {
+		p.ContainerConfig.GroupAdd = []string{"64190", "jwt"}
 	}
 	return p
 }
@@ -91,6 +95,14 @@ var hostConfigRows = []hostConfigRow{
 	{name: "deviceRequestsDenied", policy: "std", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"DeviceRequests":[{"Driver":"","Count":-1,"Capabilities":[["gpu"]]}]}}`, want: "HostConfig.DeviceRequests is not allowed for service svc", fwd: ``},
 	{name: "deviceCgroupRulesDenied", policy: "std", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"DeviceCgroupRules":["b 8:* rmw"]}}`, want: "HostConfig.DeviceCgroupRules is not allowed for service svc", fwd: ``},
 	{name: "groupAddDenied", policy: "std", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["docker"]}}`, want: "HostConfig.GroupAdd is not allowed for service svc", fwd: ``},
+	{name: "groupAddPolicyListWithoutGroupAddDenied", policy: "std", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["64190","jwt"]}}`, want: "HostConfig.GroupAdd is not allowed for service svc", fwd: ``},
+	{name: "groupAddForced", policy: "groups", body: `{"Image":"chainsafe/lodestar:v1"}`, want: "", fwd: `{"GroupAdd":["64190","jwt"]}`},
+	{name: "groupAddForcedNullHostConfig", policy: "groups", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":null}`, want: "", fwd: `{"GroupAdd":["64190","jwt"]}`},
+	{name: "groupAddCallerReplaced", policy: "groups", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["docker","0"]}}`, want: "", fwd: `{"GroupAdd":["64190","jwt"]}`},
+	{name: "groupAddCallerNullReplaced", policy: "groups", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":null}}`, want: "", fwd: `{"GroupAdd":["64190","jwt"]}`},
+	{name: "groupAddSameListUnchanged", policy: "groups", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["64190","jwt"]}}`, want: "", fwd: `{"GroupAdd":["64190","jwt"]}`},
+	{name: "groupAddCaseVariantDenied", policy: "groups", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"groupadd":["0"]}}`, want: "HostConfig.groupadd is not allowed for service svc", fwd: ``},
+	{name: "groupAddNonObjectHostConfigDenied", policy: "groups", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":["GroupAdd"]}`, want: "HostConfig must be an object for service svc", fwd: ``},
 	{name: "volumesFromDenied", policy: "std", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"VolumesFrom":["other"]}}`, want: "HostConfig.VolumesFrom is not allowed for service svc", fwd: ``},
 	{name: "linksDenied", policy: "std", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"Links":["other:alias"]}}`, want: "HostConfig.Links is not allowed for service svc", fwd: ``},
 	{name: "sysctlsDenied", policy: "std", body: `{"Image":"chainsafe/lodestar:v1","HostConfig":{"Sysctls":{"kernel.shm_rmid_forced":"1"}}}`, want: "HostConfig.Sysctls is not allowed for service svc", fwd: ``},
@@ -217,4 +229,44 @@ var hostConfigRows = []hostConfigRow{
 	{name: "dockerCliCreateBodyAllowed", policy: "std", body: `{"Hostname":"","Domainname":"","User":"","AttachStdin":false,"AttachStdout":true,"AttachStderr":true,"Tty":false,"OpenStdin":false,"StdinOnce":false,"Env":null,"Cmd":["true"],"Image":"chainsafe/lodestar:v1","Volumes":{},"WorkingDir":"","Entrypoint":null,"Labels":{},"HostConfig":{"Binds":null,"ContainerIDFile":"","LogConfig":{"Type":"","Config":{}},"NetworkMode":"default","PortBindings":{},"RestartPolicy":{"Name":"no","MaximumRetryCount":0},"AutoRemove":false,"VolumeDriver":"","VolumesFrom":null,"ConsoleSize":[0,0],"CapAdd":null,"CapDrop":null,"CgroupnsMode":"","Dns":null,"DnsOptions":[],"DnsSearch":[],"ExtraHosts":null,"GroupAdd":null,"IpcMode":"","Cgroup":"","Links":null,"OomScoreAdj":0,"PidMode":"","Privileged":false,"PublishAllPorts":false,"ReadonlyRootfs":false,"SecurityOpt":null,"UTSMode":"","UsernsMode":"","ShmSize":0,"Isolation":"","CpuShares":0,"Memory":0,"NanoCpus":0,"CgroupParent":"","BlkioWeight":0,"BlkioWeightDevice":[],"BlkioDeviceReadBps":[],"BlkioDeviceWriteBps":[],"BlkioDeviceReadIOps":[],"BlkioDeviceWriteIOps":[],"CpuPeriod":0,"CpuQuota":0,"CpuRealtimePeriod":0,"CpuRealtimeRuntime":0,"CpusetCpus":"","CpusetMems":"","Devices":[],"DeviceCgroupRules":null,"DeviceRequests":null,"MemoryReservation":0,"MemorySwap":0,"MemorySwappiness":-1,"OomKillDisable":false,"PidsLimit":0,"Ulimits":null,"CpuCount":0,"CpuPercent":0,"IOMaximumIOps":0,"IOMaximumBandwidth":0,"MaskedPaths":null,"ReadonlyPaths":null},"NetworkingConfig":{"EndpointsConfig":{"default":{"IPAMConfig":null,"Links":null,"Aliases":null,"DriverOpts":null,"GwPriority":0,"NetworkID":"","EndpointID":"","Gateway":"","IPAddress":"","MacAddress":"","IPPrefixLen":0,"IPv6Gateway":"","GlobalIPv6Address":"","GlobalIPv6PrefixLen":0,"DNSNames":null}}}}`, want: "", fwd: ``},
 	{name: "dockerCliCreateBodyBareAllowed", policy: "bare", body: `{"Hostname":"","Domainname":"","User":"","AttachStdin":false,"AttachStdout":true,"AttachStderr":true,"Tty":false,"OpenStdin":false,"StdinOnce":false,"Env":null,"Cmd":["true"],"Image":"chainsafe/lodestar:v1","Volumes":{},"WorkingDir":"","Entrypoint":null,"Labels":{},"HostConfig":{"Binds":null,"ContainerIDFile":"","LogConfig":{"Type":"","Config":{}},"NetworkMode":"default","PortBindings":{},"RestartPolicy":{"Name":"no","MaximumRetryCount":0},"AutoRemove":false,"VolumeDriver":"","VolumesFrom":null,"ConsoleSize":[0,0],"CapAdd":null,"CapDrop":null,"CgroupnsMode":"","Dns":null,"DnsOptions":[],"DnsSearch":[],"ExtraHosts":null,"GroupAdd":null,"IpcMode":"","Cgroup":"","Links":null,"OomScoreAdj":0,"PidMode":"","Privileged":false,"PublishAllPorts":false,"ReadonlyRootfs":false,"SecurityOpt":null,"UTSMode":"","UsernsMode":"","ShmSize":0,"Isolation":"","CpuShares":0,"Memory":0,"NanoCpus":0,"CgroupParent":"","BlkioWeight":0,"BlkioWeightDevice":[],"BlkioDeviceReadBps":[],"BlkioDeviceWriteBps":[],"BlkioDeviceReadIOps":[],"BlkioDeviceWriteIOps":[],"CpuPeriod":0,"CpuQuota":0,"CpuRealtimePeriod":0,"CpuRealtimeRuntime":0,"CpusetCpus":"","CpusetMems":"","Devices":[],"DeviceCgroupRules":null,"DeviceRequests":null,"MemoryReservation":0,"MemorySwap":0,"MemorySwappiness":-1,"OomKillDisable":false,"PidsLimit":0,"Ulimits":null,"CpuCount":0,"CpuPercent":0,"IOMaximumIOps":0,"IOMaximumBandwidth":0,"MaskedPaths":null,"ReadonlyPaths":null},"NetworkingConfig":{"EndpointsConfig":{"default":{"IPAMConfig":null,"Links":null,"Aliases":null,"DriverOpts":null,"GwPriority":0,"NetworkID":"","EndpointID":"","Gateway":"","IPAddress":"","MacAddress":"","IPPrefixLen":0,"IPv6Gateway":"","GlobalIPv6Address":"","GlobalIPv6PrefixLen":0,"DNSNames":null}}}}`, want: "", fwd: ``},
 	{name: "ansibleCreateBodyAllowed", policy: "secopt", body: `{"Image":"chainsafe/lodestar:v1","Cmd":["beacon"],"Env":[],"Labels":{"app":"beacon"},"HostConfig":{"Binds":["/data:/data:rw","/ro:/ro:ro"],"NetworkMode":"host","RestartPolicy":{"Name":"unless-stopped","MaximumRetryCount":0},"LogConfig":{"Type":"json-file","Config":{"max-size":"100m"}},"SecurityOpt":["no-new-privileges:true"],"Init":false,"AutoRemove":false,"Privileged":false,"ReadonlyRootfs":false,"CapDrop":["ALL"],"Memory":0}}`, want: "", fwd: ``},
+}
+
+// HostConfigGate alone, on the "groups" policy (#93): as if the mutator
+// stopped forcing the list. Only the policy's list, exactly, or a zero value
+// passes. The same rows, by name, are in rs/src/middleware.rs and
+// ts/src/middleware.test.ts.
+var groupAddGateRows = []struct {
+	name string
+	body string
+	want string
+}{
+	{"groupAddGateForcedListAllowed", `{"HostConfig":{"GroupAdd":["64190","jwt"]}}`, ""},
+	{"groupAddGateEmptyAllowed", `{"HostConfig":{"GroupAdd":[]}}`, ""},
+	{"groupAddGateNullAllowed", `{"HostConfig":{"GroupAdd":null}}`, ""},
+	{"groupAddGateOtherListDenied", `{"HostConfig":{"GroupAdd":["docker"]}}`, "HostConfig.GroupAdd is not allowed for service svc"},
+	{"groupAddGateReorderedDenied", `{"HostConfig":{"GroupAdd":["jwt","64190"]}}`, "HostConfig.GroupAdd is not allowed for service svc"},
+	{"groupAddGateSubsetDenied", `{"HostConfig":{"GroupAdd":["64190"]}}`, "HostConfig.GroupAdd is not allowed for service svc"},
+	{"groupAddGateSupersetDenied", `{"HostConfig":{"GroupAdd":["64190","jwt","0"]}}`, "HostConfig.GroupAdd is not allowed for service svc"},
+	{"groupAddGateNumberDenied", `{"HostConfig":{"GroupAdd":[64190,"jwt"]}}`, "HostConfig.GroupAdd is not allowed for service svc"},
+	{"groupAddGateStringDenied", `{"HostConfig":{"GroupAdd":"64190"}}`, "HostConfig.GroupAdd is not allowed for service svc"},
+}
+
+func TestGroupAddGateRows(t *testing.T) {
+	for _, row := range groupAddGateRows {
+		t.Run(row.name, func(t *testing.T) {
+			var body map[string]interface{}
+			if err := json.Unmarshal([]byte(row.body), &body); err != nil {
+				t.Fatalf("bad row body: %v", err)
+			}
+			err := (&HostConfigGate{}).Check(testRequest("POST", "/containers/create"), hostConfigRowPolicy("groups"), body)
+			switch {
+			case row.want == "" && err != nil:
+				t.Fatalf("expected allow, got: %v", err)
+			case row.want != "" && err == nil:
+				t.Fatalf("expected deny with %q, got allow", row.want)
+			case row.want != "" && !strings.Contains(err.Error(), row.want):
+				t.Fatalf("expected deny with %q, got: %v", row.want, err)
+			}
+		})
+	}
 }

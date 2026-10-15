@@ -587,6 +587,18 @@ fn is_zero_value(v: &serde_json::Value) -> bool {
     }
 }
 
+/// Whether `value` is a JSON list of strings equal, in order, to the
+/// policy's non-empty `group_add` (#93).
+fn equals_forced_groups(value: &serde_json::Value, policy: &Policy) -> bool {
+    let forced = match policy.container_config.as_ref().and_then(|c| c.group_add.as_ref()) {
+        Some(g) if !g.is_empty() => g,
+        _ => return false,
+    };
+    value.as_array().is_some_and(|list| {
+        list.len() == forced.len() && list.iter().zip(forced).all(|(v, f)| v.as_str() == Some(f.as_str()))
+    })
+}
+
 fn check_security_opt(value: &serde_json::Value, policy: &Policy) -> std::result::Result<(), String> {
     if value.is_null() {
         return Ok(());
@@ -685,6 +697,17 @@ impl Gate for HostConfigGate {
                     }
                 }
                 "SecurityOpt" => check_security_opt(value, policy)?,
+                // Zero, or exactly the policy's group_add, which the mutator
+                // forces (#93). Checked here too so that the gate does not
+                // open up if the mutator ever stops forcing it.
+                "GroupAdd" => {
+                    if !is_zero_value(value) && !equals_forced_groups(value, policy) {
+                        return Err(format!(
+                            "HostConfig.GroupAdd is not allowed for service {}",
+                            policy.service_name
+                        ));
+                    }
+                }
                 "OomScoreAdj" => {
                     if !value.is_null() && !value.as_f64().is_some_and(|n| n >= 0.0) {
                         return Err(format!(
@@ -929,7 +952,9 @@ fn force_endpoints(mode: &str, body: &mut HashMap<String, serde_json::Value>) {
 
 /// ContainerConfigMutator overwrites the fields the policy's
 /// `container_config` sets. It forces `HostConfig.Privileged` to false on
-/// every create, even without a `container_config` (#88). A `HostConfig` that
+/// every create, even without a `container_config` (#88), and
+/// `HostConfig.GroupAdd` to the policy's `group_add` when set (#93). A
+/// `HostConfig` that
 /// is not an object is left alone for HostConfigGate to deny.
 pub struct ContainerConfigMutator;
 impl Mutator for ContainerConfigMutator {
@@ -968,6 +993,13 @@ impl Mutator for ContainerConfigMutator {
             hc.insert(
                 "LogConfig".to_string(),
                 serde_json::json!({"Type": driver, "Config": cc.log_options.clone().unwrap_or_default()}),
+            );
+        }
+        // Overwritten like User (#93); HostConfigGate allows exactly this list.
+        if let Some(groups) = cc.group_add.as_ref().filter(|g| !g.is_empty()) {
+            hc.insert(
+                "GroupAdd".to_string(),
+                serde_json::Value::Array(groups.iter().map(|g| serde_json::Value::String(g.clone())).collect()),
             );
         }
         if let Some(u) = &cc.user {
@@ -1208,6 +1240,7 @@ mod tests {
             user: None,
             log_driver: None,
             log_options: None,
+            group_add: None,
         });
         let mut body: HashMap<String, serde_json::Value> = HashMap::new();
         mutator.mutate(&policy, &mut body);
@@ -1227,6 +1260,7 @@ mod tests {
             user: None,
             log_driver: None,
             log_options: None,
+            group_add: None,
         });
         let mut body = body_from_json(serde_json::json!({"HostConfig": {}}));
         mutator.mutate(&policy, &mut body);
@@ -1246,6 +1280,7 @@ mod tests {
             user: Some("appuser".into()),
             log_driver: None,
             log_options: None,
+            group_add: None,
         });
         let mut body = HashMap::new();
         mutator.mutate(&policy, &mut body);
@@ -1298,6 +1333,7 @@ mod tests {
             user: None,
             log_driver: None,
             log_options: None,
+            group_add: None,
         });
         let body = body_from_json(serde_json::json!({"Image": "alpine"}));
         let result = chain.execute("POST", "/containers/create", &policy, &body);
@@ -1689,6 +1725,7 @@ mod tests {
                 user: None,
                 log_driver: None,
                 log_options: None,
+                group_add: None,
             });
             let mut body = body_from_json(serde_json::json!({"Image": "alpine:3.20"}));
             if !req.is_empty() {
@@ -1785,7 +1822,8 @@ mod tests {
     // Policies: "std" has volumes /data (read_write) and /ro (read-only) and
     // forces network_mode host; "secopt" is "std" plus security_options
     // [no-new-privileges:true]; "bare" has no volumes and no
-    // container_config. `want` is "" for an allowed create, or a substring of
+    // container_config; "groups" is "std" plus group_add ["64190", "jwt"]
+    // (#93). `want` is "" for an allowed create, or a substring of
     // the deny reason. `fwd`, when set, lists HostConfig fields the forwarded
     // body must hold.
     struct HostConfigRow {
@@ -1824,6 +1862,11 @@ mod tests {
             user: None,
             log_driver: None,
             log_options: None,
+            group_add: if name == "groups" {
+                Some(vec!["64190".into(), "jwt".into()])
+            } else {
+                None
+            },
         });
         p
     }
@@ -1874,6 +1917,71 @@ mod tests {
         );
     }
 
+    // HostConfigGate alone, on the "groups" policy (#93): as if the mutator
+    // stopped forcing the list. Only the policy's list, exactly, or a zero
+    // value passes. The same rows, by name, are in
+    // go/internal/middleware/hostconfig_test.go and ts/src/middleware.test.ts.
+    #[test]
+    fn test_group_add_gate_rows() {
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "groupAddGateForcedListAllowed",
+                r##"{"HostConfig":{"GroupAdd":["64190","jwt"]}}"##,
+                "",
+            ),
+            ("groupAddGateEmptyAllowed", r##"{"HostConfig":{"GroupAdd":[]}}"##, ""),
+            ("groupAddGateNullAllowed", r##"{"HostConfig":{"GroupAdd":null}}"##, ""),
+            (
+                "groupAddGateOtherListDenied",
+                r##"{"HostConfig":{"GroupAdd":["docker"]}}"##,
+                "HostConfig.GroupAdd is not allowed for service svc",
+            ),
+            (
+                "groupAddGateReorderedDenied",
+                r##"{"HostConfig":{"GroupAdd":["jwt","64190"]}}"##,
+                "HostConfig.GroupAdd is not allowed for service svc",
+            ),
+            (
+                "groupAddGateSubsetDenied",
+                r##"{"HostConfig":{"GroupAdd":["64190"]}}"##,
+                "HostConfig.GroupAdd is not allowed for service svc",
+            ),
+            (
+                "groupAddGateSupersetDenied",
+                r##"{"HostConfig":{"GroupAdd":["64190","jwt","0"]}}"##,
+                "HostConfig.GroupAdd is not allowed for service svc",
+            ),
+            (
+                "groupAddGateNumberDenied",
+                r##"{"HostConfig":{"GroupAdd":[64190,"jwt"]}}"##,
+                "HostConfig.GroupAdd is not allowed for service svc",
+            ),
+            (
+                "groupAddGateStringDenied",
+                r##"{"HostConfig":{"GroupAdd":"64190"}}"##,
+                "HostConfig.GroupAdd is not allowed for service svc",
+            ),
+        ];
+        let policy = host_config_row_policy("groups");
+        let mut failures = Vec::new();
+        for (name, body, want) in rows {
+            let body: HashMap<String, serde_json::Value> = serde_json::from_str(body).unwrap();
+            match (
+                HostConfigGate.check("POST", "/containers/create", &policy, &body),
+                *want,
+            ) {
+                (Ok(()), "") => {}
+                (Ok(()), want) => failures.push(format!("{name}: expected deny with {want:?}, got allow")),
+                (Err(e), "") => failures.push(format!("{name}: expected allow, got: {e}")),
+                (Err(e), want) if !e.contains(want) => {
+                    failures.push(format!("{name}: expected deny with {want:?}, got: {e}"))
+                }
+                _ => {}
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     const HOST_CONFIG_ROWS: &[HostConfigRow] = &[
         HostConfigRow {
             name: "capAddDenied",
@@ -1908,6 +2016,62 @@ mod tests {
             policy: "std",
             body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["docker"]}}"##,
             want: "HostConfig.GroupAdd is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "groupAddPolicyListWithoutGroupAddDenied",
+            policy: "std",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["64190","jwt"]}}"##,
+            want: "HostConfig.GroupAdd is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "groupAddForced",
+            policy: "groups",
+            body: r##"{"Image":"chainsafe/lodestar:v1"}"##,
+            want: "",
+            fwd: r##"{"GroupAdd":["64190","jwt"]}"##,
+        },
+        HostConfigRow {
+            name: "groupAddForcedNullHostConfig",
+            policy: "groups",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":null}"##,
+            want: "",
+            fwd: r##"{"GroupAdd":["64190","jwt"]}"##,
+        },
+        HostConfigRow {
+            name: "groupAddCallerReplaced",
+            policy: "groups",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["docker","0"]}}"##,
+            want: "",
+            fwd: r##"{"GroupAdd":["64190","jwt"]}"##,
+        },
+        HostConfigRow {
+            name: "groupAddCallerNullReplaced",
+            policy: "groups",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":null}}"##,
+            want: "",
+            fwd: r##"{"GroupAdd":["64190","jwt"]}"##,
+        },
+        HostConfigRow {
+            name: "groupAddSameListUnchanged",
+            policy: "groups",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"GroupAdd":["64190","jwt"]}}"##,
+            want: "",
+            fwd: r##"{"GroupAdd":["64190","jwt"]}"##,
+        },
+        HostConfigRow {
+            name: "groupAddCaseVariantDenied",
+            policy: "groups",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":{"groupadd":["0"]}}"##,
+            want: "HostConfig.groupadd is not allowed for service svc",
+            fwd: r##""##,
+        },
+        HostConfigRow {
+            name: "groupAddNonObjectHostConfigDenied",
+            policy: "groups",
+            body: r##"{"Image":"chainsafe/lodestar:v1","HostConfig":["GroupAdd"]}"##,
+            want: "HostConfig must be an object for service svc",
             fwd: r##""##,
         },
         HostConfigRow {

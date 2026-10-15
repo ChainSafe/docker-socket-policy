@@ -123,6 +123,13 @@ func (g *HostConfigGate) Check(r *http.Request, p *policy.Policy, body map[strin
 			if value != nil {
 				return fmt.Errorf("HostConfig.%s is not allowed for service %s", key, p.ServiceName)
 			}
+		case key == "GroupAdd":
+			// Zero, or exactly the policy's group_add, which the mutator
+			// forces (#93). Checked here too so that the gate does not open
+			// up if the mutator ever stops forcing it.
+			if !isZeroValue(value) && !equalsStringList(value, p.ContainerConfig.GroupAdd) {
+				return fmt.Errorf("HostConfig.GroupAdd is not allowed for service %s", p.ServiceName)
+			}
 		case key == "SecurityOpt":
 			if err := checkSecurityOpt(value, p); err != nil {
 				return err
@@ -236,6 +243,21 @@ func isZeroValue(v interface{}) bool {
 		return len(x) == 0
 	}
 	return false
+}
+
+// equalsStringList reports whether v is a JSON list of strings equal to want,
+// in order. An empty want matches nothing.
+func equalsStringList(v interface{}, want []string) bool {
+	list, ok := v.([]interface{})
+	if !ok || len(want) == 0 || len(list) != len(want) {
+		return false
+	}
+	for i, e := range list {
+		if s, isStr := e.(string); !isStr || s != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func containsString(list []string, s string) bool {

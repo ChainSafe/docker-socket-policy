@@ -333,6 +333,49 @@ func TestNewManager_LoadTimeValidation(t *testing.T) {
 		{"empty container_names", map[string]string{
 			"a.yaml": "service_name: a\ncontainer_names: []\nallowed_image_prefixes: [alpine]\n",
 		}, `container_names must not be empty`},
+		// container_config.group_add (#93).
+		{"group_add GIDs and names", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', '4294967295', jwt, _x-1, 'samba$', abcdefghijklmnopqrstuvwxyz012345]\n",
+		}, ""},
+		{"group_add empty", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: []\n",
+		}, ""},
+		{"group_add 0", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', '0']\n",
+		}, `policy file a.yaml: group_add entry "0" is the root group, which is not allowed`},
+		{"group_add 00", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['00']\n",
+		}, `policy file a.yaml: group_add entry "00" is the root group, which is not allowed`},
+		{"group_add root", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [root]\n",
+		}, `policy file a.yaml: group_add entry "root" is the root group, which is not allowed`},
+		{"group_add duplicate", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', jwt, '64190']\n",
+		}, `policy file a.yaml: duplicate group_add entry "64190"`},
+		{"group_add duplicate GID with leading zero", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['64190', '064190']\n",
+		}, `policy file a.yaml: duplicate group_add entry "064190"`},
+		{"group_add GID too large", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['4294967296']\n",
+		}, `policy file a.yaml: invalid group_add entry "4294967296"`},
+		{"group_add upper-case name", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [Jwt]\n",
+		}, `policy file a.yaml: invalid group_add entry "Jwt"`},
+		{"group_add name with a space", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['a b']\n",
+		}, `policy file a.yaml: invalid group_add entry "a b"`},
+		{"group_add name starting with a dash", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['-x']\n",
+		}, `policy file a.yaml: invalid group_add entry "-x"`},
+		{"group_add name of 33 characters", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [abcdefghijklmnopqrstuvwxyz0123456]\n",
+		}, `policy file a.yaml: invalid group_add entry "abcdefghijklmnopqrstuvwxyz0123456"`},
+		{"group_add empty string", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: ['']\n",
+		}, `policy file a.yaml: invalid group_add entry ""`},
+		{"group_add unquoted number", map[string]string{
+			"a.yaml": "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: [64190]\n",
+		}, `group_add entries must be strings`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -393,5 +436,19 @@ func TestCovering(t *testing.T) {
 		if got := len(m.Covering(name)); got != want {
 			t.Errorf("Covering(%q) = %d policies, want %d", name, got, want)
 		}
+	}
+}
+
+// An empty group_add is the same as an unset one (#93).
+func TestNewManager_EmptyGroupAddIsUnset(t *testing.T) {
+	dir := t.TempDir()
+	writePolicyFile(t, dir, "a.yaml", "service_name: a\nallowed_image_prefixes: [alpine]\ncontainer_config:\n  group_add: []\n")
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	p, _ := m.Get("a")
+	if p.ContainerConfig.GroupAdd != nil {
+		t.Fatalf("group_add = %q, want unset", p.ContainerConfig.GroupAdd)
 	}
 }
